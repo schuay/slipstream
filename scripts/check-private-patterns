@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Copyright 2026 The slipstream developers
+# SPDX-License-Identifier: MIT
+
+# Apply checkout-private policy without storing its expressions in the repo.
+set -euo pipefail
+
+mode=${1:?usage: check-private-patterns staged|file [path]}
+git_dir=$(git rev-parse --path-format=absolute --git-common-dir)
+policy_dir="$git_dir/private-hooks"
+
+case "$mode" in
+  staged)
+    patterns="$policy_dir/content-patterns"
+    [[ -s $patterns ]] || exit 0
+    if hits=$(git diff --cached -U0 --diff-filter=ACM -- . ':!*.lock' \
+      | grep -E '^\+' | grep -Ev '^\+\+\+' \
+      | grep -inE -f <(grep -Ev '^[[:space:]]*(#|$)' "$patterns") || true); then
+      [[ -z $hits ]] && exit 0
+    fi
+    ;;
+  file)
+    target=${2:?usage: check-private-patterns file PATH}
+    patterns="$policy_dir/commit-message-patterns"
+    [[ -s $patterns ]] || exit 0
+    hits=$(grep -inE -f <(grep -Ev '^[[:space:]]*(#|$)' "$patterns") \
+      "$target" || true)
+    [[ -z $hits ]] && exit 0
+    ;;
+  *)
+    echo "unknown private-pattern scan mode: $mode" >&2
+    exit 2
+    ;;
+esac
+
+echo "$mode: content matches checkout-private policy:" >&2
+echo "$hits" >&2
+echo "remove it, or use --no-verify for a deliberate exception" >&2
+exit 1

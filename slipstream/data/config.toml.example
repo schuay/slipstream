@@ -1,0 +1,151 @@
+# Slipstream user configuration
+# Save this as ~/.config/slipstream/config.toml (`slipstream config` prints
+# it) and edit the paths to match your local setup.
+#
+# Every section is closed: a key slipstream does not read is a startup error,
+# not a comment. That includes keys that exist in the bundled config but are
+# not yours to override, and engine or suite names slipstream does not know.
+
+out_dir = "~/jsc-js2"   # where results, logs, and metadata are stored
+# results_dir = "results" # subdirectory within out_dir (default: "results")
+
+# Names this machine wherever its numbers sit beside another machine's: in the
+# perf database, in the interchange CSV, and in the db itself. One db holds one
+# bot, so `import` refuses anything that is not this machine's own data.
+# bot_name = "my-machine-local"
+
+# An engine is configured by the presence of its table. src_dir is the local
+# checkout; omit it on a machine that only benches artifacts fetched from the
+# build bus, and every command that needs git will say so by name.
+[engines.v8]
+src_dir = "~/src/v8/v8"
+# build_cmd = "..."   # override the bundled default if this box builds
+# sync_cmd = "..."    # differently from the other one
+# gn_args = """..."""
+#
+# run_set lists what has to be packaged for the binary to run on another
+# machine, relative to src_dir: directories are taken recursively, symlinks are
+# preserved. Required to publish to the bus, and hashed into the artifact's
+# build_cfg_hash, since it is as much an input to the numbers as the build args
+# are. Audit it on the target platform before filling it in: dropping a
+# framework or dereferencing a symlink is not visible in the resulting scores.
+# run_set = ["out/release-lto/d8", "out/release-lto/icudtl.dat"]
+
+[engines.jsc]
+src_dir = "~/src/WebKit"
+
+[benchmarks.js2]
+dir = "~/JetStream2"
+
+[benchmarks.js3]
+dir = "~/src/JetStream"
+
+# What this machine measures of every commit. Nothing runs that is not listed
+# here: the matrix is a choice about what is worth an hour of bot time, so a
+# flag worth running on one suite need not be run on the others.
+#
+# variant names the series in the db and in the perf frontends. Omit it and it
+# is the flag with its dashes turned to underscores, or "default" with no
+# flags; two entries may not end up with the same engine/suite/variant.
+#
+# Both boxes should list the same matrix. `slipstream bus status` compares
+# them and reports the difference, since a variant only one box collects looks
+# like a regression in the other's series.
+#
+# Adding an entry does not backfill: commits already measured stay done. To
+# fill history for a new variant, `slipstream clear` the range, which re-runs
+# every entry for those commits, not only the new one.
+
+[[run]]
+engine = "v8"
+suite = "js3"
+
+# run_mode = "per_benchmark" invokes the harness once per line item instead of
+# once for the suite. It prints no overall score, so one is synthesized as the
+# geometric mean of the line items.
+[[run]]
+engine = "v8"
+suite = "js3"
+variant = "per_line_item"
+run_mode = "per_benchmark"
+
+[[run]]
+engine = "v8"
+suite = "js2"
+flags = ["--turbolev-future"]   # variant: "turbolev_future"
+
+[[run]]
+engine = "jsc"
+suite = "js2"
+
+[[run]]
+engine = "jsc"
+suite = "js3"
+
+# [push]
+# bot_name = "my-machine-local"   # must match the top-level bot_name
+#
+# At least one target is required. Each is either a spanner database or a
+# spool_dir for a machine that can reach one.
+#
+# The perf Spanner database:
+#
+# [[push.targets]]
+# spanner = "project/instance/database"
+# # refresh = true    # aggregate into benchmarks after each push
+#
+# A machine without Spanner access appends each push to a spool log:
+#
+# [[push.targets]]
+# spool_dir = "~/slipstream/outbox"
+# # retain_days = 90                   # entries are dropped once older
+#
+# and a machine that can ssh to it drains the log into its own targets with
+# `slipstream relay`, tracking what it has read in <cursor_dir>/<bot_name>.cursor:
+#
+# [[relay]]
+# ssh_host = "box2"                    # SSH config alias
+# spool_dir = "~/slipstream/outbox"    # on box2
+# bot_name = "box2-bot"                # bot the spooled scores belong to
+# # cursor_dir = "..."                 # local; default <out_dir>/relay
+
+# The build bus: box2 builds every commit and publishes an artifact, both boxes
+# bench from it. `slipstream build` publishes, `slipstream watch` consumes.
+#
+# [bus]
+# root = "~/slipstream/bus"          # entries, payloads, fetch tmp, run roots
+#
+# One entry per source this machine consumes. `name` is the cursor directory
+# component, so the local source is named too; an engine with no source is
+# git-driven, which is how a single box runs today, and two sources may not
+# claim the same engine.
+#
+# [[bus.sources]]
+# name = "box2"
+# ssh_host = "box2"                  # omit for a bus root on this machine
+# root = "~/slipstream/bus"          # as box2's shell expands it
+# engines = ["v8", "jsc"]            # optional subset; omit to take everything
+# # bwlimit = "20000"                # rsync --bwlimit, KB/s
+#
+# What this machine builds and publishes:
+#
+# [build]
+# engines = ["v8", "jsc"]
+# retain_gb = 400                    # per engine, oldest entries dropped first
+# min_free_gb = 100                  # stop publishing below this
+# max_infra_attempts = 5             # before a stuck sync is blamed on the commit
+# max_consecutive_burns = 3          # before the builder stalls instead
+# # from = { v8 = 109680 }           # only used when an engine has no state
+#
+# [bench]
+# min_free_gb = 100                  # a payload plus its unpacked root at once
+# run_roots = 2                      # unpacked roots kept per engine
+# max_consecutive_failures = 3       # commits with no scores before it stalls
+
+# macOS only: `bench` and `watch` check the host power state before starting a
+# session. Configure the machine once with `slipstream host --apply`; "abort"
+# is the right setting for a dedicated bot, which should never run in a state
+# that lets it suspend or throttle.
+#
+# [host]
+# preflight = "warn"    # "warn" (default), "abort", or "off"

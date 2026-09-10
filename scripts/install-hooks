@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Copyright 2026 The slipstream developers
+# SPDX-License-Identifier: MIT
+
+set -euo pipefail
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd -- "$script_dir/.." && pwd)
+git -C "$repo_root" config core.hooksPath .githooks
+git_dir=$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir)
+mkdir -p "$git_dir/private-hooks"
+echo "hooks installed; private policy lives in $git_dir/private-hooks"

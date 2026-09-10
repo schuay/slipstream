@@ -1,0 +1,69 @@
+# Copyright 2026 The slipstream developers
+# SPDX-License-Identifier: MIT
+
+[v8]
+# sync_cmd runs before build_cmd, not instead of it: collapsing the two into
+# one shell command gives one exit code for two steps, and a DEPS fetch failing
+# is infrastructure while a compile failing is the commit's fault.
+build_cmd = "autoninja -C out/release-lto d8"
+sync_cmd = "gclient sync -RD"
+binary_path = "out/release-lto/d8"
+# d8 resolves both data files relative to the executable, not the cwd.
+# snapshot_blob.bin is there because v8_use_external_startup_data defaults on
+# everywhere but iOS; icudtl.dat because the build is i18n, and without it d8
+# fails to start at all rather than only failing Intl.
+run_set = [
+    "out/release-lto/d8",
+    "out/release-lto/icudtl.dat",
+    "out/release-lto/snapshot_blob.bin",
+]
+id_regex = '^ *Cr-Commit-Position:.*#([0-9]+)'
+path_filter = ""
+gn_args = """
+is_component_build = false
+is_debug = false
+target_cpu = "arm64"
+v8_enable_verify_heap = false
+dcheck_always_on = false
+use_remoteexec = true
+use_siso = true
+is_official_build = true
+chrome_pgo_phase = 0
+thin_lto_enable_optimizations = true
+use_thin_lto = true
+v8_enable_google_benchmark = true
+"""
+
+# Linux notes (TODO: investigate and add a linux-jsc config):
+#
+# build-jsc should work on Linux as-is: the xcconfig pre_build_patches are
+# no-ops (files don't exist on Linux), and DYLD_* vars are harmless.
+# The main unknown is whether thin LTO is available on the Linux clang install.
+#
+# An alternative known-working Linux build (no LTO, used historically):
+#   mkdir -p build && cd build
+#   CXXFLAGS=-fno-omit-frame-pointer cmake -GNinja .. -DPORT=JSCOnly \
+#     -DCMAKE_BUILD_TYPE=Release -DENABLE_STATIC_JSC=ON
+#   ninja -j$(nproc) jsc
+#   binary: build/bin/jsc  (static, no dyld_lib_path needed)
+# To add LTO to the cmake build: -DLTO_MODE=thin (needs clang).
+[jsc]
+build_cmd = "Tools/Scripts/build-jsc --cmakeargs='-DLTO_MODE=thin'"
+binary_path = "WebKitBuild/Release/jsc"
+id_regex = 'Canonical link:.*/([0-9]+)@'
+path_filter = "Source/JavaScriptCore"
+dyld_lib_path = "WebKitBuild/Release"
+# The framework, not libJavaScriptCore.a: WTF and bmalloc are static archives
+# linked into it, so nothing but the framework is needed at run time. Its
+# install name is /System/Library/Frameworks/..., since the Xcode build sets no
+# rpath, so jsc silently loads Apple's shipped JavaScriptCore unless
+# dyld_lib_path redirects it. Packaging the framework is half of that; the
+# DYLD_ vars the collector sets are the other half.
+run_set = [
+    "WebKitBuild/Release/jsc",
+    "WebKitBuild/Release/JavaScriptCore.framework",
+]
+pre_build_patches = [
+    "Source/JavaScriptCore/Configurations/Base.xcconfig",
+    "Source/WTF/Configurations/Base.xcconfig",
+]

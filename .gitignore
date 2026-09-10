@@ -1,0 +1,15 @@
+*.csv
+*.swp
+cached_builds/
+logs/
+results/
+__pycache__/
+*.egg-info/
+.venv/
+dist/
+*.db
+*.bak
+.claude/
+CLAUDE.md
+DECISIONS.md
+metadata/*.txt

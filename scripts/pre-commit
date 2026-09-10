@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Copyright 2026 The slipstream developers
+# SPDX-License-Identifier: MIT
+
+# Check staged files using only the environment prepared outside the sandbox.
+set -euo pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+mapfile -d '' -t staged_files < <(
+  git diff --cached --name-only --diff-filter=ACM -z
+)
+staged_py=()
+for path in "${staged_files[@]}"; do
+  [[ $path == *.py ]] && staged_py+=("$path")
+done
+
+if ((${#staged_py[@]})); then
+  uv run --offline --no-sync ruff format --check -- "${staged_py[@]}"
+  uv run --offline --no-sync ruff check -- "${staged_py[@]}"
+fi
+
+if ((${#staged_files[@]})); then
+  uv run --offline --no-sync python scripts/add-license-headers.py \
+    --check --files "${staged_files[@]}"
+fi
+
+scripts/check-private-patterns staged

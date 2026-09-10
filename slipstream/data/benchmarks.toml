@@ -1,0 +1,17 @@
+# Copyright 2026 The slipstream developers
+# SPDX-License-Identifier: MIT
+
+[js2]
+cli = "cli.js"
+run_mode = "suite"
+names_file = "js2_names.txt"
+timeout = "15m"
+score_regex = '^([A-Za-z0-9.-]+) (Stdlib-Score|Tests-Score|Total-Score|Startup-Score|Average-Score|Worst-Case-Score|Run-Time-Score): ([0-9.]+)$'
+suite_score_regex = '^\s+([A-Za-z]+-Score):\s+([0-9.]+)$'
+
+[js3]
+cli = "cli.js"
+run_mode = "suite"
+names_file = "js3_names.txt"
+timeout = "15m"
+score_regex = '^([A-Za-z0-9-]+)\s+([A-Za-z0-9-]+-Score|Score)\s+([0-9.]+)\s+pts$'
