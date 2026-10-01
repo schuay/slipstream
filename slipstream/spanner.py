@@ -44,6 +44,13 @@ META_TABLE = "meta"
 WATERMARK_KEY = "slipstream_last_imported_at"
 INCOMPLETE_PREFIX = "slipstream_incomplete_import:"
 
+# google-cloud-spanner switches for multiplexed sessions, per transaction type.
+_MULTIPLEXED_SESSION_ENV = (
+    "GOOGLE_CLOUD_SPANNER_MULTIPLEXED_SESSIONS",
+    "GOOGLE_CLOUD_SPANNER_MULTIPLEXED_SESSIONS_PARTITIONED_OPS",
+    "GOOGLE_CLOUD_SPANNER_MULTIPLEXED_SESSIONS_FOR_RW",
+)
+
 IMPORT_COLUMNS = [
     "bot",
     "benchmark",
@@ -100,6 +107,18 @@ class SpannerDb:
         from google.cloud import spanner
         from google.cloud.spanner_dbapi import connect
 
+        # Workaround: Database.close() blocks up to 600s joining the
+        # multiplexed-session maintenance thread (google-cloud-spanner 3.71).
+        # TODO: Remove once fixed upstream.
+        #
+        # The first query on a multiplexed session starts a maintenance
+        # thread that polls with an uninterruptible 10 minute sleep, and
+        # Database.close() joins it: every push would sit in close() until
+        # ten minutes after connecting. Pooled sessions close at once. The
+        # client reads these per checkout, and each transaction type would
+        # start the thread on its own.
+        for var in _MULTIPLEXED_SESSION_ENV:
+            os.environ[var] = "false"
         # Built-in metrics fail on every push with a missing instance_id
         # label and log a Cloud Monitoring 400; disabling them on the client
         # is honoured, the environment variable is not.

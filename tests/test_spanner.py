@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
@@ -460,3 +461,41 @@ class TestSpannerDbTeardown:
         db, closed = self._db(order, boom=True)
         db.close()
         assert len(closed) == 2
+
+
+class TestSpannerDbSessions:
+    def test_multiplexed_sessions_are_disabled_before_connecting(self, monkeypatch):
+        # A multiplexed session's maintenance thread makes Database.close()
+        # block for up to ten minutes; it must be off before the first query.
+        import google.cloud.spanner as gspanner
+        import google.cloud.spanner_dbapi as dbapi
+
+        for var in spanner._MULTIPLEXED_SESSION_ENV:
+            monkeypatch.setenv(var, "true")
+        seen = {}
+
+        class Cursor:
+            def __enter__(self_):
+                return self_
+
+            def __exit__(self_, *a):
+                return False
+
+            def execute(self_, sql, params=None):
+                seen.update(
+                    {v: os.environ[v] for v in spanner._MULTIPLEXED_SESSION_ENV}
+                )
+
+            def fetchall(self_):
+                return [(1,)]
+
+        class Con:
+            database = None
+
+            def cursor(self_):
+                return Cursor()
+
+        monkeypatch.setattr(gspanner, "Client", lambda **kw: object())
+        monkeypatch.setattr(dbapi, "connect", lambda *a, **kw: Con())
+        spanner.SpannerDb("p", "i", "d")
+        assert seen == {v: "false" for v in spanner._MULTIPLEXED_SESSION_ENV}
