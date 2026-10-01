@@ -48,7 +48,7 @@ class PushConfig:
 class DeliveryConfig:
     local: bool = True
     remote: bool = True
-    poll_seconds: float = 10.0
+    poll_seconds: float = 600.0
     quantum: int = 2
     max_units: int = 16
     max_rows: int = 100_000
