@@ -90,11 +90,11 @@ def test_bounded_snapshot_rotates_between_sources_and_engines(tmp_path, store):
     b = remote(
         tmp_path, "remote", {i: _csv({"commit_id": str(i)}) for i in range(1, 10)}
     )
-    c = coordinator(tmp_path, [a, b], settings=DeliveryConfig(max_units=3, quantum=2))
+    c = coordinator(tmp_path, [a, b], settings=DeliveryConfig(max_units=3))
     assert cycle(c) == 3
-    assert store.unpushed_commit_ids("v8", "arm64")[0] == 3
-    assert read_cursor(b.path) == 1
-    assert b.spool.fetched == [1]
+    assert store.unpushed_commit_ids("v8", "arm64")[0] == 4
+    assert read_cursor(b.path) == 0
+    assert b.spool.fetched == []
     assert cycle(c) == 3
     assert read_cursor(b.path) == 3
     assert store.unpushed_commit_ids("v8", "arm64")[0] == 4
@@ -113,6 +113,104 @@ def test_new_work_waits_until_next_snapshot(tmp_path, store):
     c = coordinator(tmp_path, [source], session_factory=lambda t, **kw: Arrivals(t))
     assert cycle(c) == 1
     assert store.unpushed_commit_ids("v8", "arm64") == [2]
+
+
+@pytest.mark.parametrize("kind", ["local", "remote"])
+def test_single_source_uses_cycle_unit_budget(tmp_path, store, kind):
+    if kind == "local":
+        _seed(store, list(range(1, 10)))
+        source = local(store)
+    else:
+        source = remote(
+            tmp_path, "remote", {i: _csv({"commit_id": str(i)}) for i in range(1, 10)}
+        )
+    c = coordinator(
+        tmp_path,
+        [source],
+        settings=DeliveryConfig(max_units=8),
+    )
+    assert cycle(c) == 8
+    assert all(source.acknowledged(unit) for unit in range(1, 9))
+    assert not source.acknowledged(9)
+
+
+@pytest.mark.parametrize("kind", ["local", "remote", "filtered"])
+def test_service_drains_backlog_before_idle_poll(tmp_path, store, monkeypatch, kind):
+    if kind == "remote":
+        source = remote(
+            tmp_path, "remote", {i: _csv({"commit_id": str(i)}) for i in range(1, 20)}
+        )
+    else:
+        _seed(store, list(range(1, 20)))
+        source = local(store)
+        if kind == "filtered":
+            source.valid = {"js3": {"other"}}
+    stop = False
+    events = []
+
+    def log(message):
+        nonlocal stop
+        events.append(message)
+        if message.startswith("next poll"):
+            assert all(source.acknowledged(unit) for unit in range(1, 20))
+            stop = True
+
+    def sleep(seconds):
+        pytest.fail("service slept before draining backlog")
+
+    monkeypatch.setattr("slipstream.delivery.time.sleep", sleep)
+    c = coordinator(
+        tmp_path,
+        [source],
+        settings=DeliveryConfig(max_units=8, poll_seconds=600),
+        log=log,
+        should_stop=lambda: stop,
+    )
+    assert c.run()
+    assert sum(m.startswith("cycle ") for m in events) == 4  # 8, 8, 3, idle
+    assert not c.errors
+
+
+def test_remote_soft_budget_does_not_skip_to_smaller_later_unit(tmp_path):
+    source = remote(
+        tmp_path,
+        "remote",
+        {1: _csv({}), 2: _csv({}, {"run": "2"}, {"run": "3"}), 3: _csv({})},
+    )
+    c = coordinator(tmp_path, [source], settings=DeliveryConfig(max_rows=3))
+    assert cycle(c) == 1
+    assert read_cursor(source.path) == 1
+    assert not source.attempt_path.exists()
+    assert not c.errors
+    assert cycle(c) == 3
+    assert read_cursor(source.path) == 2
+    assert cycle(c) == 1
+    assert read_cursor(source.path) == 3
+
+
+def test_idle_service_uses_source_retry_deadline(tmp_path):
+    source = remote(tmp_path, "remote", {1: "invalid"})
+    events = []
+    stop = False
+
+    def log(message):
+        nonlocal stop
+        events.append(message)
+        if message.startswith("next poll"):
+            delay = float(message.removeprefix("next poll in ").removesuffix("s"))
+            assert 0 < delay <= 5
+            stop = True
+
+    c = coordinator(
+        tmp_path,
+        [source],
+        settings=DeliveryConfig(poll_seconds=600, retry_seconds=5),
+        log=log,
+        should_stop=lambda: stop,
+    )
+    assert c.run()
+    assert c.errors
+    assert any("next poll" in m for m in events)
 
 
 def test_remote_failure_does_not_stop_healthy_local_source(tmp_path, store):

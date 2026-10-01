@@ -49,7 +49,6 @@ class DeliveryConfig:
     local: bool = True
     remote: bool = True
     poll_seconds: float = 600.0
-    quantum: int = 2
     max_units: int = 16
     max_rows: int = 100_000
     max_bytes: int = 8 * 1024 * 1024
@@ -76,7 +75,6 @@ class DeliveryConfig:
             ):
                 raise ValueError(f"[delivery] {name} must be positive and finite")
             elif name in (
-                "quantum",
                 "max_units",
                 "max_rows",
                 "max_bytes",

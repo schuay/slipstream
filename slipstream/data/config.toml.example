@@ -155,8 +155,7 @@ suite = "js3"
 # [delivery]
 # local = true                      # false on remote-only / build-only machines
 # remote = true                     # false to disable configured SSH sources
-# poll_seconds = 600
-# quantum = 2                       # commits/files per source; local engines rotate
+# poll_seconds = 600                # sleep only when no delivery progress is made
 # max_units = 16
 # max_rows = 100000                  # soft cycle bound
 # max_bytes = 8388608                # soft cycle bound (8 MiB)

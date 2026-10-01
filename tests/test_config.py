@@ -639,8 +639,8 @@ class TestStrictKeys:
 @pytest.mark.parametrize(
     "settings",
     [
-        {"quantum": True},
-        {"quantum": 1.5},
+        {"max_units": True},
+        {"max_units": 1.5},
         {"max_units": 0},
         {"poll_seconds": float("inf")},
         {"local": "false"},
@@ -655,20 +655,21 @@ def test_delivery_limits_are_validated(settings):
         DeliveryConfig(**settings)
 
 
-def test_delivery_unknown_keys_rejected_and_remote_only_no_db_created(tmp_path):
+@pytest.mark.parametrize("key", ["unknown", "quantum"])
+def test_delivery_unknown_keys_rejected_and_remote_only_no_db_created(tmp_path, key):
     from slipstream.delivery import configured_coordinator
 
     path = tmp_path / "cfg.toml"
     path.write_text(
         f'out_dir = "{tmp_path}"\n[push]\nbot_name = "bot"\n'
         f'[[push.targets]]\nspool_dir = "{tmp_path}/spool"\n'
-        "[delivery]\nlocal = false\nquantum = 3\n"
+        "[delivery]\nlocal = false\nmax_units = 3\n"
     )
     cfg = load_config(path)
     c, store = configured_coordinator(cfg, log=lambda msg: None)
-    assert c.settings.quantum == 3
+    assert c.settings.max_units == 3
     assert store is None and not cfg.metadata_dir.exists()
-    path.write_text(path.read_text().replace("quantum = 3", "unknown = 3"))
+    path.write_text(path.read_text().replace("max_units = 3", f"{key} = 3"))
     with pytest.raises(ValueError, match="unknown keys"):
         load_config(path)
 

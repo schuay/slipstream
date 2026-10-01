@@ -63,6 +63,7 @@ class Coordinator:
         self.retry = {}
         self.rotation = 0
         self.errors = []
+        self.acknowledged_units = 0
 
     def shutdown_deadline(self):
         return (
@@ -113,6 +114,7 @@ class Coordinator:
         started = time.monotonic()
         deadline = started + self.settings.cycle_seconds
         self.errors = []
+        self.acknowledged_units = 0
         delivered_rows = 0
         selected = []
         rows = size = 0
@@ -140,12 +142,9 @@ class Coordinator:
                     validate_record(record, source, self.identities)
                     units = [record["unit"]]
                 else:
-                    units = source.discover(
-                        min(
-                            self.settings.quantum,
-                            self.settings.max_units - len(candidates),
-                        )
-                    )
+                    units = source.discover(self.settings.max_units - len(candidates))
+                if not units:
+                    self.retry.pop(source.identity, None)
                 candidates.extend((source, unit, record) for unit in units)
             except Exception as exc:
                 self.fail(source, exc)
@@ -208,7 +207,9 @@ class Coordinator:
                         rows + len(batch.rows) > self.settings.max_rows
                         or size + batch.size > self.settings.max_bytes
                     ):
-                        continue
+                        # Preserve remote cursor continuity: never skip a
+                        # large unit and stage a later, smaller one instead.
+                        break
                     if record and record["digest"] != batch.digest:
                         raise ValueError(
                             f"unit {unit}: pending payload digest mismatch"
@@ -324,6 +325,7 @@ class Coordinator:
                                 "shutdown before acknowledgement; retry retained unit"
                             )
                         source.acknowledge(batch)
+                        self.acknowledged_units += 1
                         delivered_rows += len(batch.rows)
                         progress = (
                             f"cursor={batch.unit}"
@@ -392,8 +394,20 @@ class Coordinator:
                 self.cycle()
                 if once:
                     return not self.errors
-                self.log(f"next poll in {self.settings.poll_seconds}s")
-                until = time.monotonic() + self.settings.poll_seconds
+                if self.acknowledged_units:
+                    self.log("progress made; continuing with next snapshot")
+                    continue
+                delay = self.settings.poll_seconds
+                if self.retry:
+                    delay = min(
+                        delay,
+                        max(
+                            0,
+                            min(at for _, at in self.retry.values()) - time.monotonic(),
+                        ),
+                    )
+                self.log(f"next poll in {delay}s")
+                until = time.monotonic() + delay
                 while not self.should_stop() and time.monotonic() < until:
                     time.sleep(min(0.1, max(0, until - time.monotonic())))
         return True
