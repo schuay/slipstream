@@ -504,7 +504,7 @@ def test_relay_stages_every_entry_over_one_spanner_session(tmp_path, monkeypatch
     from slipstream import spanner
     from tests.test_spanner import FakeDb, T0, _csv
 
-    db = FakeDb([[("slipstream",), ("benchmarks",), ("meta",)], [(T0,)], [], [], []])
+    db = FakeDb([[("slipstream",), ("benchmarks",), ("meta",)], [], [(T0,)], []])
     monkeypatch.setattr(spanner, "connect", lambda spec: db)
     logs = []
     n = relay_source(
@@ -515,8 +515,8 @@ def test_relay_stages_every_entry_over_one_spanner_session(tmp_path, monkeypatch
     )
     assert n == 2
     assert [c[1] for c in db.of("upsert")] == ["slipstream", "slipstream"]
-    assert sum("INFORMATION_SCHEMA" in c[1] for c in db.of("query")) == 1
-    assert sum("MAX(imported_at)" in c[1] for c in db.of("query")) == 1
+    assert sum("INFORMATION_SCHEMA.TABLES" in c[1] for c in db.of("query")) == 1
+    assert sum("WHERE key = %s" in c[1] for c in db.of("query")) == 1
     assert "box2: 2 rows staged for box2, aggregated" in logs
     assert db.calls[-1] == ("close",)
 

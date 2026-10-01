@@ -20,9 +20,15 @@ T0 = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
 class FakeDb:
     """Records every call; answers queries from a scripted list."""
 
-    def __init__(self, answers=None):
+    def __init__(self, answers=None, indexes=None):
         self.answers = list(answers or [])
         self.calls: list[tuple] = []
+        # index name -> state; every declared index ready unless overridden.
+        self.indexes = (
+            {n: "READ_WRITE" for n in spanner.declared_indexes()}
+            if indexes is None
+            else indexes
+        )
 
     def query(self, sql, params=None):
         self.calls.append(("query", " ".join(sql.split()), params))
@@ -30,6 +36,8 @@ class FakeDb:
             return []
         if "CURRENT_TIMESTAMP" in sql:
             return [(T0,)]
+        if "INFORMATION_SCHEMA.INDEXES" in sql:
+            return list(self.indexes.items())
         return self.answers.pop(0) if self.answers else []
 
     def execute(self, sql, params=None):
@@ -124,82 +132,136 @@ class TestSchema:
         db = FakeDb([[("slipstream",)]])
         spanner.ensure_schema(db)
         ddl = [c[1] for c in db.of("execute")]
-        assert len(ddl) == len(spanner.schema_statements()) == 6
+        assert len(ddl) == len(spanner.schema_statements()) == 7
         assert any("trace_id INT64 NOT NULL AS (FARM_FINGERPRINT" in s for s in ddl)
         assert all(not s.startswith("--") for s in ddl)
+
+    def test_declared_indexes(self):
+        idx = spanner.declared_indexes()
+        assert set(idx) == {
+            spanner.IMPORTED_AT_INDEX,
+            spanner.GROUP_INDEX,
+            "benchmarks_filter_idx",
+            "benchmarks_trace_idx",
+        }
+        assert "STORING (commit_time, git_hash, val)" in idx[spanner.GROUP_INDEX]
+
+
+def _item(test, mean, *, bench="jetstream2.slipstream", commit=1, variant="v"):
+    return (
+        "b",
+        bench,
+        test,
+        "",
+        variant,
+        commit,
+        T0,
+        "h",
+        "slipstream",
+        mean,
+        mean / 2,
+        mean * 2,
+        0.5,
+        3,
+    )
 
 
 class TestRefresh:
     def test_empty_staging(self):
-        db = FakeDb([[(None,)]])
+        db = FakeDb([[], [(None,)]])
         assert spanner.refresh(db) == "staging is empty"
         assert db.of("upsert") == [] and db.of("execute") == []
 
     def test_watermark_up_to_date(self):
-        db = FakeDb([[(T0,)], [(T0.isoformat(),)]])
+        db = FakeDb([[(T0.isoformat(),)], []])
         assert spanner.refresh(db) == "no rows newer than the last refresh"
-        assert db.of("upsert") == []
+        assert db.of("upsert") == [] and db.of("execute") == []
+
+    def test_indexes_not_ready_skips_without_reading_staging(self):
+        db = FakeDb(indexes={spanner.GROUP_INDEX: "WRITE_ONLY"})
+        out = spanner.refresh(db)
+        assert out.startswith("indexes not ready (")
+        assert spanner.IMPORTED_AT_INDEX in out and spanner.GROUP_INDEX in out
+        assert "spanner_schema.sql" in out
+        assert not any("FROM slipstream" in c[1] for c in db.of("query"))
+        assert db.of("upsert") == [] and db.of("execute") == []
 
     def test_first_run_is_full_and_sets_watermark_last(self):
-        line = (
-            "b",
-            "jetstream3.slipstream",
-            "t",
-            "",
-            "v8_default",
-            1,
-            T0,
-            "h",
-            "slipstream",
-            1.0,
-            1.0,
-            1.0,
-            0.0,
-            3,
-        )
-        db = FakeDb([[(T0,)], [], [line], [], []])
+        line = _item("t", 1.0, bench="jetstream3.slipstream")
+        db = FakeDb([[], [(T0,)], [line]])
         assert spanner.refresh(db) is None
-        selects = [c for c in db.of("query")][3:]
-        assert len(selects) == 3
-        assert all("INNER JOIN" not in c[1] and c[2] == [] for c in selects)
+        (agg,) = [c for c in db.of("query") if "GROUP BY s.bot" in c[1]]
+        assert "FORCE_INDEX" not in agg[1] and agg[2] is None
         assert db.of("upsert") == [
             ("upsert", "benchmarks", spanner.AGG_COLUMNS, [line])
         ]
         assert db.calls[-1][0] == "execute"
         assert db.calls[-1][2] == [spanner.WATERMARK_KEY, T0.isoformat()]
 
-    def test_incremental_joins_affected_groups(self):
+    def test_incremental_reads_changed_groups_through_indexes(self):
         last = datetime(2026, 9, 1, tzinfo=timezone.utc)
-        db = FakeDb([[(T0,)], [(last.isoformat(),)], [], [], []])
+        earlier = datetime(2026, 9, 2, tzinfo=timezone.utc)
+        changed = [
+            ("b", "jetstream3.slipstream", 101, earlier),
+            ("c", "x", 5, T0),
+            ("b", "jetstream3.slipstream", 100, earlier),
+        ]
+        db = FakeDb([[(last.isoformat(),)], changed, [], []])
         assert spanner.refresh(db) is None
-        selects = [c for c in db.of("query")][3:]
-        assert all("INNER JOIN (SELECT DISTINCT" in c[1] for c in selects)
-        assert all(c[2] == [last] for c in selects)
-        assert "ON s.bot = _ak.bot" in selects[0][1]
-        assert "ON a.bot = _ak.bot" in selects[1][1]
+        queries = db.of("query")
+        (keys,) = [c for c in queries if "MAX(imported_at)" in c[1]]
+        assert f"FORCE_INDEX={spanner.IMPORTED_AT_INDEX}" in keys[1]
+        assert keys[2] == [last]
+        aggs = [c for c in queries if "GROUP BY s.bot" in c[1]]
+        assert all(f"FORCE_INDEX={spanner.GROUP_INDEX}" in c[1] for c in aggs)
+        assert all("IN UNNEST(%s)" in c[1] for c in aggs)
+        assert [c[2] for c in aggs] == [
+            ["b", "jetstream3.slipstream", [100, 101]],
+            ["c", "x", [5]],
+        ]
+        # The cutoff is the newest row seen, not a scan of the whole table.
+        assert db.calls[-1][2] == [spanner.WATERMARK_KEY, T0.isoformat()]
 
     def test_sql_shape(self):
-        db = FakeDb([[(T0,)], [], [], [], []])
+        db = FakeDb([[], [(T0,)], []])
         spanner.refresh(db)
-        s1, s2, s3 = [c[1] for c in db.of("query")][3:]
-        assert "s.test != 'Overall'" in s1 and "REGEXP_EXTRACT(s.variant" in s1
-        assert "a.benchmark = 'jetstream2.slipstream'" in s2 and "EXP(AVG(LN(" in s2
-        assert "s.test = 'Overall' AND s.metric = 'Total-Score'" in s3
+        (agg,) = [c[1] for c in db.of("query") if "GROUP BY s.bot" in c[1]]
+        assert "IF(s.test = 'Overall', 'Total', s.test) AS test" in agg
+        assert "REGEXP_EXTRACT(s.variant" in agg
+        assert "s.test != 'Overall' AND s.metric IN ('Total-Score', 'Score', '')" in agg
+        assert "s.test = 'Overall' AND s.metric = 'Total-Score'" in agg
+        assert "FROM benchmarks" not in agg
 
     def test_nan_becomes_null(self):
-        db = FakeDb([[(T0,)], [], [("b",) * 13 + (float("nan"),)], [], []])
+        row = _item("t", 1.0, bench="x")[:13] + (float("nan"),)
+        db = FakeDb([[], [(T0,)], [row]])
         spanner.refresh(db)
         assert db.of("upsert")[0][3][0][-1] is None
 
-    def test_incomplete_import_blocks_refresh(self):
-        class IncompleteDb(FakeDb):
-            def query(self, sql, params=None):
-                self.calls.append(("query", " ".join(sql.split()), params))
-                return [("marker",)]
 
-        db = IncompleteDb()
-        assert spanner.refresh(db) == "an import is incomplete"
-        assert not any("MAX(imported_at)" in c[1] for c in db.of("query"))
+class TestGeomeanTotals:
+    def test_js2_group_without_total_gets_the_geomean(self):
+        rows = [_item("a", 2.0), _item("b", 8.0)]
+        (total,) = spanner._geomean_totals(rows)
+        assert total[:6] == ("b", "jetstream2.slipstream", "Total", "", "v", 1)
+        assert total[6:9] == (T0, "h", "slipstream")
+        assert total[9] == pytest.approx(4.0)  # sqrt(2 * 8)
+        assert total[10] == pytest.approx(2.0)  # sqrt(1 * 4)
+        assert total[11] == pytest.approx(8.0)  # sqrt(4 * 16)
+        assert total[12:] == (0.0, 3)
+
+    def test_harness_total_wins(self):
+        rows = [_item("a", 2.0), _item("b", 8.0), _item("Total", 5.0)]
+        assert spanner._geomean_totals(rows) == []
+
+    def test_only_js2_and_positive_means(self):
+        rows = [
+            _item("a", 2.0, bench="jetstream3.slipstream"),
+            _item("a", 0.0, commit=2),
+            _item("a", 3.0, commit=3, variant="w"),
+        ]
+        (total,) = spanner._geomean_totals(rows)
+        assert total[4:6] == ("w", 3) and total[9] == pytest.approx(3.0)
 
 
 class TestPushCsv:
@@ -207,7 +269,7 @@ class TestPushCsv:
         return FakeDb([[("slipstream",), ("benchmarks",), ("meta",)], *extra])
 
     def test_stages_then_aggregates(self):
-        db = self._db([[(T0,)], [], [], [], []])
+        db = self._db([[], [(T0,)], []])
         out = spanner.push_csv(db, "bot1", _csv({}, {"run": "2"}))
         assert out == "2 rows staged for bot1, aggregated"
         (up,) = db.of("upsert")
@@ -222,7 +284,7 @@ class TestPushCsv:
         assert db.of("query")[1:] == [("query", "SELECT CURRENT_TIMESTAMP()", None)]
 
     def test_rebuild_wipes_before_staging(self):
-        db = self._db([[(None,)]])
+        db = self._db([[], [(None,)]])
         out = spanner.push_csv(db, "b", _csv({}), rebuild=True)
         assert "(rebuild)" in out and "staging is empty" in out
         kinds = [c[0] for c in db.calls]
@@ -270,9 +332,7 @@ class TestSpannerSession:
     def test_one_session_stages_many_and_aggregates_once(self, monkeypatch):
         from slipstream.push import open_target
 
-        db = FakeDb(
-            [[("slipstream",), ("benchmarks",), ("meta",)], [(T0,)], [], [], []]
-        )
+        db = FakeDb([[("slipstream",), ("benchmarks",), ("meta",)], [], [(T0,)], []])
         self._connect(monkeypatch, db, {})
         session = open_target(PushTarget(spanner="p/i/d"), "bot1")
         session.deliver(_csv({}))
@@ -280,13 +340,13 @@ class TestSpannerSession:
         assert session.close() == "2 rows staged for bot1, aggregated"
         assert len(db.of("upsert")) == 2
         # One schema check and one refresh for both deliveries.
-        assert sum("INFORMATION_SCHEMA" in c[1] for c in db.of("query")) == 1
-        assert sum("MAX(imported_at)" in c[1] for c in db.of("query")) == 1
+        assert sum("INFORMATION_SCHEMA.TABLES" in c[1] for c in db.of("query")) == 1
+        assert sum("WHERE key = %s" in c[1] for c in db.of("query")) == 1
 
     def test_rebuild_wipes_once_before_the_first_delivery(self, monkeypatch):
         from slipstream.push import open_target
 
-        db = FakeDb([[("slipstream",), ("benchmarks",), ("meta",)], [(None,)]])
+        db = FakeDb([[("slipstream",), ("benchmarks",), ("meta",)], [], [(None,)]])
         self._connect(monkeypatch, db, {})
         session = open_target(PushTarget(spanner="p/i/d"), "b", rebuild=True)
         session.deliver(_csv({}))

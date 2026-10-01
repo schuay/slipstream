@@ -3,14 +3,15 @@
 
 """Push export CSVs into the perf Spanner database and aggregate them.
 
-The database feeds other perf frontends, so the schema in
+The database feeds other perf frontends, so the table shapes in
 ``data/spanner_schema.sql`` (including the stored trace_id on benchmarks)
-is fixed. Rows land in the ``slipstream`` staging table with an
-``imported_at`` stamp; ``refresh`` then re-aggregates only the
-(bot, benchmark, commit) groups that gained rows since the watermark in
-``meta`` into ``benchmarks``. Both steps are idempotent: staging rows are
-upserted on their primary key and aggregates are recomputed over the full
-run set of a group, so a replayed push converges to the same state.
+are fixed; the indexes are slipstream's own. Rows land in the
+``slipstream`` staging table with an ``imported_at`` stamp; ``refresh``
+then re-aggregates only the (bot, benchmark, commit) groups that gained
+rows since the watermark in ``meta`` into ``benchmarks``. Both steps are
+idempotent: staging rows are upserted on their primary key and aggregates
+are recomputed over the full run set of a group, so a replayed push
+converges to the same state.
 
 All Spanner I/O goes through :class:`SpannerDb` so the mapping and SQL can
 be tested against a recording fake.
@@ -25,6 +26,8 @@ import hashlib
 import io
 import math
 import os
+import re
+from collections import defaultdict
 from datetime import datetime, timezone
 from importlib.resources import files as pkg_files
 from pathlib import Path
@@ -43,6 +46,9 @@ AGG_TABLE = "benchmarks"
 META_TABLE = "meta"
 WATERMARK_KEY = "slipstream_last_imported_at"
 INCOMPLETE_PREFIX = "slipstream_incomplete_import:"
+# Indexes refresh() hints; declared in data/spanner_schema.sql.
+IMPORTED_AT_INDEX = "slipstream_imported_at_idx"
+GROUP_INDEX = "slipstream_group_idx"
 
 # google-cloud-spanner switches for multiplexed sessions, per transaction type.
 _MULTIPLEXED_SESSION_ENV = (
@@ -252,7 +258,12 @@ def schema_statements() -> list[str]:
 
 
 def ensure_schema(db) -> None:
-    """Apply the DDL only when a table is missing; DDL is slow even as a no-op."""
+    """Apply the DDL only when a table is missing; DDL is slow even as a no-op.
+
+    Indexes on an existing database are not touched: a backfill over the
+    staging table takes far longer than a push should, so index changes are
+    applied to the live database by hand (see :func:`index_drift`).
+    """
     have = {
         r[0]
         for r in db.query(
@@ -263,6 +274,41 @@ def ensure_schema(db) -> None:
         return
     for stmt in schema_statements():
         db.execute(stmt)
+
+
+_CREATE_INDEX = re.compile(r"CREATE INDEX IF NOT EXISTS (\w+)\s+ON (\w+)")
+
+
+def declared_indexes() -> dict[str, str]:
+    """Index name -> its CREATE statement, from the bundled DDL."""
+    out = {}
+    for stmt in schema_statements():
+        m = _CREATE_INDEX.match(stmt)
+        if m:
+            out[m.group(1)] = stmt
+    return out
+
+
+def index_drift(db) -> tuple[list[str], list[str], list[str]]:
+    """(missing, building, retired) index names relative to the bundled DDL.
+
+    ``retired`` are indexes on slipstream's tables that the DDL no longer
+    declares (earlier versions, or ones added by hand).
+    """
+    declared = declared_indexes()
+    live = {
+        r[0]: r[1]
+        for r in db.query(
+            "SELECT index_name, index_state FROM INFORMATION_SCHEMA.INDEXES"
+            " WHERE table_schema = '' AND index_type = 'INDEX'"
+            " AND table_name IN UNNEST(%s)",
+            [[IMPORT_TABLE, AGG_TABLE, META_TABLE]],
+        )
+    }
+    missing = [n for n in declared if n not in live]
+    building = [n for n in declared if live.get(n, "READ_WRITE") != "READ_WRITE"]
+    retired = sorted(n for n in live if n not in declared)
+    return missing, building, retired
 
 
 # --- Staging rows ---
@@ -322,7 +368,7 @@ def benchmark_name(suite: str) -> str:
 def commit_numbers(db, bot: str, benchmark: str) -> list[int]:
     """Commit numbers this bot has staged for a benchmark, ascending.
 
-    slipstream_refresh_idx is on (bot, benchmark, commit_number), so this reads
+    slipstream_group_idx is on (bot, benchmark, commit_number), so this reads
     the index rather than the table.
     """
     rows = db.query(
@@ -363,28 +409,92 @@ def _to_utc(raw) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
-def _upsert_select(db, table: str, columns: list[str], select_sql: str, params):
-    # INSERT OR UPDATE ... SELECT as one statement would exceed the mutation
-    # limit on large groups; select first, then upsert in batches.
-    rows = [
-        tuple(None if isinstance(v, float) and math.isnan(v) else v for v in row)
-        for row in db.query(select_sql, params)
-    ]
-    if rows:
-        db.upsert(table, columns, rows)
+def _clean(row) -> tuple:
+    return tuple(None if isinstance(v, float) and math.isnan(v) else v for v in row)
+
+
+# One pass over staging yields both the line items and the suite total:
+# Overall/Total-Score becomes test 'Total'. Staging has no line item named
+# 'Total', so the two never share a group.
+_AGG_SELECT = f"""
+    SELECT
+        s.bot, s.benchmark, IF(s.test = 'Overall', 'Total', s.test) AS test,
+        '' AS submetric, {_VARIANT_EXPR} AS variant, s.commit_number,
+        MIN(s.commit_time), MIN(s.git_hash), 'slipstream' AS source,
+        AVG(s.val), MIN(s.val), MAX(s.val),
+        COALESCE(STDDEV_SAMP(s.val), 0.0), COUNT(*)
+    FROM {{source}}
+    WHERE ((s.test != 'Overall' AND s.metric IN ('Total-Score', 'Score', ''))
+           OR (s.test = 'Overall' AND s.metric = 'Total-Score'))
+      {{where}}
+    GROUP BY s.bot, s.benchmark, IF(s.test = 'Overall', 'Total', s.test),
+        {_VARIANT_EXPR}, s.commit_number
+"""
+
+# JS2 groups without a harness total get the geomean of their line items. Only
+# historical data lacks one: suite runs always print it.
+_GEOMEAN_BENCHMARK = "jetstream2.slipstream"
+
+
+def _geomean_totals(rows: list[tuple]) -> list[tuple]:
+    """Total rows for JS2 groups that have line items but no Total."""
+    groups: dict[tuple, list[tuple]] = defaultdict(list)
+    have_total = set()
+    for r in rows:
+        bot, benchmark, test, _, variant, commit = r[:6]
+        if benchmark != _GEOMEAN_BENCHMARK:
+            continue
+        key = (bot, benchmark, variant, commit)
+        if test == "Total":
+            have_total.add(key)
+        elif r[9] is not None and r[9] > 0:
+            groups[key].append(r)
+    out = []
+    for key, items in groups.items():
+        if key in have_total:
+            continue
+        bot, benchmark, variant, commit = key
+
+        def geo(col, floor=None):
+            vals = [r[col] if floor is None else max(r[col], floor) for r in items]
+            return math.exp(sum(math.log(v) for v in vals) / len(vals))
+
+        times = [r[6] for r in items if r[6] is not None]
+        hashes = [r[7] for r in items if r[7] is not None]
+        out.append(
+            (
+                bot,
+                benchmark,
+                "Total",
+                "",
+                variant,
+                commit,
+                min(times) if times else None,
+                min(hashes) if hashes else None,
+                "slipstream",
+                geo(9),
+                geo(10, 1e-9),
+                geo(11, 1e-9),
+                0.0,
+                min(r[13] for r in items),
+            )
+        )
+    return out
 
 
 def refresh(db) -> str | None:
     """Aggregate staging into benchmarks. Returns None when it ran, else why not.
 
-    Steps, each an upsert into benchmarks:
-      1. line items: every test except Overall, variants cleaned;
-      2. JS2 Total as the geomean of its line items;
-      3. Overall/Total-Score as test 'Total' (overrides the geomean for JS2,
-         the only source of Total for JS3).
-    Only groups with a row newer than the watermark are recomputed, always
-    over the group's full run set. The watermark advances last, so a failed
-    step is retried next time.
+    Every (bot, benchmark, commit) group with a row newer than the watermark
+    in ``meta`` is recomputed over its full run set: line items (every test
+    but Overall, variants cleaned) and test 'Total' from Overall/Total-Score,
+    or for JS2 groups without one, the geomean of the line items. The
+    watermark advances last, so a failed run is retried next time.
+
+    Reads stay proportional to the new rows: the changed groups come off
+    the imported_at index, and each (bot, benchmark) pair is then read
+    through the covering group index at just those commits. Without a
+    watermark (first run) everything is aggregated in one scan.
     """
     incomplete = db.query(
         f"SELECT key FROM {META_TABLE} WHERE STARTS_WITH(key, %s) LIMIT 1",
@@ -392,11 +502,12 @@ def refresh(db) -> str | None:
     )
     if incomplete:
         return "an import is incomplete"
-
-    (raw_cutoff,) = db.query(f"SELECT MAX(imported_at) FROM {IMPORT_TABLE}")[0]
-    if raw_cutoff is None:
-        return "staging is empty"
-    cutoff = _to_utc(raw_cutoff)
+    missing, building, _ = index_drift(db)
+    if missing or building:
+        return (
+            f"indexes not ready ({', '.join(missing + building)});"
+            " the database is behind data/spanner_schema.sql"
+        )
 
     found = db.query(f"SELECT value FROM {META_TABLE} WHERE key = %s", [WATERMARK_KEY])
     try:
@@ -405,85 +516,42 @@ def refresh(db) -> str | None:
         # Silently treating this as "no watermark" would re-aggregate
         # everything on every push; make the operator fix the row.
         raise ValueError(f"unparseable {WATERMARK_KEY} in {META_TABLE}: {e}") from e
-    if last is not None and last >= cutoff:
-        return "no rows newer than the last refresh"
 
-    if last is not None:
-        # A derived table joined once. A correlated EXISTS made Spanner
-        # rescan staging per outer row and time out on large tables.
-        affected = (
-            f"INNER JOIN (SELECT DISTINCT bot, benchmark, commit_number"
-            f" FROM {IMPORT_TABLE} WHERE imported_at > %s) _ak"
-            " ON {A}.bot = _ak.bot AND {A}.benchmark = _ak.benchmark"
-            " AND {A}.commit_number = _ak.commit_number"
-        )
-        params = [last]
+    if last is None:
+        (raw_cutoff,) = db.query(f"SELECT MAX(imported_at) FROM {IMPORT_TABLE}")[0]
+        if raw_cutoff is None:
+            return "staging is empty"
+        rows = db.query(_AGG_SELECT.format(source=f"{IMPORT_TABLE} s", where=""), None)
     else:
-        affected = ""
-        params = []
+        changed = db.query(
+            f"SELECT bot, benchmark, commit_number, MAX(imported_at)"
+            f" FROM {IMPORT_TABLE}@{{FORCE_INDEX={IMPORTED_AT_INDEX}}}"
+            " WHERE imported_at > %s"
+            " GROUP BY bot, benchmark, commit_number",
+            [last],
+        )
+        if not changed:
+            return "no rows newer than the last refresh"
+        raw_cutoff = max(r[3] for r in changed)
+        commits: dict[tuple[str, str], list[int]] = defaultdict(list)
+        for bot, benchmark, commit, _ in changed:
+            commits[(bot, benchmark)].append(commit)
+        sql = _AGG_SELECT.format(
+            source=f"{IMPORT_TABLE}@{{FORCE_INDEX={GROUP_INDEX}}} s",
+            where="AND s.bot = %s AND s.benchmark = %s"
+            " AND s.commit_number IN UNNEST(%s)",
+        )
+        rows = []
+        for (bot, benchmark), nums in sorted(commits.items()):
+            rows += db.query(sql, [bot, benchmark, sorted(nums)])
 
-    _upsert_select(
-        db,
-        AGG_TABLE,
-        AGG_COLUMNS,
-        f"""
-        SELECT
-            s.bot, s.benchmark, s.test, '' AS submetric,
-            {_VARIANT_EXPR} AS variant, s.commit_number,
-            MIN(s.commit_time), MIN(s.git_hash), 'slipstream' AS source,
-            AVG(s.val), MIN(s.val), MAX(s.val),
-            COALESCE(STDDEV_SAMP(s.val), 0.0), COUNT(*)
-        FROM {IMPORT_TABLE} s
-        {affected.replace("{A}", "s")}
-        WHERE s.metric IN ('Total-Score', 'Score', '')
-          AND s.test != 'Overall'
-        GROUP BY s.bot, s.benchmark, s.test, {_VARIANT_EXPR}, s.commit_number
-        """,
-        params,
-    )
-    _upsert_select(
-        db,
-        AGG_TABLE,
-        AGG_COLUMNS,
-        f"""
-        SELECT
-            a.bot, a.benchmark, 'Total' AS test, '' AS submetric,
-            a.variant, a.commit_number,
-            MIN(a.commit_time), MIN(a.git_hash), 'slipstream' AS source,
-            EXP(AVG(LN(a.mean))),
-            EXP(AVG(LN(GREATEST(a.min, 1e-9)))),
-            EXP(AVG(LN(GREATEST(a.max, 1e-9)))),
-            0.0, MIN(a.count)
-        FROM {AGG_TABLE} a
-        {affected.replace("{A}", "a")}
-        WHERE a.benchmark = 'jetstream2.slipstream'
-          AND a.test != 'Total' AND a.submetric = '' AND a.mean > 0
-        GROUP BY a.bot, a.benchmark, a.variant, a.commit_number
-        """,
-        params,
-    )
-    _upsert_select(
-        db,
-        AGG_TABLE,
-        AGG_COLUMNS,
-        f"""
-        SELECT
-            s.bot, s.benchmark, 'Total' AS test, '' AS submetric,
-            {_VARIANT_EXPR} AS variant, s.commit_number,
-            MIN(s.commit_time), MIN(s.git_hash), 'slipstream' AS source,
-            AVG(s.val), MIN(s.val), MAX(s.val),
-            COALESCE(STDDEV_SAMP(s.val), 0.0), COUNT(*)
-        FROM {IMPORT_TABLE} s
-        {affected.replace("{A}", "s")}
-        WHERE s.test = 'Overall' AND s.metric = 'Total-Score'
-        GROUP BY s.bot, s.benchmark, {_VARIANT_EXPR}, s.commit_number
-        """,
-        params,
-    )
-
+    rows = [_clean(r) for r in rows]
+    rows += _geomean_totals(rows)
+    if rows:
+        db.upsert(AGG_TABLE, AGG_COLUMNS, rows)
     db.execute(
         f"INSERT OR UPDATE INTO {META_TABLE} (key, value) VALUES (%s, %s)",
-        [WATERMARK_KEY, cutoff.isoformat()],
+        [WATERMARK_KEY, _to_utc(raw_cutoff).isoformat()],
     )
     return None
 
