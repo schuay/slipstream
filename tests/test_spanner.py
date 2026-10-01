@@ -219,6 +219,31 @@ class TestRefresh:
         # The cutoff is the newest row seen, not a scan of the whole table.
         assert db.calls[-1][2] == [spanner.WATERMARK_KEY, T0.isoformat()]
 
+    def test_watermark_keeps_nanoseconds(self):
+        # Spanner timestamps carry nanoseconds; a microsecond watermark would
+        # sit just below the newest row and re-select it on every refresh.
+        from google.api_core.datetime_helpers import DatetimeWithNanoseconds
+
+        newest = DatetimeWithNanoseconds.from_rfc3339("2026-10-01T13:00:57.544872375Z")
+        db = FakeDb(
+            [[("2026-10-01T12:00:00.000000001Z",)], [("c", "x", 5, newest)], []]
+        )
+        assert spanner.refresh(db) is None
+        (keys,) = [c for c in db.of("query") if "MAX(imported_at)" in c[1]]
+        assert keys[2][0].nanosecond == 1
+        assert db.calls[-1][2] == [
+            spanner.WATERMARK_KEY,
+            "2026-10-01T13:00:57.544872375Z",
+        ]
+
+    def test_legacy_isoformat_watermark_still_parses(self):
+        db = FakeDb([[("2026-10-01T05:45:11.359679+00:00",)], []])
+        assert spanner.refresh(db) == "no rows newer than the last refresh"
+        (keys,) = [c for c in db.of("query") if "MAX(imported_at)" in c[1]]
+        assert keys[2] == [
+            datetime(2026, 10, 1, 5, 45, 11, 359679, tzinfo=timezone.utc)
+        ]
+
     def test_sql_shape(self):
         db = FakeDb([[], [(T0,)], []])
         spanner.refresh(db)

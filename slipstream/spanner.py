@@ -452,6 +452,27 @@ def _to_utc(raw) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
+# The watermark keeps Spanner's nanosecond precision. A plain datetime stops
+# at microseconds, which leaves it just below the newest imported_at, so
+# every refresh would re-aggregate the last push.
+def _watermark_text(raw) -> str:
+    from google.api_core.datetime_helpers import DatetimeWithNanoseconds
+
+    if isinstance(raw, DatetimeWithNanoseconds):
+        return raw.rfc3339()
+    return _to_utc(raw).isoformat()
+
+
+def _parse_watermark(text: str) -> datetime:
+    from google.api_core.datetime_helpers import DatetimeWithNanoseconds
+
+    try:
+        return DatetimeWithNanoseconds.from_rfc3339(text)
+    except ValueError:
+        # Older rows were written with isoformat() ("+00:00", microseconds).
+        return _to_utc(text)
+
+
 def _clean(row) -> tuple:
     return tuple(None if isinstance(v, float) and math.isnan(v) else v for v in row)
 
@@ -554,7 +575,7 @@ def refresh(db) -> str | None:
 
     found = db.query(f"SELECT value FROM {META_TABLE} WHERE key = %s", [WATERMARK_KEY])
     try:
-        last = _to_utc(found[0][0]) if found else None
+        last = _parse_watermark(found[0][0]) if found else None
     except ValueError as e:
         # Silently treating this as "no watermark" would re-aggregate
         # everything on every push; make the operator fix the row.
@@ -594,7 +615,7 @@ def refresh(db) -> str | None:
         db.upsert(AGG_TABLE, AGG_COLUMNS, rows)
     db.execute(
         f"INSERT OR UPDATE INTO {META_TABLE} (key, value) VALUES (%s, %s)",
-        [WATERMARK_KEY, _to_utc(raw_cutoff).isoformat()],
+        [WATERMARK_KEY, _watermark_text(raw_cutoff)],
     )
     return None
 
