@@ -807,7 +807,7 @@ def relay(
     )
 
     def echo(msg: str) -> None:
-        typer.echo(f"  {msg}")
+        typer.echo(f"[{time_mod.strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
     try:
         if rebuild:
@@ -819,11 +819,14 @@ def relay(
         raise typer.Exit(1)
 
     interval_secs = _parse_interval(interval)
+    echo(f"Relay started (sources={len(cfg.relays)}, interval={interval})")
     try:
         while True:
+            echo("Polling relay sources")
             relay_all(cfg, echo)
             if once:
                 break
+            echo(f"Next relay poll in {interval}")
             time.sleep(interval_secs)
     except KeyboardInterrupt:
         typer.echo("Relay stopped.")

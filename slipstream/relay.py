@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -101,6 +102,7 @@ def relay_source(
         return 0
     pending = [s for s in seqs if s > cursor]
     if not pending:
+        log(f"{source.bot_name}: up to date (cursor {cursor})")
         return 0
 
     # Everything up to the first hole is deliverable; the hole itself is the
@@ -139,17 +141,30 @@ def _deliver(
     """Deliver a contiguous run of entries, advancing the cursor after each."""
     delivered = 0
     sessions = []
+    started = time.monotonic()
+    log(
+        f"{source.bot_name}: starting delivery of {len(pending)} file(s) "
+        f"from {source.ssh_host} (sequences {pending[0]}..{pending[-1]})"
+    )
     try:
         for target in cfg.push.targets:
+            log(
+                f"{source.bot_name}: opening target "
+                f"{target.spanner or target.spool_dir} (waiting if busy)"
+            )
             sessions.append(open_target(target, source.bot_name))
         for seq in pending:
             name = seq_name(seq)
+            log(f"{source.bot_name}: fetching {name} from {source.ssh_host}")
             try:
                 csv_text = spool.fetch(seq)
             except Exception as e:
                 log(f"{source.bot_name}: fetching {name} from {source.ssh_host}: {e}")
                 break
             try:
+                log(
+                    f"{source.bot_name}: delivering {name} ({len(csv_text.encode('utf-8'))} bytes)"
+                )
                 for session in sessions:
                     session.deliver(csv_text)
             except Exception as e:
@@ -166,9 +181,13 @@ def _deliver(
                 log(f"{source.bot_name}: recording the cursor at {seq} failed: {e}")
                 break
             delivered += 1
+            log(f"{source.bot_name}: delivered {name}; cursor {seq}")
     finally:
         for session in sessions:
             try:
+                log(
+                    f"{source.bot_name}: finishing target (including aggregation if enabled)"
+                )
                 summary = session.close()
             except Exception as e:
                 # The delivered rows are staged and the cursor is left
@@ -178,6 +197,10 @@ def _deliver(
             else:
                 if summary:
                     log(f"{source.bot_name}: {summary}")
+        log(
+            f"{source.bot_name}: delivery finished, {delivered}/{len(pending)} "
+            f"file(s) in {time.monotonic() - started:.1f}s"
+        )
     return delivered
 
 

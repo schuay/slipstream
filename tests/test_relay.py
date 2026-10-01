@@ -174,7 +174,10 @@ class TestRelaySource:
         assert n == 3
         assert len(delivered.state["sessions"]) == 1
         assert delivered.state["closes"] == 1
-        assert logs == ["box2: 3 rows staged"]
+        assert "box2: 3 rows staged" in logs
+        assert "starting delivery of 3 file(s)" in logs[0]
+        assert sum("delivered 000000" in m for m in logs) == 3
+        assert "delivery finished, 3/3 file(s)" in logs[-1]
 
     def test_failure_stops_the_source_at_the_cursor(self, tmp_path, delivered):
         delivered.state["fail_on"] = "b"
@@ -514,7 +517,7 @@ def test_relay_stages_every_entry_over_one_spanner_session(tmp_path, monkeypatch
     assert [c[1] for c in db.of("upsert")] == ["slipstream", "slipstream"]
     assert sum("INFORMATION_SCHEMA" in c[1] for c in db.of("query")) == 1
     assert sum("MAX(imported_at)" in c[1] for c in db.of("query")) == 1
-    assert logs == ["box2: 2 rows staged for box2, aggregated"]
+    assert "box2: 2 rows staged for box2, aggregated" in logs
     assert db.calls[-1] == ("close",)
 
 

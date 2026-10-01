@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import pytest
 
@@ -245,12 +247,24 @@ class TestSpannerSession:
         assert up[1] == spanner.IMPORT_TABLE and len(up[3]) == 2
         assert db.calls[-1] == ("close",)
 
-    def test_concurrent_local_session_is_rejected(self, monkeypatch, tmp_path):
+    def test_concurrent_local_session_waits(self, monkeypatch, tmp_path):
         monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
         first = spanner._acquire_local_lock("p/i/d")
-        with pytest.raises(RuntimeError, match="another local delivery"):
-            spanner._acquire_local_lock("/p/i/d/")
-        first.close()
+        started = Event()
+
+        def acquire():
+            started.set()
+            return spanner._acquire_local_lock("/p/i/d/")
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(acquire)
+            try:
+                assert started.wait(2)
+                with pytest.raises(TimeoutError):
+                    future.result(timeout=0.1)
+            finally:
+                first.close()
+            future.result(timeout=2).close()
 
     def test_one_session_stages_many_and_aggregates_once(self, monkeypatch):
         from slipstream.push import open_target

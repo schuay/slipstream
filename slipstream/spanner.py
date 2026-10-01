@@ -208,7 +208,7 @@ def connect(spec: str, *, exclusive: bool = True) -> SpannerDb:
 
 
 def _acquire_local_lock(spec: str):
-    """Exclude other processes on this machine from the same database."""
+    """Wait for other local deliveries to the same database to finish."""
     cache_dir = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     lock_dir = cache_dir / "slipstream" / "locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
@@ -216,12 +216,10 @@ def _acquire_local_lock(spec: str):
     digest = hashlib.sha256(canonical_spec.encode()).hexdigest()
     lock = open(lock_dir / f"spanner-{digest}.lock", "w")
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as e:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    except BaseException:
         lock.close()
-        raise RuntimeError(
-            f"another local delivery to Spanner target {spec} is active"
-        ) from e
+        raise
     return lock
 
 
