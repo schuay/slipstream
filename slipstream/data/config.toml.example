@@ -92,7 +92,7 @@ suite = "js3"
 #
 # [[push.targets]]
 # spanner = "project/instance/database"
-# # refresh = true    # aggregate into benchmarks after each push
+# # refresh = true    # aggregate once per delivery cycle, including idle cycles
 #
 # A machine without Spanner access appends each push to a spool log:
 #
@@ -101,7 +101,7 @@ suite = "js3"
 # # retain_days = 90                   # entries are dropped once older
 #
 # and a machine that can ssh to it drains the log into its own targets with
-# `slipstream relay`, tracking what it has read in <cursor_dir>/<bot_name>.cursor:
+# `slipstream deliver`, tracking what it has read in <cursor_dir>/<bot_name>.cursor:
 #
 # [[relay]]
 # ssh_host = "box2"                    # SSH config alias
@@ -149,3 +149,21 @@ suite = "js3"
 #
 # [host]
 # preflight = "warn"    # "warn" (default), "abort", or "off"
+
+# Delivery runs separately from collector-only watch. Keep [[relay]] for remote
+# spool sources; the relay CLI is removed. All omitted keys use these defaults.
+# [delivery]
+# local = true                      # false on remote-only / build-only machines
+# remote = true                     # false to disable configured SSH sources
+# poll_seconds = 10
+# quantum = 2                       # commits/files per source; local engines rotate
+# max_units = 16
+# max_rows = 100000                  # soft cycle bound
+# max_bytes = 8388608                # soft cycle bound (8 MiB)
+# max_payload_bytes = 67108864       # hard individual payload bound (64 MiB)
+# cycle_seconds = 120               # stop starting new units after this budget
+# lock_seconds = 30
+# io_seconds = 30                   # supervised Spanner operation / SSH transfer
+# shutdown_seconds = 15
+# retry_seconds = 5
+# max_retry_seconds = 300

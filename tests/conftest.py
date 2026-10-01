@@ -26,6 +26,7 @@ def isolated_machine_lock(tmp_path_factory, monkeypatch):
     production; the defaults are read at call time so a test can.
     """
     locks = tmp_path_factory.mktemp("locks")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(locks))
     monkeypatch.setattr(lock_mod, "MACHINE_LOCK", locks / "machine.lock")
     monkeypatch.setattr(lock_mod, "PAUSE_FILE", locks / "pause")
 

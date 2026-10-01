@@ -59,7 +59,7 @@ class TestParseCursorArg:
             parse_cursor_arg(value)
 
 
-class TestRelayAdmin:
+class TestDeliveryAdmin:
     """--rebuild and --reset-cursor act on the cursor before the first cycle."""
 
     def _cfg(self, tmp_path, target):
@@ -78,16 +78,29 @@ class TestRelayAdmin:
         from slipstream.cli import app
 
         class FakeSpool:
-            def __init__(self, host, spool_dir):
+            def __init__(self, host, spool_dir, **kwargs):
                 pass
 
-            def list(self):
+            def list(self, **kwargs):
                 return list(entries)
 
-        monkeypatch.setattr("slipstream.relay.RemoteSpool", FakeSpool)
-        monkeypatch.setattr("slipstream.relay.relay_all", lambda cfg, log: 0)
+            def fetch(self, seq):
+                from tests.test_spanner import _csv
+
+                return _csv({})
+
+        monkeypatch.setattr("slipstream.delivery_sources.RemoteSpool", FakeSpool)
+        monkeypatch.setattr(
+            "slipstream.delivery.Coordinator.run", lambda self, **kw: True
+        )
+        from slipstream.delivery_targets import SpannerSession
+
+        monkeypatch.setattr(
+            "slipstream.delivery_targets.BoundedSpannerSession",
+            lambda target, **kw: SpannerSession(target),
+        )
         return CliRunner().invoke(
-            app, ["relay", "--once", "--config", str(cfg_path), *args]
+            app, ["deliver", "--once", "--config", str(cfg_path), *args]
         )
 
     def test_reset_cursor_writes_the_file(self, tmp_path, monkeypatch):
@@ -109,20 +122,20 @@ class TestRelayAdmin:
         cfg = self._cfg(tmp_path, f'spool_dir = "{tmp_path}/outbox"')
 
         class BrokenSpool:
-            def __init__(self, host, spool_dir):
+            def __init__(self, host, spool_dir, **kwargs):
                 pass
 
-            def list(self):
+            def list(self, **kwargs):
                 raise subprocess.CalledProcessError(255, "ssh")
 
-        monkeypatch.setattr("slipstream.relay.RemoteSpool", BrokenSpool)
+        monkeypatch.setattr("slipstream.delivery_sources.RemoteSpool", BrokenSpool)
         from typer.testing import CliRunner
 
         from slipstream.cli import app
 
         res = CliRunner().invoke(
             app,
-            ["relay", "--once", "--config", str(cfg), "--reset-cursor", "b2"],
+            ["deliver", "--once", "--config", str(cfg), "--reset-cursor", "b2"],
         )
         assert res.exit_code == 1
         assert "Error:" in res.output
@@ -132,7 +145,7 @@ class TestRelayAdmin:
         cfg = self._cfg(tmp_path, 'spanner = "p/i/d"')
         monkeypatch.setattr(
             "slipstream.spanner.connect",
-            lambda spec: (_ for _ in ()).throw(RuntimeError("delivery active")),
+            lambda spec, **kw: (_ for _ in ()).throw(RuntimeError("delivery active")),
         )
         res = self._run(cfg, ["--rebuild", "b2"], monkeypatch)
         assert res.exit_code == 1
@@ -144,7 +157,7 @@ class TestRelayAdmin:
         from slipstream.relay import read_cursor
 
         monkeypatch.setattr(
-            spanner, "connect", lambda spec: pytest.fail("wiped before checking")
+            spanner, "connect", lambda spec, **kw: pytest.fail("wiped before checking")
         )
         cfg = self._cfg(tmp_path, 'spanner = "p/i/d"')
         res = self._run(cfg, ["--rebuild", "b2"], monkeypatch, entries=(4, 5))
@@ -163,7 +176,9 @@ class TestRelayAdmin:
         from slipstream import spanner
         from slipstream.relay import read_cursor
 
-        monkeypatch.setattr(spanner, "connect", lambda spec: pytest.fail("no spanner"))
+        monkeypatch.setattr(
+            spanner, "connect", lambda spec, **kw: pytest.fail("no spanner")
+        )
         cfg = self._cfg(tmp_path, f'spool_dir = "{tmp_path}/outbox"')
         res = self._run(
             cfg, ["--rebuild", "b2", "--force"], monkeypatch, entries=(4, 5)
@@ -188,11 +203,16 @@ class TestRelayAdmin:
         wiped = []
 
         class Db:
+            def query(self, *args):
+                return [("slipstream",), ("benchmarks",), ("meta",)]
+
             def close(self):
                 wiped.append("closed")
 
-        monkeypatch.setattr(spanner, "connect", lambda spec: Db())
-        monkeypatch.setattr(spanner, "wipe_bot", lambda db, bot: wiped.append(bot) or 3)
+        monkeypatch.setattr(spanner, "connect", lambda spec, **kw: Db())
+        monkeypatch.setattr(
+            spanner, "rebuild_bot", lambda db, bot: wiped.append(bot) or 3
+        )
         cfg = self._cfg(tmp_path, 'spanner = "p/i/d"')
         res = self._run(cfg, ["--rebuild", "b2"], monkeypatch)
         assert res.exit_code == 0, res.output

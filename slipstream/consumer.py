@@ -73,7 +73,7 @@ class ConsumerError(RuntimeError):
 # reachable from a bench cycle: a truncated archive from a zstd killed
 # mid-stream, and "database or disk is full" from any of the store writes the
 # cycle makes. Either would escape drain, kill the daemon and take the
-# git-driven engines and the pusher with it.
+# git-driven engines and delivery with it.
 TRANSPORT_ERRORS = (
     ConsumerError,
     BusError,
@@ -141,7 +141,6 @@ class BusConsumer:
         collector: BenchCollector,
         *,
         log: Callable[[str], None] | None = None,
-        on_commit_done: Callable[[], None] | None = None,
         dry_run: bool = False,
         interval_secs: float = DEFAULT_INTERVAL_SECS,
     ):
@@ -149,7 +148,6 @@ class BusConsumer:
         self.collector = collector
         self.store = collector.store
         self.log = log or (lambda msg: None)
-        self.on_commit_done = on_commit_done
         self.dry_run = dry_run
         self.interval_secs = interval_secs
         if cfg.bus is None:
@@ -293,7 +291,6 @@ class BusConsumer:
             commit,
             root,
             runs,
-            on_commit_done=self.on_commit_done,
             provenance=provenance,
         )
 
@@ -314,7 +311,7 @@ class BusConsumer:
         on several paths, both under a filesystem that a stalled or paused
         cycle is very likely reacting to being full, and an escape here unwinds
         watch's per-engine loop and takes the daemon down with the git-driven
-        engines and the pusher.
+        engines and delivery.
         """
         self._benched = 0
         try:

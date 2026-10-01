@@ -19,27 +19,18 @@ be tested against a recording fake.
 
 from __future__ import annotations
 
-import contextlib
 import csv
-import fcntl
-import hashlib
 import io
 import math
 import os
 import re
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from importlib.resources import files as pkg_files
 from pathlib import Path
 
 from .config import parse_spanner_spec
-
-# The pusher thread holds a gRPC channel open while the collector forks
-# benchmarks, and where that is a real fork (macOS, which has no vfork path in
-# subprocess) grpc's atfork handlers log stale poller fds over the progress
-# output. Muting them is a workaround: the fix is to move BackgroundPusher into
-# its own process. Must be set before google.cloud.spanner imports grpc.
-os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 
 IMPORT_TABLE = "slipstream"
 AGG_TABLE = "benchmarks"
@@ -142,13 +133,26 @@ class SpannerDb:
             raise ConnectionError(f"Spanner auth check failed: {e}") from e
 
     def query(self, sql: str, params: list | None = None) -> list[tuple]:
+        started = time.monotonic()
+        self._log(f"query start sql={' '.join(sql.split())[:160]}")
         with self._con.cursor() as cur:
             cur.execute(sql, params or None)
-            return [tuple(r) for r in cur.fetchall()]
+            rows = [tuple(r) for r in cur.fetchall()]
+        self._log(
+            f"query rows={len(rows)} elapsed={time.monotonic() - started:.3f}s sql={' '.join(sql.split())[:160]}"
+        )
+        return rows
 
     def execute(self, sql: str, params: list | None = None) -> None:
+        started = time.monotonic()
         with self._con.cursor() as cur:
             cur.execute(sql, params or None)
+        self._log(
+            f"execute elapsed={time.monotonic() - started:.3f}s sql={' '.join(sql.split())[:100]}"
+        )
+
+    def _log(self, msg):
+        getattr(self, "log", lambda msg: None)(msg)
 
     def partitioned_dml(self, sql: str, params: dict[str, str | int]) -> int:
         """Run DML over the whole table without the per-transaction limit."""
@@ -169,43 +173,48 @@ class SpannerDb:
         # so budget three times the column count and aim for half the limit.
         chunk = max(500, 40_000 // (max(1, len(columns)) * 3))
         for i in range(0, len(rows), chunk):
+            started = time.monotonic()
+            self._log(
+                f"write start table={table} chunk={i // chunk + 1} rows={len(rows[i : i + chunk])}"
+            )
             with self._database.batch() as batch:
                 batch.insert_or_update(
                     table=table, columns=columns, values=rows[i : i + chunk]
                 )
+            self._log(
+                f"write complete table={table} elapsed={time.monotonic() - started:.3f}s"
+            )
 
     def close(self) -> None:
-        try:
-            self._con.close()
-        finally:
+        errors = []
+        for step in (self._con.close, self._release_channels):
             try:
-                self._release_channels()
-            finally:
-                lock = getattr(self, "_local_lock", None)
-                if lock is not None:
-                    lock.close()
+                step()
+            except Exception as exc:
+                errors.append(exc)
+                self._log(f"cleanup failed: {type(exc).__name__}: {exc}")
+        lock = getattr(self, "_local_lock", None)
+        if lock is not None:
+            lock.close()
+        if errors:
+            raise errors[0]
 
     def _release_channels(self) -> None:
-        """Close the gRPC channels this connection opened.
-
-        The DB-API close only clears the session pool, and each of these
-        clients holds a channel of its own, so a daemon that connects per push
-        accumulates descriptors until grpc aborts the process trying to make
-        another wakeup fd. Only already-created clients are touched: reading
-        the public property would build a channel for the sake of closing it.
-        """
-        # Stops the multiplexed-session thread and deletes its session, so it
-        # has to run while the channel it needs is still up.
+        """Attempt every cleanup step; report failure after releasing resources."""
+        errors = []
         for step in (
             lambda: self._database.close(),
             lambda: self._api_transport(self._database, "_spanner_api"),
             lambda: self._api_transport(self._client, "_database_admin_api"),
             lambda: self._api_transport(self._client, "_instance_admin_api"),
         ):
-            # A cleanup failure must not mask the error that led here, nor cost
-            # the caller the rest of the teardown.
-            with contextlib.suppress(Exception):
+            try:
                 step()
+            except Exception as exc:
+                errors.append(exc)
+                self._log(f"channel cleanup failed: {type(exc).__name__}: {exc}")
+        if errors:
+            raise errors[0]
 
     @staticmethod
     def _api_transport(owner, attr: str) -> None:
@@ -234,17 +243,18 @@ def connect(spec: str, *, exclusive: bool = True) -> SpannerDb:
 
 def _acquire_local_lock(spec: str):
     """Wait for other local deliveries to the same database to finish."""
+    from .durability import FileLock, identity_digest
+
     cache_dir = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-    lock_dir = cache_dir / "slipstream" / "locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
     canonical_spec = "/".join(parse_spanner_spec(spec))
-    digest = hashlib.sha256(canonical_spec.encode()).hexdigest()
-    lock = open(lock_dir / f"spanner-{digest}.lock", "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-    except BaseException:
-        lock.close()
-        raise
+    path = (
+        cache_dir
+        / "slipstream"
+        / "locks"
+        / f"spanner-{identity_digest(canonical_spec)}.lock"
+    )
+    lock = FileLock(path)
+    lock.__enter__()
     return lock
 
 
@@ -331,10 +341,22 @@ def variant_label(engine: str, flags: str) -> str:
 
 def rows_from_csv(csv_text: str, bot: str, imported_at: datetime) -> list[tuple]:
     """Map export CSV rows to staging rows in IMPORT_COLUMNS order."""
+    reader = csv.DictReader(io.StringIO(csv_text), skipinitialspace=True)
+    from .delivery_batch import COLUMNS
+
+    return rows_from_records(
+        [tuple(r.get(c, "") for c in COLUMNS) for r in reader], bot, imported_at
+    )
+
+
+def rows_from_records(records, bot: str, imported_at: datetime) -> list[tuple]:
+    from .delivery_batch import COLUMNS
+
     rows = []
-    for r in csv.DictReader(io.StringIO(csv_text), skipinitialspace=True):
+    for record in records:
+        r = dict(zip(COLUMNS, record))
         suite = r["suite"].strip()
-        ts = r.get("commit_timestamp", "").strip()
+        ts = str(r.get("commit_timestamp", "")).strip()
         commit_time = datetime.fromtimestamp(int(ts), tz=timezone.utc) if ts else None
         rows.append(
             (
@@ -344,8 +366,8 @@ def rows_from_csv(csv_text: str, bot: str, imported_at: datetime) -> list[tuple]
                 r["metric"].strip(),
                 variant_label(r["engine"].strip(), r["flags"].strip()),
                 r["platform"].strip(),
-                int(r["commit_id"]),
-                int(r["run"]),
+                int(str(r["commit_id"])),
+                int(str(r["run"])),
                 commit_time,
                 r.get("git_hash", "").strip() or None,
                 float(r["score"]),
@@ -384,6 +406,27 @@ def wipe_bot(db, bot: str) -> int:
     return db.partitioned_dml(
         f"DELETE FROM {IMPORT_TABLE} WHERE bot = @bot", {"bot": bot}
     )
+
+
+def rebuild_bot(db, bot: str) -> int:
+    """Explicit destructive repair, including obsolete aggregate score keys."""
+    count = wipe_bot(db, bot)
+    db.partitioned_dml(
+        f"DELETE FROM {AGG_TABLE} WHERE bot = @bot AND source = 'slipstream'",
+        {"bot": bot},
+    )
+    # After the explicit full wipe, old imports for this bot contain no partial
+    # raw rows. Preserve other bots' markers and the global refresh watermark.
+    db.partitioned_dml(
+        f"DELETE FROM {META_TABLE} WHERE key = @legacy OR "
+        "(STARTS_WITH(key, @prefix) AND STARTS_WITH(value, @bot))",
+        {
+            "legacy": INCOMPLETE_PREFIX + bot,
+            "prefix": INCOMPLETE_PREFIX + "attempt:",
+            "bot": f"{len(bot)}:{bot}:",
+        },
+    )
+    return count
 
 
 # --- Aggregation ---
@@ -501,7 +544,7 @@ def refresh(db) -> str | None:
         [INCOMPLETE_PREFIX],
     )
     if incomplete:
-        return "an import is incomplete"
+        return f"an import is incomplete ({incomplete[0][0]}); shared-target refresh blocked"
     missing, building, _ = index_drift(db)
     if missing or building:
         return (
@@ -566,12 +609,15 @@ def stage_rows(db, rows: list[tuple]) -> int:
     return len(rows)
 
 
-def begin_import(db, bot: str) -> str:
-    """Persist a marker that prevents refresh after partial staging."""
-    key = f"{INCOMPLETE_PREFIX}{bot}"
+def begin_import(db, bot: str, attempt: str, digest: str) -> str:
+    """Only the exact interrupted attempt may clear its own import marker.
+
+    Legacy per-bot markers deliberately remain until explicit reconciliation.
+    """
+    key = f"{INCOMPLETE_PREFIX}attempt:{attempt}"
     db.execute(
         f"INSERT OR UPDATE INTO {META_TABLE} (key, value) VALUES (%s, %s)",
-        [key, "staging"],
+        [key, f"{len(bot)}:{bot}:{digest}"],
     )
     return key
 
@@ -608,7 +654,10 @@ def push_csv(
     rows = rows_from_csv(csv_text, bot, current_timestamp(db))
     if rebuild:
         wipe_bot(db, bot)
-    marker = begin_import(db, bot)
+    from .durability import identity_digest
+
+    digest = identity_digest(csv_text)
+    marker = begin_import(db, bot, identity_digest(bot + ":" + digest), digest)
     n_rows = stage_rows(db, rows)
     finish_import(db, marker)
     return summary_line(

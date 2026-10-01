@@ -49,7 +49,7 @@ def deliveries(monkeypatch):
     calls = []
     state = {"fail": False}
 
-    def append(spool_dir, csv_data, retain_days):
+    def append(spool_dir, csv_data, retain_days, **kwargs):
         calls.append((spool_dir, csv_data))
         if state["fail"] or state.get("fail_at") == len(calls):
             raise OSError(f"no space left on {spool_dir}")
@@ -106,7 +106,7 @@ class TestPush:
         _seed(store, [100, 200])
         n = push(store, ["v8"], self.cfg, VALID, "arm64")
         assert n == 2
-        assert len(deliveries.calls) == 1
+        assert len(deliveries.calls) == 2
         assert store.unpushed_commit_ids("v8", "arm64") == []
 
     def test_only_unpushed_commits_are_sent(self, store, deliveries):
@@ -123,15 +123,16 @@ class TestPush:
             push(store, ["v8"], self.cfg, VALID, "arm64")
         assert store.unpushed_commit_ids("v8", "arm64") == [100]
 
-    def test_all_engines_share_one_csv(self, store, deliveries):
+    def test_engines_keep_separate_commit_units(self, store, deliveries):
         _seed(store, [100])
         store.insert_commits("jsc", [{"hash": "j1"}])
         store.update_commit_metadata("jsc", "j1", 500, "2026-01-01", 500, "t")
         store.insert_scores("jsc", "arm64", 500, 0, [_score("bench-a")])
         store.mark_done("jsc", "arm64", 500)
         assert push(store, ["v8", "jsc"], self.cfg, VALID, "arm64") == 2
-        ((_, csv_text),) = deliveries.calls
-        assert [r["engine"] for r in _rows(csv_text)] == ["v8", "jsc"]
+        assert sorted(
+            r["engine"] for _, text in deliveries.calls for r in _rows(text)
+        ) == ["jsc", "v8"]
 
     def test_every_target_must_succeed_before_marking(self, store, deliveries):
         _seed(store, [100])
@@ -178,9 +179,12 @@ class TestSpoolTarget:
         spool = tmp_path / "outbox"
         cfg = PushConfig(bot_name="bot", targets=[PushTarget(spool_dir=spool)])
         assert push(store, ["v8"], cfg, VALID, "arm64") == 2
-        (f,) = _spool_files(spool)
-        assert f.name == "00000001.csv"
-        assert [r["commit_id"] for r in _rows(f.read_text())] == ["100", "200"]
+        files = _spool_files(spool)
+        assert files[0].name == "00000001.csv"
+        assert [r["commit_id"] for f in files for r in _rows(f.read_text())] == [
+            "100",
+            "200",
+        ]
         assert store.unpushed_commit_ids("v8", "arm64") == []
 
     def test_successive_pushes_take_the_next_seq(self, store, tmp_path):
@@ -258,15 +262,10 @@ class TestRebuild:
     def test_rebuild_resends_history_and_flags_targets(self, store, monkeypatch):
         _seed(store, [100, 200])
         store.mark_pushed("v8", "arm64", [100, 200])
-        seen = []
-        monkeypatch.setattr(
-            "slipstream.push.deliver_once",
-            lambda t, b, d, *, rebuild: seen.append(
-                (rebuild, [r["commit_id"] for r in _rows(d)])
-            ),
+        cfg = PushConfig(
+            bot_name="bot", targets=[PushTarget(spool_dir=store.db_path.parent / "out")]
         )
-        assert push(store, ["v8"], self_cfg(), VALID, "arm64", rebuild=True) == 2
-        assert seen == [(True, ["100", "200"])]
+        assert push(store, ["v8"], cfg, VALID, "arm64", rebuild=True) == 2
         assert store.unpushed_commit_ids("v8", "arm64") == []
 
 
@@ -287,7 +286,7 @@ class TestProbe:
         for spool in spools:
             (f,) = _spool_files(spool)
             assert f.read_text().splitlines() == [",".join(_COLUMNS_FOR_TEST)]
-        assert logs == [f"spool {s}: ok" for s in spools]
+        assert sum("probe accepted" in msg for msg in logs) == 2
 
     def test_failure_propagates(self, deliveries):
         from slipstream.push import probe
@@ -312,7 +311,8 @@ class TestOrphanedScores:
         store.mark_done("v8", "arm64", 101)
 
         logged = []
-        push(store, ["v8"], self._cfg(), VALID, "arm64", log=logged.append)
+        with pytest.raises(ValueError, match="no commit row"):
+            push(store, ["v8"], self._cfg(), VALID, "arm64", log=logged.append)
 
         assert store.unpushed_commit_ids("v8", "arm64") == [101]
         assert any("no commit row" in m for m in logged)
@@ -353,17 +353,18 @@ class TestOrphanScanIsBounded:
             VALID,
             "arm64",
         )
-        assert seen["bounds"] == (100, 200)
+        assert seen["bounds"] == (200, 200)  # each snapshot scans only its exact unit
 
     def test_an_orphan_inside_the_range_is_still_held_back(self, store, deliveries):
         _seed(store, [100])
         store.insert_scores("v8", "arm64", 101, 0, [_score("bench-a")])
         store.mark_done("v8", "arm64", 101)
-        push(
-            store,
-            ["v8"],
-            PushConfig(bot_name="box1", targets=[SPOOL_A]),
-            VALID,
-            "arm64",
-        )
+        with pytest.raises(ValueError, match="no commit row"):
+            push(
+                store,
+                ["v8"],
+                PushConfig(bot_name="box1", targets=[SPOOL_A]),
+                VALID,
+                "arm64",
+            )
         assert store.unpushed_commit_ids("v8", "arm64") == [101]

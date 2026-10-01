@@ -62,7 +62,7 @@ def _open_store(cfg, **kwargs):
         raise typer.Exit(1)
 
 
-def _shutdown_flag(label: str = "current commit"):
+def _shutdown_flag(label: str = "current commit", log=None):
     """Install SIGINT/SIGTERM handlers; returns a callable reading the flag.
 
     A callable rather than a variable so the flag reaches the collector's
@@ -76,7 +76,9 @@ def _shutdown_flag(label: str = "current commit"):
         if state["stop"]:
             raise SystemExit(1)
         state["stop"] = True
-        typer.echo(f"\nShutdown requested — finishing {label} (^C again to force)...")
+        (log or typer.echo)(
+            f"Shutdown requested; finishing {label} (^C again to force)"
+        )
 
     signal.signal(signal.SIGINT, handle)
     signal.signal(signal.SIGTERM, handle)
@@ -289,7 +291,11 @@ def watch(
     step: int = typer.Option(1, help="Sample every N-th commit"),
     runs: int = typer.Option(3, help="Benchmark iterations per commit"),
     once: bool = typer.Option(False, "--once", help="Single poll cycle then exit"),
-    no_push: bool = typer.Option(False, "--no-push", help="Skip all pushing"),
+    no_push: bool = typer.Option(
+        False,
+        "--no-push",
+        help="Accepted for old service definitions; watch only collects",
+    ),
     reset_cursor: Optional[str] = typer.Option(
         None,
         "--reset-cursor",
@@ -391,23 +397,8 @@ def watch(
 
     _host_preflight(cfg)
 
-    # Background pusher: drains new scores after each commit without delaying
-    # the next build. A single worker with coalescing wakes keeps pushes
-    # regular even when a target is slow. Disabled for dry runs and when
-    # pushing is turned off or unconfigured.
-    push_enabled = cfg.push and not no_push and not dry_run
-    pusher = None
-    on_commit_done = None
-    if push_enabled:
-        from .pusher import BackgroundPusher
-
-        pusher = BackgroundPusher(
-            cfg, engine_names, log=lambda msg: typer.echo(f"  {msg}")
-        )
-        pusher.start()
-        on_commit_done = pusher.notify
-    if consumer is not None:
-        consumer.on_commit_done = on_commit_done
+    if no_push:
+        typer.echo("watch only collects; --no-push has no effect")
 
     should_stop = _shutdown_flag()
 
@@ -472,7 +463,6 @@ def watch(
                     step=step,
                     runs=runs,
                     include_start=False,
-                    on_commit_done=on_commit_done,
                     should_stop=should_stop,
                 )
 
@@ -487,9 +477,7 @@ def watch(
                     break
                 time.sleep(1)
     finally:
-        if pusher is not None:
-            typer.echo("Draining background pushes...")
-            pusher.close()
+        collector.store.close()
 
     typer.echo("Watch stopped.")
 
@@ -542,13 +530,19 @@ def clear(
             f"Clear {len(ids)} commits of {engine} ({ids[0]}..{ids[-1]})?", abort=True
         )
 
-    store.clear_range(engine, cfg.platform, ids)
-    for cid in ids:
-        path = cfg.commit_results_dir(engine, cid)
-        if path.exists():
-            _shutil.rmtree(path)
-    typer.echo(f"Cleared {len(ids)} commits. They will be measured again.")
-    store.close()
+    try:
+        with store.result_locks(engine, cfg.platform, ids):
+            store.clear_range(engine, cfg.platform, ids)
+            for cid in ids:
+                path = cfg.commit_results_dir(engine, cid)
+                if path.exists():
+                    _shutil.rmtree(path)
+        typer.echo(f"Cleared {len(ids)} commits. They will be measured again.")
+    except (RuntimeError, OSError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
+    finally:
+        store.close()
 
 
 @app.command(name="import")
@@ -673,13 +667,16 @@ def import_csv(
             ts_lookup = {
                 r["commit_id"]: r["timestamp"] for r in store.get_all_commits(engine)
             }
-            store.bulk_insert_scores(
-                engine, plat, [(*r, ts_lookup.get(r[0], 0)) for r in rows]
-            )
-            for cid in {r[0] for r in rows}:
-                # No status: these scores come with no run of our own to report,
-                # and must not overwrite the verdict of one.
-                store.mark_done(engine, plat, cid)
+            import_ids = sorted({r[0] for r in rows})
+            with store.result_locks(engine, plat, import_ids):
+                store.check_pending(engine, plat, import_ids)
+                store.bulk_insert_scores(
+                    engine, plat, [(*r, ts_lookup.get(r[0], 0)) for r in rows]
+                )
+                for cid in {r[0] for r in rows}:
+                    # No status: these scores come with no run of our own to report,
+                    # and must not overwrite the verdict of one.
+                    store.mark_done(engine, plat, cid)
         typer.echo(f"  {path}: {len(rows)} scores ({plat})")
         total += len(rows)
 
@@ -755,81 +752,84 @@ def export_csv(
 
 
 @app.command()
-def relay(
-    interval: str = typer.Option("10m", help="Poll interval, e.g. 10m, 1h"),
-    once: bool = typer.Option(False, "--once", help="Single cycle then exit"),
+def deliver(
+    once: bool = typer.Option(
+        False, "--once", help="One bounded cycle, including idle refresh"
+    ),
     rebuild: Optional[str] = typer.Option(
         None,
         "--rebuild",
         metavar="BOT",
-        help="Wipe BOT's Spanner staging rows and replay its whole log;"
-        " obsolete aggregate keys are not removed",
+        help="Wipe remote BOT staging and aggregates, then replay retained spool",
     ),
     reset_cursor: Optional[str] = typer.Option(
+        None, "--reset-cursor", metavar="BOT[=SEQ]"
+    ),
+    reconcile_legacy: Optional[str] = typer.Option(
         None,
-        "--reset-cursor",
-        metavar="BOT[=SEQ]",
-        help="Replay BOT's log from SEQ + 1 (default 0: all of it), without a wipe",
+        "--reconcile-legacy",
+        metavar="BOT",
+        help="After verified full replay: explicitly clear only BOT's old per-bot marker",
     ),
     force: bool = typer.Option(
-        False,
-        "--force",
-        help="With --rebuild: wipe even though the source can no longer replay"
-        " its whole log",
+        False, "--force", help="Allow rebuild from a retained suffix"
     ),
     config: Optional[Path] = typer.Option(None, help="User config path"),
+    log_file: Optional[Path] = typer.Option(
+        None, "--log-file", help="Rotating plain event log (default: stderr)"
+    ),
 ):
-    """Drain remote spool logs into this machine's push targets.
+    """Deliver local results and remote SSH spools under one machine owner."""
+    from .delivery import configured_coordinator
+    from .delivery_maintenance import maintain_remote
 
-    Sources are the config's relay entries.
-    """
-    import time
-
-    cfg = _load_config(config)
-    if not cfg.relays:
-        typer.echo("Error: no [[relay]] sources in config.", err=True)
-        raise typer.Exit(1)
-    if not cfg.push:
-        typer.echo("Error: [push] is required to relay.", err=True)
-        raise typer.Exit(1)
-    if rebuild and reset_cursor:
-        typer.echo("Error: --rebuild already resets the cursor.", err=True)
+    if sum(bool(v) for v in (rebuild, reset_cursor, reconcile_legacy)) > 1:
+        typer.echo(
+            "Error: --rebuild, --reset-cursor and --reconcile-legacy are exclusive",
+            err=True,
+        )
         raise typer.Exit(1)
     if force and not rebuild:
-        typer.echo("Error: --force applies to --rebuild.", err=True)
+        typer.echo("Error: --force applies to --rebuild", err=True)
         raise typer.Exit(1)
+    cfg = _load_config(config)
+    from .service_logging import EventLog
 
-    from .relay import (
-        parse_cursor_arg,
-        rebuild_source,
-        relay_all,
-        reset_cursor as do_reset_cursor,
-    )
+    echo = EventLog("deliver", log_file)
+    should_stop = _shutdown_flag("delivery unit", log=echo)
 
-    def echo(msg: str) -> None:
-        typer.echo(f"[{time_mod.strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
-
+    store = None
     try:
-        if rebuild:
-            rebuild_source(cfg, rebuild, echo, force=force)
-        elif reset_cursor:
-            do_reset_cursor(cfg, *parse_cursor_arg(reset_cursor), echo)
-    except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as e:
-        typer.echo(f"Error: {e}", err=True)
+        echo(
+            f"Deliver starting local={cfg.delivery.local} remote={cfg.delivery.remote} poll_seconds={cfg.delivery.poll_seconds}"
+        )
+        coordinator, store = configured_coordinator(
+            cfg, log=echo, should_stop=should_stop
+        )
+        if rebuild or reset_cursor or reconcile_legacy:
+            with coordinator.ownership():
+                maintain_remote(
+                    coordinator,
+                    cfg,
+                    rebuild=rebuild,
+                    reset=reset_cursor,
+                    legacy=reconcile_legacy,
+                    force=force,
+                )
+            return
+        echo(
+            f"Deliver started bot={cfg.push.bot_name} sources={len(coordinator.sources)} targets={coordinator.identities} poll_seconds={cfg.delivery.poll_seconds}"
+        )
+        if not coordinator.run(once=once):
+            raise typer.Exit(1)
+    except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        echo.error(f"Error: {exc}")
         raise typer.Exit(1)
-
-    interval_secs = _parse_interval(interval)
-    echo(f"Relay started (sources={len(cfg.relays)}, interval={interval})")
-    try:
-        while True:
-            echo("Polling relay sources")
-            relay_all(cfg, echo)
-            if once:
-                break
-            echo(f"Next relay poll in {interval}")
-            time.sleep(interval_secs)
-    except KeyboardInterrupt:
-        typer.echo("Relay stopped.")
+    finally:
+        if store is not None:
+            store.close()
+        echo("Deliver stopped")
+        echo.close()
 
 
 def _parse_engine_id(value: str, flag: str) -> tuple[str, int]:
@@ -1137,6 +1137,9 @@ def push(
         typer.Argument(help="Engines to push (default: all configured)"),
     ] = None,
     config: Optional[Path] = typer.Option(None, help="User config path"),
+    log_file: Optional[Path] = typer.Option(
+        None, "--log-file", help="Rotating plain event log (default: stderr)"
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print CSV to stdout"),
     rebuild: bool = typer.Option(
         False,
@@ -1159,12 +1162,22 @@ def push(
         typer.echo("Error: no [push] section in config.", err=True)
         raise typer.Exit(1)
 
+    from .service_logging import EventLog
+
     if probe:
+        events = EventLog("push", log_file)
         try:
-            do_probe(cfg.push, lambda msg: typer.echo(f"  {msg}"))
+            do_probe(
+                cfg.push,
+                events,
+                state_dir=cfg.out_dir / "delivery",
+                settings=cfg.delivery,
+            )
         except Exception as e:
-            typer.echo(f"Probe failed: {e}", err=True)
+            events.error(f"Probe failed: {e}")
             raise typer.Exit(1)
+        finally:
+            events.close()
         return
 
     engine_names = engines or list(cfg.engines.keys())
@@ -1183,6 +1196,7 @@ def push(
         store.close()
         return
 
+    events = EventLog("push", log_file)
     try:
         n = do_push(
             store,
@@ -1191,14 +1205,18 @@ def push(
             cfg.valid_names_by_suite,
             cfg.platform,
             rebuild=rebuild,
-            log=lambda msg: typer.echo(f"  {msg}"),
+            log=events,
+            settings=cfg.delivery,
+            state_dir=cfg.out_dir / "delivery",
+            should_stop=_shutdown_flag("delivery unit", log=events),
         )
         typer.echo(f"Pushed {n} scores")
-    except (subprocess.CalledProcessError, OSError) as e:
-        typer.echo(f"Push failed: {e}", err=True)
+    except (subprocess.SubprocessError, OSError, ValueError, RuntimeError) as e:
+        events.error(f"Push failed: {e}")
         raise typer.Exit(1)
     finally:
         store.close()
+        events.close()
 
 
 @app.command(name="host")

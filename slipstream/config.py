@@ -26,10 +26,10 @@ class PushTarget:
     """Where an export CSV goes. Exactly one of spool_dir, spanner.
 
     spool_dir: the CSV is appended to a sequenced log there, for a machine
-    with access to the real target to collect with ``slipstream relay``.
+    with access to the real target to collect with ``slipstream deliver``.
     ``retain_days`` bounds how long entries are kept.
     spanner: "project/instance/database" of the perf database. ``refresh``
-    aggregates after each push.
+    aggregates once per delivery cycle, including idle cycles.
     """
 
     spool_dir: Path | None = None
@@ -42,6 +42,51 @@ class PushTarget:
 class PushConfig:
     bot_name: str  # identifies this machine in the perf database
     targets: list[PushTarget]
+
+
+@dataclass
+class DeliveryConfig:
+    local: bool = True
+    remote: bool = True
+    poll_seconds: float = 10.0
+    quantum: int = 2
+    max_units: int = 16
+    max_rows: int = 100_000
+    max_bytes: int = 8 * 1024 * 1024
+    max_payload_bytes: int = 64 * 1024 * 1024
+    cycle_seconds: float = 120.0
+    lock_seconds: float = 30.0
+    io_seconds: float = 30.0
+    shutdown_seconds: float = 15.0
+    retry_seconds: float = 5.0
+    max_retry_seconds: float = 300.0
+
+    def __post_init__(self):
+        import math
+
+        for name, value in vars(self).items():
+            if name in ("local", "remote"):
+                if not isinstance(value, bool):
+                    raise ValueError(f"[delivery] {name} must be boolean")
+            elif (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"[delivery] {name} must be positive and finite")
+            elif name in (
+                "quantum",
+                "max_units",
+                "max_rows",
+                "max_bytes",
+                "max_payload_bytes",
+            ) and not isinstance(value, int):
+                raise ValueError(f"[delivery] {name} must be an integer")
+        if self.max_bytes > self.max_payload_bytes:
+            raise ValueError("[delivery] max_bytes exceeds max_payload_bytes")
+        if self.retry_seconds > self.max_retry_seconds:
+            raise ValueError("[delivery] retry_seconds exceeds max_retry_seconds")
 
 
 @dataclass
@@ -205,6 +250,7 @@ _TOP_LEVEL_KEYS = (
     "bus",
     "build",
     "bench",
+    "delivery",
 )
 _ENGINE_KEYS = ("src_dir", "build_cmd", "sync_cmd", "gn_args", "run_set")
 _BENCHMARK_KEYS = ("dir",)
@@ -252,6 +298,7 @@ class Config:
     bench: BenchProcessConfig = field(default_factory=BenchProcessConfig)
     # CPU architecture of this host, e.g. "arm64". Keys scores and processing
     # state in the store; it is a host property, not a user setting.
+    delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
     platform: str = field(default_factory=_platform.machine)
 
     def require_runs(self, engine: str) -> list[RunSpec]:
@@ -447,6 +494,11 @@ def load_config(user_config_path: Path | None = None) -> Config:
         # database, whose aggregate key has no platform, with no error anywhere.
         raise ValueError(f"bot_name {bot_name!r} is also a [[relay]] source")
 
+    delivery_data = user.get("delivery", {})
+    _reject_unknown(delivery_data, DeliveryConfig.__dataclass_fields__, "[delivery]")
+    delivery_cfg = DeliveryConfig(**delivery_data)
+    validate_delivery_identities(push_cfg, relays)
+
     return Config(
         out_dir=out_dir,
         results_dir=results_dir,
@@ -460,6 +512,7 @@ def load_config(user_config_path: Path | None = None) -> Config:
         bus=bus_cfg,
         build=build_cfg,
         bench=bench_cfg,
+        delivery=delivery_cfg,
     )
 
 
@@ -733,3 +786,36 @@ def _parse_target(t: dict) -> PushTarget:
         )
     parse_spanner_spec(t["spanner"])
     return PushTarget(spanner=t["spanner"], refresh=t.get("refresh", True))
+
+
+def validate_delivery_identities(push, sources):
+    from .delivery_targets import target_identity
+
+    if push is not None:
+        if not isinstance(push.bot_name, str) or not push.bot_name.strip():
+            raise ValueError("[push] bot_name must be non-empty")
+        identities = [target_identity(t) for t in push.targets]
+        if len(set(identities)) != len(identities):
+            raise ValueError("duplicate push target identity")
+    bots, spools, cursors = set(), set(), set()
+    for src in sources:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", src.bot_name) or src.bot_name in (
+            ".",
+            "..",
+        ):
+            raise ValueError("[[relay]] bot_name must be a safe cursor filename")
+        if not src.ssh_host or src.ssh_host.startswith("-") or not src.spool_dir:
+            raise ValueError("invalid [[relay]] SSH host or spool path")
+        spool = (src.ssh_host, str(PurePosixPath(src.spool_dir)))
+        cursor = (src.cursor_dir / f"{src.bot_name}.cursor").resolve()
+        if src.bot_name in bots or spool in spools or cursor in cursors:
+            raise ValueError("duplicate relay bot, spool or cursor identity")
+        bots.add(src.bot_name)
+        spools.add(spool)
+        cursors.add(cursor)
+        if push and src.bot_name == push.bot_name:
+            raise ValueError("local bot is also a relay source")
+        if push and src.ssh_host in ("localhost", "127.0.0.1", "::1"):
+            path = Path(src.spool_dir).expanduser().resolve()
+            if any(t.spool_dir and t.spool_dir.resolve() == path for t in push.targets):
+                raise ValueError("spool target routes back to its input")

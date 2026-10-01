@@ -5,14 +5,11 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor
-from threading import Event
 
 import pytest
 
 from slipstream import spanner
-from slipstream.config import PushTarget
-from slipstream.push import _COLUMNS, deliver_once
+from slipstream.push import _COLUMNS
 
 T0 = datetime(2026, 9, 5, 12, 0, tzinfo=timezone.utc)
 
@@ -292,173 +289,6 @@ class TestPushCsv:
         assert db.of("pdml")[0][2] == {"bot": "b"}
 
 
-class TestSpannerSession:
-    def _connect(self, monkeypatch, db, seen):
-        monkeypatch.setattr(
-            spanner, "connect", lambda spec: (seen.__setitem__("spec", spec), db)[1]
-        )
-
-    def test_deliver_once_stages_and_closes(self, monkeypatch):
-        seen = {}
-        db = FakeDb([[("slipstream",), ("benchmarks",), ("meta",)]])
-        self._connect(monkeypatch, db, seen)
-        t = PushTarget(spanner="p/i/d", refresh=False)
-        out = deliver_once(t, "bot1", _csv({}, {"run": "2"}))
-        assert seen["spec"] == "p/i/d"
-        assert out == "2 rows staged for bot1"
-        (up,) = db.of("upsert")
-        assert up[1] == spanner.IMPORT_TABLE and len(up[3]) == 2
-        assert db.calls[-1] == ("close",)
-
-    def test_concurrent_local_session_waits(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-        first = spanner._acquire_local_lock("p/i/d")
-        started = Event()
-
-        def acquire():
-            started.set()
-            return spanner._acquire_local_lock("/p/i/d/")
-
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(acquire)
-            try:
-                assert started.wait(2)
-                with pytest.raises(TimeoutError):
-                    future.result(timeout=0.1)
-            finally:
-                first.close()
-            future.result(timeout=2).close()
-
-    def test_one_session_stages_many_and_aggregates_once(self, monkeypatch):
-        from slipstream.push import open_target
-
-        db = FakeDb([[("slipstream",), ("benchmarks",), ("meta",)], [], [(T0,)], []])
-        self._connect(monkeypatch, db, {})
-        session = open_target(PushTarget(spanner="p/i/d"), "bot1")
-        session.deliver(_csv({}))
-        session.deliver(_csv({"run": "2"}))
-        assert session.close() == "2 rows staged for bot1, aggregated"
-        assert len(db.of("upsert")) == 2
-        # One schema check and one refresh for both deliveries.
-        assert sum("INFORMATION_SCHEMA.TABLES" in c[1] for c in db.of("query")) == 1
-        assert sum("WHERE key = %s" in c[1] for c in db.of("query")) == 1
-
-    def test_rebuild_wipes_once_before_the_first_delivery(self, monkeypatch):
-        from slipstream.push import open_target
-
-        db = FakeDb([[("slipstream",), ("benchmarks",), ("meta",)], [], [(None,)]])
-        self._connect(monkeypatch, db, {})
-        session = open_target(PushTarget(spanner="p/i/d"), "b", rebuild=True)
-        session.deliver(_csv({}))
-        session.deliver(_csv({}))
-        out = session.close()
-        assert db.of("pdml") == [
-            (
-                "pdml",
-                f"DELETE FROM {spanner.IMPORT_TABLE} WHERE bot = @bot",
-                {"bot": "b"},
-            )
-        ]
-        assert out.startswith("2 rows staged for b (rebuild)")
-
-    def test_unparseable_csv_does_not_wipe(self, monkeypatch):
-        """The wipe is only worth it if the replacement rows exist."""
-        from slipstream.push import open_target
-
-        db = FakeDb([[("slipstream",), ("benchmarks",), ("meta",)]])
-        self._connect(monkeypatch, db, {})
-        session = open_target(PushTarget(spanner="p/i/d"), "b", rebuild=True)
-        with pytest.raises(ValueError):
-            session.deliver(_csv({"score": ""}))
-        assert db.of("pdml") == [] and db.of("upsert") == []
-
-    def test_failed_delivery_does_not_aggregate(self, monkeypatch):
-        """Staging commits in chunks, so a failed CSV can be half in. Its
-        groups must not be aggregated over an incomplete run set."""
-        from slipstream.push import open_target
-
-        class HalfStaged(FakeDb):
-            def upsert(self, table, columns, rows):
-                super().upsert(table, columns, rows)
-                raise RuntimeError("DEADLINE_EXCEEDED")
-
-        db = HalfStaged([[("slipstream",), ("benchmarks",), ("meta",)]])
-        self._connect(monkeypatch, db, {})
-        session = open_target(PushTarget(spanner="p/i/d"), "b")
-        with pytest.raises(RuntimeError):
-            session.deliver(_csv({}))
-        assert session.close() is None
-        assert not any("MAX(imported_at)" in c[1] for c in db.of("query"))
-        assert any(
-            c[0] == "execute" and "INSERT OR UPDATE INTO meta" in c[1] for c in db.calls
-        )
-        assert not any(
-            c[0] == "execute" and "DELETE FROM meta" in c[1] for c in db.calls
-        )
-        assert db.calls[-1] == ("close",)
-
-    def test_later_session_cannot_refresh_a_partial_import(self, monkeypatch):
-        from slipstream.push import open_target
-
-        markers = set()
-
-        class SharedDb(FakeDb):
-            def query(self, sql, params=None):
-                self.calls.append(("query", " ".join(sql.split()), params))
-                if "STARTS_WITH(key" in sql:
-                    return [(next(iter(markers)),)] if markers else []
-                if "CURRENT_TIMESTAMP" in sql:
-                    return [(T0,)]
-                return self.answers.pop(0) if self.answers else []
-
-            def execute(self, sql, params=None):
-                super().execute(sql, params)
-                if "INSERT OR UPDATE INTO meta" in sql and params[1] == "staging":
-                    markers.add(params[0])
-                elif "DELETE FROM meta" in sql:
-                    markers.remove(params[0])
-
-        class HalfStaged(SharedDb):
-            def upsert(self, table, columns, rows):
-                super().upsert(table, columns, rows)
-                raise RuntimeError("DEADLINE_EXCEEDED")
-
-        failed = HalfStaged([[("slipstream",), ("benchmarks",), ("meta",)]])
-        self._connect(monkeypatch, failed, {})
-        first = open_target(PushTarget(spanner="p/i/d"), "a")
-        with pytest.raises(RuntimeError):
-            first.deliver(_csv({}))
-        first.close()
-
-        healthy = SharedDb([[("slipstream",), ("benchmarks",), ("meta",)]])
-        self._connect(monkeypatch, healthy, {})
-        second = open_target(PushTarget(spanner="p/i/d"), "b")
-        second.deliver(_csv({"run": "2"}))
-        assert second.close() == (
-            "1 rows staged for b, aggregation skipped (an import is incomplete)"
-        )
-        assert len(markers) == 1
-        assert not any("MAX(imported_at)" in c[1] for c in healthy.of("query"))
-
-        recovered = SharedDb([[("slipstream",), ("benchmarks",), ("meta",)]])
-        self._connect(monkeypatch, recovered, {})
-        retry = open_target(PushTarget(spanner="p/i/d", refresh=False), "a")
-        retry.deliver(_csv({"run": "3"}))
-        retry.close()
-        assert markers == set()
-
-    def test_failed_delivery_still_closes_the_connection(self, monkeypatch):
-        class Boom(FakeDb):
-            def upsert(self, table, columns, rows):
-                raise RuntimeError("DEADLINE_EXCEEDED")
-
-        db = Boom([[("slipstream",), ("benchmarks",), ("meta",)]])
-        self._connect(monkeypatch, db, {})
-        with pytest.raises(RuntimeError, match="DEADLINE_EXCEEDED"):
-            deliver_once(PushTarget(spanner="p/i/d"), "b", _csv({}))
-        assert db.calls[-1] == ("close",)
-
-
 class _Api:
     def __init__(self, closed):
         self.transport = self
@@ -519,7 +349,8 @@ class TestSpannerDbTeardown:
     def test_a_failing_step_does_not_strand_the_rest(self):
         order: list[str] = []
         db, closed = self._db(order, boom=True)
-        db.close()
+        with pytest.raises(RuntimeError, match="session delete failed"):
+            db.close()
         assert len(closed) == 2
 
 

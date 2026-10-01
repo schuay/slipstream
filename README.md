@@ -43,7 +43,8 @@ slipstream watch
 `bench` walks a commit range, building and measuring each commit. `analyze`
 reports the change points it finds, with a Cohen's d effect size per segment.
 `watch` is the same thing as a daemon: it picks up where the last run left off,
-measures each new commit, and pushes the scores onward.
+measures each new commit, and persists the scores. Run `slipstream deliver`
+separately to send them onward.
 
 `clear` forgets a range so it can be measured again, which is also how you
 backfill history for a `[[run]]` entry added after the fact.
@@ -63,13 +64,18 @@ the rest.
 
 ## Sending scores somewhere
 
-`push` delivers scores to every entry in `[[push.targets]]`, tracked per commit
+`deliver` continuously drains bounded cycles of local results and remote SSH
+spools. `push` performs one bounded local cycle through the same pipeline.
+Both deliver scores to every entry in `[[push.targets]]`, tracked per commit
 so a cycle only sends what is new. A target is either a Spanner database
 (`spanner = "project/instance/database"`, with the DDL in
 `slipstream/data/spanner_schema.sql`) or a `spool_dir`, which appends to a
-sequenced log for a machine that has no route to the database. `slipstream
-relay` runs on a machine that does, draining a remote spool over ssh into its
-own targets.
+sequenced log for a machine that has no route to the database. The receiving
+machine configures `[[relay]]` sources and runs one `slipstream deliver` owner
+for both its local DB and remote spools. The `relay` command is removed.
+
+See [delivery operations](docs/delivery.md) for configuration, crash recovery,
+explicit replay/rebuild, index prerequisites, and deployment/rollback preparation.
 
 Scores also move as CSV: `export` writes it and `import` reads it. One database
 holds one bot, and `import` refuses anything that is not its own machine's data.

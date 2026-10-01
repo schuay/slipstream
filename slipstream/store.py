@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import sqlite3
 import time
 from datetime import datetime
@@ -63,11 +65,13 @@ class CommitStore:
         backup: bool | None = None,
         init_schema: bool = True,
         bot: str | None = None,
+        busy_timeout_ms: int = 30000,
+        should_stop=lambda: False,
     ):
         """Open a connection to the store.
 
         ``backup`` defaults to ``not readonly``. Set it False for secondary
-        connections (e.g. the background pusher) that must not snapshot the
+        connections (e.g. delivery) that must not snapshot the
         db again. ``init_schema`` may be disabled when the caller knows the
         schema already exists, to avoid re-running migrations concurrently
         from a second connection; ``readonly`` disables it too, so reporting
@@ -77,8 +81,10 @@ class CommitStore:
         first open that has one, and a later open under a different name is
         refused.
         """
-        self._db_path = db_path
+        self._db_path = db_path.resolve()
+        self._result_locks = {}
         self._bot = bot
+        self._should_stop = should_stop
         db_path.parent.mkdir(parents=True, exist_ok=True)
         if backup is None:
             backup = not readonly
@@ -90,8 +96,9 @@ class CommitStore:
         self.conn.row_factory = sqlite3.Row
         # busy_timeout first, so the WAL conversion below (and every later op)
         # waits on a concurrent writer rather than raising immediately.
-        self.conn.execute("PRAGMA busy_timeout=30000")
-        # WAL lets the background pusher's reader coexist with the collector's
+        self.conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+        self.conn.execute("PRAGMA synchronous=FULL")
+        # WAL lets delivery's reader coexist with the collector's
         # writer instead of deadlocking on lock promotion. It is a persistent
         # property of the db file, so setting it on any connection converts it.
         self.conn.execute("PRAGMA journal_mode=WAL")
@@ -102,10 +109,14 @@ class CommitStore:
         # db on every run. A db that does not exist yet has nothing to read, so
         # it is created either way: otherwise the first export or analyze on a
         # fresh machine fails on a missing table instead of reporting nothing.
-        if init_schema and (not readonly or not pre_existing):
-            self._init_schema()
-        elif bot is not None:
-            self._check_bot()
+        try:
+            if init_schema and (not readonly or not pre_existing):
+                self._init_schema()
+            elif bot is not None:
+                self._check_bot()
+        except BaseException:
+            self.conn.close()
+            raise
 
     @staticmethod
     def _backup(conn: sqlite3.Connection, db_path: Path, keep: int = 10):
@@ -126,6 +137,9 @@ class CommitStore:
 
     def _init_schema(self):
         self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS delivery_attempts (
+                source TEXT PRIMARY KEY, record TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS commits (
                 engine      TEXT    NOT NULL,
                 hash        TEXT    NOT NULL,
@@ -260,6 +274,8 @@ class CommitStore:
         # accept a db copied from the other machine for this whole process.
         self._check_bot()
         for attempt in range(_MIGRATE_ATTEMPTS):
+            if self._should_stop():
+                raise InterruptedError("store migration cancelled")
             try:
                 self._run_migration()
                 return
@@ -273,7 +289,11 @@ class CommitStore:
                         f"could not be migrated. Stop whatever is holding it "
                         f"and retry."
                     ) from e
-                time.sleep(_MIGRATE_RETRY_SECS)
+                until = time.monotonic() + _MIGRATE_RETRY_SECS
+                while time.monotonic() < until:
+                    if self._should_stop():
+                        raise InterruptedError("store migration retry cancelled")
+                    time.sleep(min(0.05, max(0, until - time.monotonic())))
 
     def _run_migration(self):
         for table, column, decl in _ADDED_COLUMNS:
@@ -574,7 +594,65 @@ class CommitStore:
         ).fetchall()
         return {r[0]: r[1] for r in rows}
 
+    @property
+    def db_path(self) -> Path:
+        return self._db_path
+
+    @contextlib.contextmanager
+    def result_locks(self, engine, platform, commit_ids, **kwargs):
+        from .durability import FileLock, identity_digest
+
+        with contextlib.ExitStack() as stack:
+            for cid in sorted(set(commit_ids)):
+                key = (engine, platform, cid)
+                if key in self._result_locks:
+                    continue
+                path = self._db_path.parent / ("." + self._db_path.name + ".locks")
+                stack.enter_context(
+                    FileLock(
+                        path / (identity_digest(json.dumps(key)) + ".lock"), **kwargs
+                    )
+                )
+                self._result_locks[key] = True
+                stack.callback(self._result_locks.pop, key)
+            yield
+
+    def pending_attempt(self, source):
+        row = self.conn.execute(
+            "SELECT record FROM delivery_attempts WHERE source=?", (source,)
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def save_attempt(self, source, record):
+        self.conn.execute(
+            "INSERT INTO delivery_attempts VALUES (?, ?)",
+            (source, json.dumps(record, sort_keys=True)),
+        )
+        self.conn.commit()
+
+    def retire_attempt(self, source):
+        self.conn.execute("DELETE FROM delivery_attempts WHERE source=?", (source,))
+        self.conn.commit()
+
+    def check_pending(self, engine, platform, commit_ids):
+        for row in self.conn.execute("SELECT record FROM delivery_attempts"):
+            record = json.loads(row[0])
+            if (
+                record["engine"] == engine
+                and record["platform"] == platform
+                and record["unit"] in commit_ids
+            ):
+                raise StoreError(
+                    f"unresolved delivery attempt {record['attempt']} protects "
+                    f"{engine}/{platform}/{record['unit']}; retry delivery first"
+                )
+
     def clear_scores(self, engine: str, platform: str, commit_ids: list[int]):
+        with self.result_locks(engine, platform, commit_ids):
+            self.check_pending(engine, platform, commit_ids)
+            self._clear_scores(engine, platform, commit_ids)
+
+    def _clear_scores(self, engine: str, platform: str, commit_ids: list[int]):
         """Delete only the scores of commits, leaving their state alone.
 
         For resuming an interrupted commit: ``scores`` is INSERT OR IGNORE with
@@ -591,6 +669,11 @@ class CommitStore:
         self.conn.commit()
 
     def clear_range(self, engine: str, platform: str, commit_ids: list[int]):
+        with self.result_locks(engine, platform, commit_ids):
+            self.check_pending(engine, platform, commit_ids)
+            self._clear_range(engine, platform, commit_ids)
+
+    def _clear_range(self, engine: str, platform: str, commit_ids: list[int]):
         """Delete scores, processing state, and push state for specific commits.
 
         Clearing push_state too means any re-benchmarked commit will be
@@ -951,7 +1034,9 @@ class CommitStore:
 
     # --- Push state ---
 
-    def unpushed_commit_ids(self, engine: str, platform: str) -> list[int]:
+    def unpushed_commit_ids(
+        self, engine: str, platform: str, limit: int | None = None
+    ) -> list[int]:
         """Return commit_ids that are done but not yet pushed, ordered ascending."""
         rows = self.conn.execute(
             "SELECT ps.commit_id FROM processing_state ps"
@@ -959,8 +1044,8 @@ class CommitStore:
             "   ON pu.engine=ps.engine AND pu.platform=ps.platform"
             "  AND pu.commit_id=ps.commit_id"
             " WHERE ps.engine=? AND ps.platform=? AND pu.commit_id IS NULL"
-            " ORDER BY ps.commit_id",
-            (engine, platform),
+            " ORDER BY ps.commit_id LIMIT ?",
+            (engine, platform, limit if limit is not None else -1),
         ).fetchall()
         return [r[0] for r in rows]
 

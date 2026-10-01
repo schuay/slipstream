@@ -160,62 +160,173 @@ def test_bots_are_isolated(db):
     assert db.query(f"SELECT DISTINCT bot FROM {spanner.IMPORT_TABLE}") == [("bot2",)]
 
 
-def test_relay_cycle_stages_both_files_and_aggregates_once(db, tmp_path, monkeypatch):
-    """A relay cycle over two spool entries: one connection, one aggregation,
-    and the group's aggregate covers the runs from both files."""
-    from slipstream import push as push_mod
-    from slipstream.config import PushConfig, PushTarget, RelaySource
-    from slipstream.relay import read_cursor, relay_source
+def test_delivery_cycle_stages_files_and_multiple_bots_then_refreshes_once(
+    db, tmp_path, monkeypatch
+):
+    from slipstream.config import PushTarget, RelaySource
+    from slipstream.delivery import Coordinator
+    from slipstream.delivery_sources import SshSpoolSource
+    from slipstream.delivery_targets import SpannerSession
+    from slipstream.relay import read_cursor
+    from slipstream.config import DeliveryConfig
+    from tests.test_delivery import MemorySpool
 
     class KeepOpen:
-        """The session closes its connection; this one belongs to the fixture."""
-
         def __getattr__(self, name):
             return getattr(db, name)
 
         def close(self):
             pass
 
-    monkeypatch.setattr(spanner, "connect", lambda spec: KeepOpen())
-    real_refresh = spanner.refresh
+    monkeypatch.setattr(spanner, "connect", lambda spec, **kw: KeepOpen())
+    sources = [
+        SshSpoolSource(
+            RelaySource(bot, "/spool", bot, tmp_path / "relay"),
+            settings=DeliveryConfig(),
+            spool=MemorySpool(
+                {
+                    1: _csv({"run": "1", "score": "10"}),
+                    2: _csv({"run": "2", "score": "20"}),
+                }
+            ),
+        )
+        for bot in ("box1", "box2")
+    ]
     refreshes = []
+    real_refresh = spanner.refresh
     monkeypatch.setattr(
         spanner, "refresh", lambda d: (refreshes.append(d), real_refresh(d))[1]
     )
-
-    outbox = tmp_path / "outbox"
-    push_mod.spool_append(outbox, _csv({"run": "1", "score": "10"}), 90)
-    push_mod.spool_append(outbox, _csv({"run": "2", "score": "20"}), 90)
-
-    class LocalSpool:
-        def list(self):
-            names = (push_mod.parse_seq(p.name) for p in outbox.iterdir())
-            return sorted(s for s in names if s)
-
-        def fetch(self, seq):
-            return (outbox / push_mod.seq_name(seq)).read_text()
-
-    class Cfg:
-        push = PushConfig(bot_name="box1", targets=[PushTarget(spanner="p/i/d")])
-
-    source = RelaySource(
-        ssh_host="box2",
-        spool_dir=str(outbox),
-        bot_name="box2",
-        cursor_dir=tmp_path / "relay",
+    c = Coordinator(
+        sources,
+        [PushTarget(spanner="p/i/d")],
+        tmp_path / "delivery",
+        session_factory=lambda t, **kw: SpannerSession(t),
     )
-    logs = []
-    assert relay_source(Cfg(), source, LocalSpool(), logs.append) == 2
+    with c.ownership():
+        assert c.cycle() == 4
+    assert not c.errors
     assert len(refreshes) == 1
-    assert logs == ["box2: 2 rows staged for box2, aggregated"]
-    assert read_cursor(tmp_path / "relay" / "box2.cursor") == 2
-    assert _agg(db)[("bench-a", "v8_default")][:5] == (
-        15.0,
-        10.0,
-        20.0,
-        pytest.approx(7.0710678),
-        2,
+    assert all(read_cursor(src.path) == 2 for src in sources)
+    rows = db.query(
+        "SELECT bot, mean, count FROM benchmarks WHERE test='bench-a' ORDER BY bot"
     )
+    assert rows == [("box1", 15.0, 2), ("box2", 15.0, 2)]
+
+
+def test_exact_partial_import_blocks_other_payload_until_persisted_retry(
+    db, tmp_path, monkeypatch
+):
+    from slipstream.config import PushTarget
+    from slipstream.delivery import Coordinator
+    from slipstream.delivery_targets import SpannerSession
+    from tests.test_delivery import remote
+
+    failed = [True]
+
+    class FaultDb:
+        def __getattr__(self, name):
+            return getattr(db, name)
+
+        def close(self):
+            pass
+
+        def upsert(self, table, columns, rows):
+            if table == spanner.IMPORT_TABLE and failed[0]:
+                db.upsert(table, columns, rows[:1])
+                failed[0] = False
+                raise RuntimeError("crash after first chunk")
+            db.upsert(table, columns, rows)
+
+    monkeypatch.setattr(spanner, "connect", lambda spec, **kw: FaultDb())
+    original = remote(
+        tmp_path, "box1", {1: _csv({"score": "10"}, {"run": "2", "score": "20"})}
+    )
+    target = PushTarget(spanner="p/i/d")
+
+    def make(sources):
+        return Coordinator(
+            sources,
+            [target],
+            tmp_path / "delivery",
+            session_factory=lambda t, **kw: SpannerSession(t),
+        )
+
+    c = make([original])
+    with c.ownership():
+        assert c.cycle() == 0
+    assert original.pending()
+    assert not _agg(db)
+    # A different unit/bot completes, but cannot clear the original marker.
+    other = remote(tmp_path, "box2", {1: _csv({"score": "30"})})
+    c = make([other])
+    with c.ownership():
+        assert c.cycle() == 1
+    assert not _agg(db)
+    assert db.query(
+        "SELECT key FROM meta WHERE STARTS_WITH(key, %s)", [spanner.INCOMPLETE_PREFIX]
+    )
+    # New coordinator reconstructs the exact retained source and attempt.
+    original = remote(
+        tmp_path, "box1", {1: _csv({"score": "10"}, {"run": "2", "score": "20"})}
+    )
+    c = make([original])
+    with c.ownership():
+        assert c.cycle() == 2
+    assert original.pending() is None
+    assert db.query("SELECT bot, mean, count FROM benchmarks ORDER BY bot") == [
+        ("box1", 15.0, 2),
+        ("box2", 30.0, 1),
+    ]
+
+
+def test_failed_aggregate_write_retries_on_idle_without_reupload(
+    db, tmp_path, monkeypatch
+):
+    from slipstream.config import PushTarget
+    from slipstream.delivery import Coordinator
+    from slipstream.delivery_targets import SpannerSession
+    from tests.test_delivery import remote
+
+    failed = [True]
+
+    class FaultDb:
+        def __getattr__(self, name):
+            return getattr(db, name)
+
+        def close(self):
+            pass
+
+        def upsert(self, table, columns, rows):
+            db.upsert(table, columns, rows)
+            if table == spanner.AGG_TABLE and failed[0]:
+                failed[0] = False
+                raise RuntimeError("aggregate failure before watermark")
+
+    monkeypatch.setattr(spanner, "connect", lambda spec, **kw: FaultDb())
+    source = remote(
+        tmp_path, "box1", {1: _csv({"score": "10"}, {"run": "2", "score": "20"})}
+    )
+
+    def make():
+        return Coordinator(
+            [source],
+            [PushTarget(spanner="p/i/d")],
+            tmp_path / "delivery",
+            session_factory=lambda t, **kw: SpannerSession(t),
+        )
+
+    c = make()
+    with c.ownership():
+        assert c.cycle() == 2
+    assert c.errors and source.acknowledged(1)
+    assert not db.query("SELECT value FROM meta WHERE key=%s", [spanner.WATERMARK_KEY])
+    c = make()
+    with c.ownership():
+        assert c.cycle() == 0
+    assert not c.errors and source.spool.fetched == [1]
+    assert _agg(db)[("bench-a", "v8_default")][0] == 15.0
+    assert db.query("SELECT value FROM meta WHERE key=%s", [spanner.WATERMARK_KEY])
 
 
 def test_commit_numbers_per_bot(db):

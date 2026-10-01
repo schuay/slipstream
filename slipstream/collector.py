@@ -683,13 +683,23 @@ class BenchCollector:
             should_stop, wait=self.wait_for_lock, log=lambda m: self._log(f"  {m}")
         )
 
-    def bench_at_root(
+    def bench_at_root(self, engine, commit, run_root, runs, provenance=None):
+        if self.dry_run:
+            return self._bench_at_root(engine, commit, run_root, runs, provenance)
+        with self.store.result_locks(
+            engine.name, self.cfg.platform, [int(commit["commit_id"])]
+        ):
+            self.store.check_pending(
+                engine.name, self.cfg.platform, [int(commit["commit_id"])]
+            )
+            return self._bench_at_root(engine, commit, run_root, runs, provenance)
+
+    def _bench_at_root(
         self,
         engine: EngineConfig,
         commit: dict,
         run_root: Path,
         runs: int,
-        on_commit_done: Callable[[], None] | None = None,
         provenance: dict | None = None,
     ) -> BenchOutcome:
         """Measure one commit from a provisioned run root, and record it.
@@ -775,8 +785,6 @@ class BenchCollector:
             int(commit["commit_id"]),
             provenance or self.local_provenance(engine, runs),
         )
-        if on_commit_done is not None:
-            on_commit_done()
         return outcome
 
     def local_provenance(self, engine: EngineConfig, runs: int) -> dict:
@@ -895,15 +903,9 @@ class BenchCollector:
         runs: int = 3,
         clear: bool = False,
         include_start: bool = True,
-        on_commit_done: Callable[[], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
     ):
         """Benchmark commits in (start_id, end_id].
-
-        ``on_commit_done`` is invoked after each commit reaches the done state
-        (scores written and marked). It must be cheap and non-blocking: the
-        background pusher uses it to drain new scores without delaying the next
-        build.
 
         ``should_stop`` lets a shutdown request reach the per-commit path,
         where the wait for the machine lock can otherwise last hours. It
@@ -933,11 +935,12 @@ class BenchCollector:
                 f"[yellow]Clearing results and state for {len(clear_ids)} commits...[/yellow]"
             )
             if not self.dry_run:
-                self.store.clear_range(engine_name, self.cfg.platform, clear_ids)
-                for cid in clear_ids:
-                    p = self.cfg.commit_results_dir(engine_name, cid)
-                    if p.exists():
-                        shutil.rmtree(p)
+                with self.store.result_locks(engine_name, self.cfg.platform, clear_ids):
+                    self.store.clear_range(engine_name, self.cfg.platform, clear_ids)
+                    for cid in clear_ids:
+                        p = self.cfg.commit_results_dir(engine_name, cid)
+                        if p.exists():
+                            shutil.rmtree(p)
             else:
                 cleared = set(clear_ids)
 
@@ -977,9 +980,7 @@ class BenchCollector:
                     continue
                 console.print(f"[green]OK ({int(time.time() - t0)}s)[/green]")
 
-                self.bench_at_root(
-                    engine, dict(row), run_root, runs, on_commit_done=on_commit_done
-                )
+                self.bench_at_root(engine, dict(row), run_root, runs)
             finally:
                 self.lock.release()
 

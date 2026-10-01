@@ -634,3 +634,63 @@ class TestStrictKeys:
         p = tmp_path / "config.toml"
         p.write_text((pkg_files("slipstream.data") / "config.toml.example").read_text())
         assert len(load_config(p).runs) == 5
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"quantum": True},
+        {"quantum": 1.5},
+        {"max_units": 0},
+        {"poll_seconds": float("inf")},
+        {"local": "false"},
+        {"max_bytes": 100, "max_payload_bytes": 10},
+        {"retry_seconds": 10, "max_retry_seconds": 5},
+    ],
+)
+def test_delivery_limits_are_validated(settings):
+    from slipstream.config import DeliveryConfig
+
+    with pytest.raises(ValueError, match=r"\[delivery\]"):
+        DeliveryConfig(**settings)
+
+
+def test_delivery_unknown_keys_rejected_and_remote_only_no_db_created(tmp_path):
+    from slipstream.delivery import configured_coordinator
+
+    path = tmp_path / "cfg.toml"
+    path.write_text(
+        f'out_dir = "{tmp_path}"\n[push]\nbot_name = "bot"\n'
+        f'[[push.targets]]\nspool_dir = "{tmp_path}/spool"\n'
+        "[delivery]\nlocal = false\nquantum = 3\n"
+    )
+    cfg = load_config(path)
+    c, store = configured_coordinator(cfg, log=lambda msg: None)
+    assert c.settings.quantum == 3
+    assert store is None and not cfg.metadata_dir.exists()
+    path.write_text(path.read_text().replace("quantum = 3", "unknown = 3"))
+    with pytest.raises(ValueError, match="unknown keys"):
+        load_config(path)
+
+
+def test_delivery_identity_collisions_are_rejected(tmp_path):
+    from slipstream.config import (
+        PushConfig,
+        PushTarget,
+        RelaySource,
+        validate_delivery_identities,
+    )
+
+    push = PushConfig(
+        "bot", [PushTarget(spanner="/p/i/d/"), PushTarget(spanner="p/i/d")]
+    )
+    with pytest.raises(ValueError, match="duplicate push target"):
+        validate_delivery_identities(push, [])
+    sources = [RelaySource("box", "/spool", bot, tmp_path / bot) for bot in ("a", "b")]
+    with pytest.raises(ValueError, match="duplicate relay"):
+        validate_delivery_identities(None, sources)
+    push = PushConfig("bot", [PushTarget(spool_dir=tmp_path / "spool")])
+    with pytest.raises(ValueError, match="routes back"):
+        validate_delivery_identities(
+            push, [RelaySource("localhost", str(tmp_path / "spool"), "other", tmp_path)]
+        )

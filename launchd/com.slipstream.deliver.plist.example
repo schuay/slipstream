@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.slipstream.deliver</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/slipstream</string>
+    <string>deliver</string>
+    <string>--config</string><string>/ABSOLUTE/PATH/TO/config.toml</string>
+    <string>--log-file</string><string>/ABSOLUTE/EXISTING/LOG/DIRECTORY/deliver.log</string>
+  </array>
+  <key>WorkingDirectory</key><string>/ABSOLUTE/PATH/TO/slipstream-checkout</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>PYTHONUNBUFFERED</key><string>1</string><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>KillTimeOut</key><integer>20</integer>
+  <key>StandardOutPath</key><string>/ABSOLUTE/EXISTING/LOG/DIRECTORY/deliver.stdout.log</string>
+  <key>StandardErrorPath</key><string>/ABSOLUTE/EXISTING/LOG/DIRECTORY/deliver.stderr.log</string>
+</dict>
+</plist>

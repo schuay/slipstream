@@ -374,25 +374,6 @@ class TestBenchAtRoot:
         (row,) = c.store.get_commits_with_metadata("v8", ["incumbent"])
         assert row["title"] == "held"
 
-    def test_notifies_the_pusher_only_after_the_commit_is_recorded(
-        self, config, tmp_path, monkeypatch
-    ):
-        from slipstream.collector import BenchOutcome
-
-        c = self._collector(config, tmp_path, monkeypatch)
-        monkeypatch.setattr(c, "_run_benchmarks", lambda *a: BenchOutcome(2, 2, 40))
-        seen = []
-        c.bench_at_root(
-            config.engines["v8"],
-            self.COMMIT,
-            tmp_path / "root",
-            3,
-            on_commit_done=lambda: seen.append(
-                c.store.is_done("v8", config.platform, 109680)
-            ),
-        )
-        assert seen == [True]
-
     def test_the_run_root_decides_where_the_binary_comes_from(
         self, config, tmp_path, monkeypatch
     ):
