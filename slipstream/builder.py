@@ -31,6 +31,7 @@ from .collector import BenchCollector, BuildStepError, FetchError
 from .config import Config, EngineConfig
 from .lock import MachineLock
 from .models import CommitKey
+from .resolve import BuildJob, IdentityResolver, Resolver
 
 # A stalled engine still retries, or the guard against a permanent burn becomes
 # a permanent stall. Each attempt is a full checkout, sync and compile holding
@@ -147,8 +148,21 @@ class Builder:
         self.lock = MachineLock("build")
         self.log = log or (lambda msg: None)
         self.identity = {"bot": cfg.bot_name, **host.identity()}
+        self._resolvers: dict[str, Resolver] = {}
 
     # --- resolving what to build ---
+
+    def resolver(self, engine_name: str) -> Resolver:
+        """The reader of this engine's series.
+
+        One per engine, made on first use: the collector it wraps is shared,
+        and the choice of resolver is a property of the engine's config, not
+        of the cycle.
+        """
+        if engine_name not in self._resolvers:
+            engine = self.cfg.engines[engine_name]
+            self._resolvers[engine_name] = IdentityResolver(self.collector, engine)
+        return self._resolvers[engine_name]
 
     def frontier(self, engine_name: str) -> CommitKey | None:
         """The highest key this builder has finished with.
@@ -186,27 +200,24 @@ class Builder:
             if row["status"] == "infra_burned"
         )
 
-    def next_commit(self, engine_name: str) -> dict | None:
-        """The next commit to build, or None when up to date.
+    def next_job(self, engine_name: str) -> BuildJob | None:
+        """The next job to build, or None when up to date.
 
         Retries come first: entries above the failed commit exist by the time
         anyone retries, so the frontier rule would never pick it up again.
         """
-        engine = self.cfg.engines[engine_name]
-        # The collector resolves scalar ids in the engine's own checkout, so
-        # the key's commit_id is what it is asked for; an engine built inside
-        # another's tree gets its own resolver, not this path.
+        resolver = self.resolver(engine_name)
         for key in self.store.build_retries_requested(engine_name):
-            commit = self.collector.commit_metadata_for_id(engine, key.commit_id)
-            if commit:
-                return commit
+            job = resolver.for_key(key)
+            if job:
+                return job
         frontier = self.frontier(engine_name)
         if frontier is None:
             raise BuildError(
                 f"{engine_name} has no build history and no [build] from entry; "
                 f"set one to say where to start"
             )
-        return self.collector.next_commit_after(engine, frontier.commit_id)
+        return resolver.next_after(frontier)
 
     # --- one commit ---
 
@@ -246,8 +257,8 @@ class Builder:
             self._publish_state(engine_name, state)
             return BuildResult()
 
-        commit = self.next_commit(engine_name)
-        if commit is None:
+        job = self.next_job(engine_name)
+        if job is None:
             state.last_error = None
             # A builder killed between publishing and writing its state leaves
             # this set; refreshing it every cycle would report a package step
@@ -256,7 +267,7 @@ class Builder:
             self._publish_state(engine_name, state)
             return BuildResult()
 
-        key = CommitKey.from_commit(commit)
+        key = job.key
         state.in_flight = {
             "commit_id": key.commit_id,
             "embedder_id": key.embedder_id,
@@ -270,8 +281,8 @@ class Builder:
         log_path = self.cfg.logs_dir / f"build-{engine_name}-{key}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         started = time.time()
-        self.log(f"{engine_name}: building {key} ({commit['hash'][:8]})")
-        failure = self.collector.build_at(engine, commit["hash"], log_path)
+        self.log(f"{engine_name}: building {key} ({job.hash[:8]})")
+        failure = self.collector.build_at(engine, job.checkout_hash, log_path)
         if failure is not None:
             return self._record_failure(
                 engine_name,
@@ -291,9 +302,7 @@ class Builder:
         }
         self._publish_state(engine_name, state)
         try:
-            entry = self._package_and_publish(
-                engine, commit, int(time.time() - started)
-            )
+            entry = self._package_and_publish(engine, job, int(time.time() - started))
         except (BuildError, OSError) as e:
             # Packaging is this machine's business, not the commit's.
             return self._record_failure(
@@ -328,9 +337,10 @@ class Builder:
         return BuildResult(key=key, published=True)
 
     def _package_and_publish(
-        self, engine: EngineConfig, commit: dict, build_secs: int
+        self, engine: EngineConfig, job: BuildJob, build_secs: int
     ) -> Entry:
-        key = CommitKey.from_commit(commit)
+        key = job.key
+        commit = job.commit
         blob = self.bus.tmp_blob(engine.name, key)
         package(engine.require_src_dir(), engine.require_run_set(), blob)
         entry = Entry(
@@ -442,7 +452,7 @@ class Builder:
             if not self.lock.acquire(should_stop, wait=True, log=self.log):
                 break
             try:
-                self.collector.head_commit_id(name)  # fetch, so origin/main is current
+                self.resolver(name).fetch()  # so origin/main is current
                 result = self.build_one(name)
             except FetchError:
                 self.log(f"{name}: skipping until fetch succeeds")

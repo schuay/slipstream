@@ -145,7 +145,70 @@ class TestFrontier:
     def test_no_history_and_no_from_is_an_error(self, builder):
         builder.cfg.build.start_from = {}
         with pytest.raises(BuildError, match="from"):
-            builder.next_commit("v8")
+            builder.next_job("v8")
+
+
+class TestResolverSeam:
+    """The builder asks a Resolver what to build and does not look past it.
+
+    Today every engine gets the IdentityResolver; the point of the seam is
+    that an engine built inside another's tree gets a different one and the
+    rest of the builder -- state, retries, packaging -- does not change.
+    """
+
+    def test_build_one_builds_what_the_resolver_hands_it(self, builder, monkeypatch):
+        from slipstream.resolve import BuildJob
+
+        checked_out = []
+
+        def build_at(engine, commit_hash, log=None):
+            checked_out.append(commit_hash)
+            return None
+
+        monkeypatch.setattr(builder.collector, "build_at", build_at)
+
+        class Scripted:
+            def fetch(self):
+                pass
+
+            def next_after(self, frontier):
+                return BuildJob(
+                    key=K1(101),
+                    commit=_commit(101),
+                    checkout_hash="elsewhere",  # not the commit's own hash
+                )
+
+            def for_key(self, key):
+                return None
+
+        builder._resolvers["v8"] = Scripted()
+        result = builder.build_one("v8")
+        assert result.published and result.key == K1(101)
+        assert checked_out == ["elsewhere"]
+        entry = builder.bus.read_entry("v8", K1(101))
+        assert entry.hash == "hash101"  # the entry describes the engine commit
+
+    def test_an_embedder_key_on_an_identity_engine_is_a_misconfiguration(self, builder):
+        """[build] from = { v8 = "7-100" } names a series v8 does not have."""
+        from slipstream.models import CommitKey
+
+        builder.cfg.build.start_from = {"v8": CommitKey(7, 100)}
+        with pytest.raises(ValueError, match="own checkout"):
+            builder.next_job("v8")
+        # The cycle treats it like any other misconfigured engine: logged,
+        # skipped, and the other engines keep going.
+        assert builder.run_cycle(["v8"], lambda: False) == 0
+        assert any("own checkout" in m for m in builder.logs)
+
+    def test_the_cycle_fetches_through_the_resolver(self, builder, monkeypatch):
+        fetched = []
+        monkeypatch.setattr(
+            builder.collector,
+            "head_commit_id",
+            lambda name, fetch=True: fetched.append((name, fetch)) or 999,
+        )
+        builder.run_cycle(["v8"], lambda: False)
+        assert fetched[0] == ("v8", True)
 
 
 class TestFailureClassification:
@@ -269,7 +332,7 @@ class TestRetry:
         builder.build_one("v8")  # 101 fails
         builder.build_one("v8")  # 102 publishes
         assert builder.store.request_build_retry("v8", 101)
-        assert builder.next_commit("v8")["commit_id"] == 101
+        assert builder.next_job("v8").key == K1(101)
 
     def test_a_successful_retry_clears_the_allowance(self, builder):
         builder.failures = [BuildStepError("compile", 1)]
@@ -277,7 +340,7 @@ class TestRetry:
         builder.store.request_build_retry("v8", 101)
         assert builder.build_one("v8").key == K1(101)
         assert builder.store.get_build_state("v8", 101) is None
-        assert builder.next_commit("v8")["commit_id"] == 102
+        assert builder.next_job("v8").key == K1(102)
 
     def test_a_failed_retry_is_not_sticky(self, builder):
         """Otherwise one operator action head-of-line blocks the engine."""
@@ -287,7 +350,7 @@ class TestRetry:
         builder.failures = [BuildStepError("compile", 1)]
         builder.build_one("v8")
         assert builder.store.get_build_state("v8", 101)["status"] == "compile_failed"
-        assert builder.next_commit("v8")["commit_id"] == 102
+        assert builder.next_job("v8").key == K1(102)
 
     def test_a_burned_commit_reburns_rather_than_retrying_forever(self, builder):
         builder.cfg.build.max_infra_attempts = 1
@@ -553,7 +616,7 @@ class TestRetryFailureIsNotStranded:
         builder.failures = [BuildStepError("sync", 1)]
         assert builder.build_one("v8").key == K1(101)
         assert builder.store.build_retries_requested("v8") == K(101)
-        assert builder.next_commit("v8")["commit_id"] == 101
+        assert builder.next_job("v8").key == K1(101)
 
     def test_it_still_burns_once_the_attempts_run_out(self, builder):
         builder.cfg.build.max_infra_attempts = 2
@@ -576,7 +639,7 @@ class TestRetryFailureIsNotStranded:
         builder.failures = [BuildStepError("compile", 1)]
         builder.build_one("v8")
         assert builder.store.get_build_state("v8", 101)["status"] == "compile_failed"
-        assert builder.next_commit("v8")["commit_id"] == 102
+        assert builder.next_job("v8").key == K1(102)
 
 
 class TestNoStaleInFlight:
