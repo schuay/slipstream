@@ -257,7 +257,7 @@ class CommitStore:
             # A reporting command reads what is there rather than migrating a
             # live db on every run. A db that does not exist yet has nothing
             # to read, so it is created either way: otherwise the first export
-            # or analyze on a fresh machine fails on a missing table instead
+            # on a fresh machine fails on a missing table instead
             # of reporting nothing.
             if init_schema and (not readonly or not pre_existing):
                 self._init_schema()

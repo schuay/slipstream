@@ -15,12 +15,11 @@ import typer
 from .config import load_config
 from .models import CommitKey
 from .collector import BenchCollector, FetchError
-from .analyzer import PerfAnalyzer
 from . import host as host_mod
 
 app = typer.Typer(
     name="slipstream",
-    help="JS engine benchmark collector and analyzer.",
+    help="JS engine benchmark builder, bencher and publisher.",
     no_args_is_help=True,
 )
 
@@ -154,78 +153,6 @@ def bench(
         raise typer.Exit(EXIT_BUSY)
 
 
-@app.command()
-def analyze(
-    csv_path: Annotated[
-        Optional[Path], typer.Argument(help="Path to raw_results CSV (omit to use DB)")
-    ] = None,
-    engine: Optional[str] = typer.Option(
-        None, help="Engine (required when using DB, ignored with CSV)"
-    ),
-    commits: Optional[str] = typer.Option(
-        None, help="Glob for commit info CSVs (CSV mode only)"
-    ),
-    config: Optional[Path] = typer.Option(None, help="User config path"),
-    min_change: float = typer.Option(0.01, help="Minimum change threshold (0.01 = 1%)"),
-    penalty: float = typer.Option(
-        3.0, help="PELT penalty (higher = fewer change points)"
-    ),
-    min_effect: float = typer.Option(0.5, help="Minimum Cohen's d effect size"),
-    group: bool = typer.Option(False, "--group", help="Group results by commit"),
-    include_bench: Optional[list[str]] = typer.Option(
-        None, "--include-bench", help="Include only matching benchmarks"
-    ),
-    exclude_bench: Optional[list[str]] = typer.Option(
-        None, "--exclude-bench", help="Exclude matching benchmarks"
-    ),
-    include_score: Optional[list[str]] = typer.Option(
-        None, "--include-score", help="Include only matching score types"
-    ),
-    exclude_score: Optional[list[str]] = typer.Option(
-        None, "--exclude-score", help="Exclude matching score types"
-    ),
-    since: Optional[str] = typer.Option(
-        None,
-        help="Only include commits on or after this date (YYYY-MM-DD or '2 weeks ago')",
-    ),
-    until: Optional[str] = typer.Option(
-        None,
-        help="Only include commits on or before this date (YYYY-MM-DD or 'yesterday')",
-    ),
-):
-    """Detect change points in benchmark results (DB or CSV)."""
-
-    cfg = _load_config(config)
-    analyzer = PerfAnalyzer(
-        min_change=min_change, penalty=penalty, min_effect_size=min_effect
-    )
-
-    if csv_path:
-        if not analyzer.load_results(csv_path):
-            raise typer.Exit(1)
-        commit_pattern = commits or str(cfg.metadata_dir / "commit-infos-*.csv")
-        analyzer.load_commit_infos(commit_pattern)
-    else:
-        if not engine:
-            typer.echo("Error: --engine required when analyzing from DB", err=True)
-            raise typer.Exit(1)
-        store = _open_store(cfg, readonly=True)
-        analyzer.load_from_db(store, engine)
-
-    since_date = _parse_date(since) if since else None
-    until_date = _parse_date(until) if until else None
-    if since_date or until_date:
-        analyzer.filter_by_date(since=since_date, until=until_date)
-
-    results = analyzer.analyze(
-        include_bench=include_bench,
-        exclude_bench=exclude_bench,
-        include_score=include_score,
-        exclude_score=exclude_score,
-    )
-    analyzer.print_report(results, group_by_commit=group)
-
-
 @app.command(name="next-range")
 def next_range(
     engine: Annotated[str, typer.Argument(help="Engine name: v8 or jsc")],
@@ -261,16 +188,6 @@ def next_range(
     typer.echo(f"Latest done : {start_id}")
     typer.echo(f"Newest in git: {end_id}")
     typer.echo(f"\n  slipstream bench {engine} {start_id} {end_id}")
-
-
-def _parse_date(value: str) -> str:
-    """Parse a date string like '2026-01-15' or '2 weeks ago' into YYYY-MM-DD."""
-    import dateparser
-
-    dt = dateparser.parse(value)
-    if dt is None:
-        raise typer.BadParameter(f"Cannot parse date: {value!r}")
-    return dt.strftime("%Y-%m-%d")
 
 
 def _parse_interval(value: str) -> int:
@@ -579,7 +496,7 @@ def import_csv(
     One db holds one bot, so this refuses anything that is not this machine's
     own data. Foreign scores would land under the local bot name and could not
     be found or separated again afterwards; compare two machines in the perf
-    frontend, which keys on bot, or with 'slipstream analyze <csv>'.
+    frontend, which keys on bot.
     """
     import csv as _csv
 
@@ -658,7 +575,6 @@ def import_csv(
                 # `is not None`, not truthiness: a blank cell in a 7-column
                 # file (hand-concatenated, or partially populated) would
                 # otherwise bypass the check and land under the local bot.
-                # analyzer.load_results already refuses the same file.
                 if row_bot is not None and row_bot != bot:
                     typer.echo(
                         f"Error: {path} holds {row_bot or '(blank)'}'s scores, "

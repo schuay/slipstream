@@ -1,7 +1,7 @@
 # Copyright 2026 The slipstream developers
 # SPDX-License-Identifier: MIT
 
-"""The interchange CSV shared by ``import``, ``export`` and ``analyze <csv>``.
+"""The interchange CSV shared by ``import`` and ``export``.
 
 This is the format skiz wrote before the SQLite store, and the only one that
 crosses machines by hand. It grew a trailing ``bot`` column when one db came

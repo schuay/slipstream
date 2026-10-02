@@ -1,10 +1,9 @@
 # slipstream
 
-Slipstream measures JavaScript engine performance across a range of commits and
-tells you which commits changed it. It builds V8 or JavaScriptCore at each
-commit, runs JetStream2 or JetStream3, stores every raw score in SQLite, and
-runs PELT change-point detection over the resulting time series to find the
-commits where a score shifted.
+Slipstream measures JavaScript engine performance commit by commit. It builds
+V8 or JavaScriptCore at each commit, runs JetStream2 or JetStream3, stores
+every raw score in SQLite, and delivers the series to the perf database, where
+the analysis lives.
 
 It is built for unattended operation: a `watch` daemon benchmarks new commits as
 they land, and two machines can split the work, one building and both measuring
@@ -36,13 +35,11 @@ is the reference for what can be set.
 
 ```sh
 slipstream bench v8 109000 109100
-slipstream analyze --engine v8
 slipstream watch
 ```
 
-`bench` walks a commit range, building and measuring each commit. `analyze`
-reports the change points it finds, with a Cohen's d effect size per segment.
-`watch` is the same thing as a daemon: it picks up where the last run left off,
+`bench` walks a commit range, building and measuring each commit. `watch` is
+the same thing as a daemon: it picks up where the last run left off,
 measures each new commit, and persists the scores. Run `slipstream deliver`
 separately to send them onward.
 

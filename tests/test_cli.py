@@ -8,7 +8,7 @@ import subprocess
 import pytest
 
 from slipstream.cli import _parse_interval
-from keys import K, K1
+from keys import K
 
 
 class TestParseInterval:
@@ -406,31 +406,6 @@ class TestCompatCsvIngress:
         assert "1 scores" in res.output
 
 
-class TestAnalyzeCsvBotGuard:
-    def test_refuses_two_bots_in_one_file(self, tmp_path):
-        from slipstream.analyzer import PerfAnalyzer
-
-        f = tmp_path / "mixed.csv"
-        f.write_text(
-            "b_type,flags,benchmark,score_type,commit_id,score,bot\n"
-            "js3,default,Air,Total-Score,100,1.0,box1\n"
-            "js3,default,Air,Total-Score,100,1.1,box2\n"
-        )
-        assert PerfAnalyzer().load_results(f) is False
-
-    def test_accepts_one_bot(self, tmp_path):
-        from slipstream.analyzer import PerfAnalyzer
-
-        f = tmp_path / "one.csv"
-        f.write_text(
-            "b_type,flags,benchmark,score_type,commit_id,score,bot\n"
-            "js3,default,Air,Total-Score,100,1.0,box1\n"
-        )
-        a = PerfAnalyzer()
-        assert a.load_results(f) is True
-        assert a.data["js3[default] Air"]["Total-Score"][K1(100)] == [1.0]
-
-
 class TestClearScope:
     def test_it_leaves_the_other_engines_logs_alone(self, tmp_path):
         """The two engines' commit id spaces are independent, so a clear used
@@ -649,12 +624,6 @@ class TestFreshMachine:
         res = self._invoke(["export", "v8", "--config", str(self._cfg(tmp_path))])
         assert res.exit_code == 0, res.output
 
-    def test_analyze_on_a_db_that_does_not_exist_yet(self, tmp_path):
-        res = self._invoke(
-            ["analyze", "--engine", "v8", "--config", str(self._cfg(tmp_path))]
-        )
-        assert res.exit_code == 0, res.output
-
 
 class TestCheckoutlessEngine:
     """config.toml.example promises every command that needs git says so by name."""
@@ -736,18 +705,6 @@ class TestImportBlankBotCell:
         assert res.exit_code == 1
         assert "(blank)" in res.output
 
-    def test_analyze_refuses_the_same_file(self, tmp_path):
-        """The two paths agreed on everything except this."""
-        from slipstream.analyzer import PerfAnalyzer
-
-        f = tmp_path / "mixed.csv"
-        f.write_text(
-            "b_type,flags,benchmark,score_type,commit_id,score,bot\n"
-            "js3,default,Air,Total-Score,100,1.0,\n"
-            "js3,default,Air,Total-Score,101,1.0,box1\n"
-        )
-        assert PerfAnalyzer().load_results(f) is False
-
 
 class TestRaggedCsvRows:
     """A hand-concatenated or partially populated file is the realistic case
@@ -815,27 +772,3 @@ class TestRaggedCsvRows:
         )
         assert "Traceback" not in res.output, res.output
         assert res.exit_code == 0
-
-    def test_analyze_reports_rather_than_crashing(self, tmp_path):
-        from slipstream.analyzer import PerfAnalyzer
-
-        f = tmp_path / "ragged.csv"
-        f.write_text(
-            "b_type,flags,benchmark,score_type,commit_id,score,bot\n"
-            "js3,default,Box2D,Score,100,1.5\n"
-            "js3,default,Box2D,Score,101,1.6,box1\n"
-        )
-        # A ragged merged file has more than one bot once the blank counts.
-        assert PerfAnalyzer().load_results(f) is False
-
-    def test_analyze_loads_a_well_formed_file(self, tmp_path):
-        from slipstream.analyzer import PerfAnalyzer
-
-        f = tmp_path / "ok.csv"
-        f.write_text(
-            "b_type,flags,benchmark,score_type,commit_id,score,bot\n"
-            "js3,default,Box2D,Score,100,1.5,box1\n"
-        )
-        a = PerfAnalyzer()
-        assert a.load_results(f) is True
-        assert a.data["js3[default] Box2D"]["Score"][K1(100)] == [1.5]

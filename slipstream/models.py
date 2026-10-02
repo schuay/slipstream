@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
 from typing import NamedTuple
 
 _KEY_RE = re.compile(r"^(?:(\d+)-)?(\d+)$")
@@ -21,9 +20,9 @@ class CommitKey(NamedTuple):
     CL, V8 position pinned under it), so the same V8 commit can be measured
     under two chromium revisions and the series still has one point per key.
 
-    The lexicographic order is what the analyzer needs: along the series each
-    step changes one coordinate, so a change point blames either a range of
-    the engine's commits or a range of the embedder's, never a mixture.
+    The order is lexicographic: along the series each step changes one
+    coordinate, so a step is either a range of the engine's commits or a
+    range of the embedder's, never a mixture.
 
     The scalar spelling is kept wherever ``embedder_id`` is 0 -- ``str``,
     ``to_json`` -- so files and state written before this type existed read
@@ -97,32 +96,3 @@ class CommitKey(NamedTuple):
 
     def __repr__(self) -> str:
         return f"CommitKey({self.embedder_id}, {self.commit_id})"
-
-
-@dataclass
-class CommitInfo:
-    key: CommitKey
-    hash: str
-    date: str
-    timestamp: int
-    title: str
-
-    @property
-    def id(self) -> int:
-        return self.key.commit_id
-
-
-@dataclass
-class ChangePoint:
-    benchmark: str  # "js3[default] regex-dna-SP"
-    score_type: str
-    key: CommitKey  # where the change is detected
-    prev_key: CommitKey  # last benchmarked commit before the change
-    direction: str  # "improvement" / "regression"
-    magnitude: float  # Cohen's d
-    pct_change: float  # (after - before) / before
-    confidence: str  # "high" / "medium" / "low"
-    seg_before_mean: float
-    seg_after_mean: float
-    # (key, probability) pairs for alternative breakpoint locations
-    candidates: list[tuple[CommitKey, float]] = field(default_factory=list)

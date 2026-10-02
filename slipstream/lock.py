@@ -7,7 +7,7 @@ A build next to a measurement contaminates it, so the builder and the bencher
 take this lock around their expensive phases: the builder across checkout,
 build and packaging, the bencher across all runs of one commit rather than per
 run, since a build landing between run 1 and run 2 would contaminate exactly
-the within-commit variance the analyzer reads as noise.
+the within-commit variance downstream reads as noise.
 
 It is per machine, not per out_dir, and it is deliberately not used to
 serialize schema changes: it is held for hours, and every store-opening command

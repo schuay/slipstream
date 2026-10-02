@@ -11,10 +11,6 @@ requires-python = ">=3.11.4"
 dependencies = [
     "typer>=0.12",
     "rich>=13",
-    "scipy>=1.11",
-    "ruptures>=1.1",
-    "numpy>=1.24",
-    "dateparser>=1.2",
     # Not an extra: a spanner target is the only way scores reach the perf
     # database, and the machine that cannot reach it spools for one that can.
     "google-cloud-spanner>=3.0",

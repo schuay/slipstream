@@ -119,16 +119,3 @@ def csv_old_format(tmp_path):
         "test-bench, Total-Score, 1001, 99.8\n"
     )
     return p
-
-
-@pytest.fixture
-def commit_infos_csv(tmp_path):
-    """Commit info CSV for the analyzer."""
-    p = tmp_path / "commit-infos-v8.csv"
-    lines = []
-    for cid in range(1000, 1030):
-        lines.append(
-            f'{cid}, hash{cid}, 2026-01-01, "commit {cid}", {1700000000 + cid}'
-        )
-    p.write_text("\n".join(lines) + "\n")
-    return p
