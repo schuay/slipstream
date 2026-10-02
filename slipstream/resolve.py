@@ -16,9 +16,17 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
+from .collector import FetchError
 from .models import CommitKey
+
+
+class _Point(NamedTuple):
+    """A commit on the inner engine's main line, with the id the series uses."""
+
+    sha: str
+    id: int
 
 
 @dataclass(frozen=True)
@@ -114,17 +122,34 @@ class EmbedderResolver:
     onto it isolates the chromium-side delta; the steps after it isolate one
     V8 commit each.
 
+    What chromium pins is not a main commit. V8 cuts a release branch for
+    every roll: ``main@{#N}`` plus one "Version X.Y.Z" commit that bumps
+    ``include/v8-version.h``, positioned ``refs/heads/X.Y.Z@{#1}`` and
+    carrying ``Cr-Branched-From: <sha>-refs/heads/main@{#N}``. Two such
+    endpoints share no branch, so neither is the other's ancestor, and the
+    position each carries is ``1``. Each endpoint is therefore read as the
+    main commit it was cut from -- the series is main's, and the ids on it
+    are what the inner engine's own series uses -- and the roll is compared,
+    expanded and keyed in those terms. Every key ``(R, N)`` pins ``main@{#N}``
+    then, the endpoints included; what the shipped Chrome had there differs
+    from that by the version string alone.
+
     The scan is bounded by the frontier: its outer coordinate names the roll
     being walked, so "what is next" is either further inside that roll or
-    the first forward roll after it. Reverts are rolls whose ``new`` is not
-    a descendant of ``old`` and are skipped; the re-roll that follows covers
-    the same inner range, and resumes at the frontier's inner commit under
-    the new outer one -- which is itself a chromium-only step, correctly
-    keyed. A roll whose ``new`` is at or below the frontier's inner commit
-    adds nothing and is skipped too.
+    the first forward roll after it. Reverts are rolls whose ``new`` is below
+    ``old`` on main and are skipped; the re-roll that follows covers the same
+    inner range, and resumes at the frontier's inner commit under the new
+    outer one -- which is itself a chromium-only step, correctly keyed. A
+    roll whose ``new`` is below the frontier's inner commit adds nothing and
+    is skipped too; one ending exactly on it is that chromium-only step.
 
     Inner history is read from the inner engine's own checkout, not from the
-    copy under the outer tree, which sits at whatever was last synced.
+    copy under the outer tree, which sits at whatever was last synced. An
+    endpoint that checkout has not fetched -- a fresh roll, usually -- is
+    fetched by hash on the spot; one that cannot be is a FetchError, so the
+    builder retries next cycle rather than scanning past the roll and
+    building a later one, which would have moved the frontier over commits
+    nobody built.
     """
 
     def __init__(
@@ -159,26 +184,30 @@ class EmbedderResolver:
                 raise ValueError(
                     f"{self.outer.name} has no commit at position {outer_pos}"
                 )
-            bounds = self._bounds(
-                self._git(self.outer, f"show --format= -p {start} -- {self.roll_file}")
+            ends = self._endpoints(
+                self._bounds(
+                    self._git(
+                        self.outer, f"show --format= -p {start} -- {self.roll_file}"
+                    )
+                )
             )
-            if bounds and self._forward(*bounds):
+            if ends and self._forward(*ends):
                 # Still inside the frontier's roll: the next inner commit
                 # above the one just built, up to the roll's new pin.
-                job = self._first_within(start, *bounds, min_id=inner_id + 1)
+                job = self._first_within(start, *ends, min_id=inner_id + 1)
                 if job:
                     return job
         rng = f"{start}..origin/main" if start else "origin/main"
-        for roll, (old, new) in self._rolls(rng):
-            if not self._forward(old, new):
+        for roll, bounds in self._rolls(rng):
+            ends = self._endpoints(bounds)
+            if ends is None or not self._forward(*ends):
                 continue
-            new_id = self._inner_id(new)
-            if new_id is None or new_id <= inner_id:
+            if ends[1].id < inner_id:
                 continue
             # A fresh roll starts at its own old pin -- the chromium-only
             # step -- unless the frontier is already past it (a re-roll after
             # a revert), in which case it resumes there.
-            job = self._first_within(roll, old, new, min_id=inner_id)
+            job = self._first_within(roll, *ends, min_id=inner_id)
             if job:
                 return job
         return None
@@ -241,36 +270,94 @@ class EmbedderResolver:
 
     # --- the inner side ---
 
-    def _inner_id(self, sha: str) -> int | None:
-        found = self.collector._commit_id_from_hash(self.inner, sha)
-        return int(found) if found else None
+    def _endpoints(
+        self, bounds: tuple[str, str] | None
+    ) -> tuple[_Point, _Point] | None:
+        """Both pins of a roll as main-line points, or None if either is
+        nothing the inner series has a place for."""
+        if bounds is None:
+            return None
+        old, new = (self._main_point(sha) for sha in bounds)
+        return (old, new) if old and new else None
 
-    def _forward(self, old: str, new: str) -> bool:
-        """A roll, not a revert of one: ``new`` descends from ``old``."""
+    def _main_point(self, sha: str) -> _Point | None:
+        """The main commit a pin stands for, with the id the series uses.
+
+        The pin itself when it is on main; otherwise the commit named by its
+        ``Cr-Branched-From`` trailer, which is how a release-branch head says
+        where it was cut. The id is read off that main commit with the inner
+        engine's own id_regex, so the resolver keeps no second notion of it.
+        """
+        self._ensure_fetched(sha)
+        if self._on_main(sha):
+            base = sha
+        else:
+            m = re.search(
+                r"^ *Cr-Branched-From: ([0-9a-f]{40})",
+                self._git(self.inner, f"show -s {sha}"),
+                re.MULTILINE,
+            )
+            if not m:
+                return None
+            base = m.group(1)
+        found = self.collector._commit_id_from_hash(self.inner, base)
+        return _Point(base, int(found)) if found else None
+
+    def _on_main(self, sha: str) -> bool:
         res = self.collector._run(
-            f"git merge-base --is-ancestor {old} {new}",
+            f"git merge-base --is-ancestor {sha} origin/main",
             cwd=self.inner.require_src_dir(),
             capture=True,
             caffeinate=False,
         )
         return res.returncode == 0
 
+    def _ensure_fetched(self, sha: str) -> None:
+        """Have ``sha`` in the inner checkout, fetching it by hash if not.
+
+        The routine fetch brings main; a branch head is not on it, and the
+        remote serves any commit by hash. Failing that is the fetch's
+        failure, retried next cycle, not a roll to walk past.
+        """
+        src = self.inner.require_src_dir()
+        have = self.collector._run(
+            f"git cat-file -e {sha}^{{commit}}", cwd=src, capture=True, caffeinate=False
+        )
+        if have.returncode == 0:
+            return
+        got = self.collector._run(
+            f"git fetch origin {sha}", cwd=src, capture=True, caffeinate=False
+        )
+        if got.returncode != 0:
+            raise FetchError(
+                f"{self.inner.name}: {sha[:12]} is not in the checkout and "
+                f"could not be fetched"
+            )
+
+    def _forward(self, old: _Point, new: _Point) -> bool:
+        """A roll, not a revert of one: ``new`` is not behind ``old`` on main.
+
+        Equal is a roll too -- two branch heads cut from the same main
+        commit -- and expands to its base point alone.
+        """
+        return old.id <= new.id
+
     def _first_within(
-        self, roll: str, old: str, new: str, *, min_id: int
+        self, roll: str, old: _Point, new: _Point, *, min_id: int
     ) -> BuildJob | None:
         """The lowest inner commit in ``old..=new`` with id >= ``min_id``.
 
         ``old`` itself is always a candidate -- it is the roll's base point,
         whatever the inner engine's path_filter says -- and the commits
         above it are the ones the inner engine's own cadence would build.
-        Both bounds are known to the checkout: ``_forward`` said so.
         """
         fmt = self.collector._METADATA_FORMAT
         path_filter = self.inner.path_filter or ""
-        base = self._git(self.inner, f'log -1 --pretty=format:"{fmt}" {old}')
+        base = self._git(self.inner, f'log -1 --pretty=format:"{fmt}" {old.sha}')
         rest = self._git(
             self.inner,
-            f'log --reverse --pretty=format:"{fmt}" {old}..{new} -- {path_filter}',
+            f'log --reverse --pretty=format:"{fmt}" {old.sha}..{new.sha}'
+            f" -- {path_filter}",
         )
         for raw in (base + rest).split("--END-COMMIT--"):
             if not raw.strip():

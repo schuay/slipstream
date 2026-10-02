@@ -154,6 +154,25 @@ class Repo:
         self.git("fetch", "-q", "origin", "main")
         return sha
 
+    def cut(self, pos: int, version: str) -> str:
+        """A release-branch head the way V8 makes one: a Version commit on
+        its own branch off main's ``pos``, carrying ``Cr-Branched-From``."""
+        base = self.by_pos[pos]
+        self.git("checkout", "-q", "-b", version, base)
+        (self.path / "v8-version.h").write_text(f"{version}\n")
+        self.git("add", "v8-version.h")
+        self.git(
+            "commit",
+            "-q",
+            "-m",
+            f"Version {version}\n\n"
+            f"Cr-Commit-Position: refs/heads/{version}@{{#1}}\n"
+            f"Cr-Branched-From: {base}-refs/heads/main@{{#{pos}}}",
+        )
+        sha = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", "main")
+        return sha
+
 
 def _deps(v8_sha: str, extra: str = "") -> str:
     return f"deps = {{\n  'v8_revision': '{v8_sha}',\n{extra}}}\n"
@@ -216,6 +235,33 @@ def _resolver(config, v8_path: Path, cr_path: Path) -> EmbedderResolver:
 def embedder(repos, config):
     v8, cr = repos
     return _resolver(config, v8.path, cr.path)
+
+
+@pytest.fixture
+def branched(tmp_path, config):
+    """The same history as ``repos`` -- same V8 commits, same rolls -- but
+    chromium pins what it really pins: a release-branch head cut from each
+    main commit, not the main commit itself."""
+    v8 = Repo(tmp_path / "v8")
+    for pos in range(1001, 1009):
+        rel = "README" if pos == 1007 else f"src/f{pos}.cc"
+        v8.commit(pos, f"v8 change {pos}", {rel: f"{pos}\n"})
+    H = {
+        pos: v8.cut(pos, f"15.0.{pos - 1000}") for pos in (1001, 1003, 1005, 1006, 1008)
+    }
+
+    cr = Repo(tmp_path / "chromium")
+    cr.commit(5001, "Initial", {"DEPS": _deps(H[1001]), "foo.txt": "a\n"})
+    cr.commit(5002, "Unrelated", {"foo.txt": "b\n"})
+    cr.commit(5003, "Roll V8 1001..1003", {"DEPS": _deps(H[1003])})
+    cr.commit(5004, "Roll skia", {"DEPS": _deps(H[1003], "  'skia': 'x',\n")})
+    cr.commit(5005, "Roll V8 1003..1005", {"DEPS": _deps(H[1005], "  'skia': 'x',\n")})
+    cr.commit(5006, "Revert Roll V8", {"DEPS": _deps(H[1003], "  'skia': 'x',\n")})
+    cr.commit(
+        5007, "Reland Roll V8 1003..1006", {"DEPS": _deps(H[1006], "  'skia': 'x',\n")}
+    )
+    cr.commit(5008, "Roll V8 1006..1008", {"DEPS": _deps(H[1008], "  'skia': 'x',\n")})
+    return v8, cr, H, _resolver(config, v8.path, cr.path)
 
 
 def _walk(resolver, start):
@@ -284,33 +330,53 @@ class TestEmbedderResolver:
         with pytest.raises(ValueError, match="no commit at position 4242"):
             embedder.next_after(CommitKey(4242, 0))
 
-    def test_a_roll_past_the_inner_checkout_waits_for_the_fetch(
-        self, repos, config, tmp_path
+    def test_a_roll_past_the_inner_checkout_fetches_the_endpoint(
+        self, branched, config, tmp_path
     ):
         """Chromium can roll to a V8 commit the V8 checkout has not fetched
-        yet. As far as the checkout can tell the roll is not forward, so it
-        is skipped -- and since nothing was built the frontier stays put and
-        the next cycle, after its fetch, finds the roll and expands it."""
-        v8, cr = repos
+        yet: the routine fetch brings main, and a branch head is not on it.
+        The endpoint is fetched by hash on the spot and the roll expands."""
+        v8, cr, H, _ = branched
         lagging = Repo(tmp_path / "v8_checkout", clone_of=v8.path)
-        sha = v8.commit(1009, "v8 change 1009", {"src/f1009.cc": "1009\n"})
-        cr.commit(5009, "Roll V8 1008..1009", {"DEPS": _deps(sha, "  'skia': 'x',\n")})
+        v8.commit(1009, "v8 change 1009", {"src/f1009.cc": "1009\n"})
+        head = v8.cut(1009, "15.0.9")
+        cr.commit(5009, "Roll V8 1008..1009", {"DEPS": _deps(head, "  'skia': 'x',\n")})
         resolver = _resolver(config, lagging.path, cr.path)
-        assert resolver.next_after(CommitKey(5008, 1008)) is None
-        resolver.fetch()
+        resolver.fetch()  # main, as the builder does before every cycle
+        assert lagging.git("cat-file", "-t", v8.by_pos[1009]) == "commit"
+        with pytest.raises(subprocess.CalledProcessError):
+            lagging.git("cat-file", "-e", head)
         assert _walk(resolver, CommitKey(5008, 1008)) == [
             CommitKey(5009, 1008),
             CommitKey(5009, 1009),
         ]
 
-    def test_a_roll_to_a_commit_not_on_main_is_not_part_of_the_series(
+    def test_a_pin_that_cannot_be_fetched_is_a_fetch_error_not_a_skip(
         self, embedder, repos
     ):
-        """A pin that is not a descendant of the previous one -- a revert, or
-        a roll onto a branch -- is nothing V8's own series would walk; it is
-        skipped, both as the frontier's roll and as a candidate."""
+        """Skipping it would let a later roll move the frontier past it,
+        and nothing would ever come back for its commits."""
         v8, cr = repos
         cr.commit(5009, "Roll V8 to nowhere", {"DEPS": _deps("f" * 40)})
+        with pytest.raises(FetchError, match="ffffffffffff"):
+            embedder.next_after(CommitKey(5008, 1008))
+        with pytest.raises(FetchError):
+            embedder.for_key(CommitKey(5009, 1008))
+
+    def test_a_pin_off_main_with_no_branch_point_is_not_part_of_the_series(
+        self, embedder, repos
+    ):
+        """A commit the checkout has but that is neither on main nor says
+        where it was cut from has no place on the series; the roll is
+        skipped, both as the frontier's roll and as a candidate."""
+        v8, cr = repos
+        v8.git("checkout", "-q", "-b", "elsewhere", v8.by_pos[1005])
+        (v8.path / "x").write_text("x\n")
+        v8.git("add", "x")
+        v8.git("commit", "-q", "-m", "not on main, not cut from it")
+        stray = v8.git("rev-parse", "HEAD")
+        v8.git("checkout", "-q", "main")
+        cr.commit(5009, "Roll V8 sideways", {"DEPS": _deps(stray, "  'skia': 'x',\n")})
         assert embedder.next_after(CommitKey(5008, 1008)) is None
         assert embedder.next_after(CommitKey(5009, 0)) is None
         assert embedder.for_key(CommitKey(5009, 1008)) is None
@@ -321,6 +387,62 @@ class TestEmbedderResolver:
         cr.git("remote", "set-url", "origin", str(cr.path / "nowhere"))
         with pytest.raises(FetchError):
             embedder.fetch()
+
+
+class TestBranchHeadEndpoints:
+    """What chromium pins is V8's release-branch head, one Version commit
+    above a main commit. The series must not notice."""
+
+    def test_the_series_is_the_same_as_with_main_pins(self, branched):
+        _, _, _, resolver = branched
+        K = CommitKey
+        assert _walk(resolver, K(5001, 0)) == [
+            K(5003, 1001),
+            K(5003, 1002),
+            K(5003, 1003),
+            K(5005, 1003),
+            K(5005, 1004),
+            K(5005, 1005),
+            K(5007, 1005),
+            K(5007, 1006),
+            K(5008, 1006),
+            K(5008, 1008),
+        ]
+
+    def test_every_key_pins_the_main_commit_the_endpoints_included(self, branched):
+        v8, cr, H, resolver = branched
+        for key in _walk(resolver, CommitKey(5001, 0)):
+            job = resolver.for_key(key)
+            assert job.pins == {"src/v8": v8.by_pos[key.commit_id]}, key
+            assert job.commit["hash"] == v8.by_pos[key.commit_id]
+            assert job.commit["title"] == f"v8 change {key.commit_id}"
+        # Never the branch head itself.
+        pinned = {
+            resolver.for_key(k).pins["src/v8"]
+            for k in _walk(resolver, CommitKey(5001, 0))
+        }
+        assert pinned.isdisjoint(H.values())
+
+    def test_cold_starts_and_for_key(self, branched):
+        _, _, _, resolver = branched
+        assert resolver.next_after(CommitKey(5005, 0)).key == CommitKey(5005, 1003)
+        assert resolver.next_after(CommitKey(5004, 0)).key == CommitKey(5005, 1003)
+        assert resolver.next_after(CommitKey(5008, 1008)) is None
+        assert resolver.for_key(CommitKey(5006, 1003)) is None  # the revert
+        assert resolver.for_key(CommitKey(5008, 1007)) is None  # filtered out
+
+    def test_two_heads_cut_from_one_commit_are_a_chromium_only_step(self, branched):
+        """A re-cut with no new V8 commits -- same branch point, new version
+        -- is a roll whose range is its base alone."""
+        v8, cr, H, resolver = branched
+        again = v8.cut(1008, "15.0.8.1")
+        cr.commit(
+            5009, "Roll V8 15.0.8..15.0.8.1", {"DEPS": _deps(again, "  'skia': 'x',\n")}
+        )
+        assert _walk(resolver, CommitKey(5008, 1008)) == [CommitKey(5009, 1008)]
+        assert resolver.for_key(CommitKey(5009, 1008)).pins == {
+            "src/v8": v8.by_pos[1008]
+        }
 
 
 class TestCommitIdLookup:
@@ -363,3 +485,18 @@ class TestCommitIdLookup:
         )
         assert collector._commit_hash_from_id(engine, 322487) == shas[322487]
         assert collector._commit_hash_from_id(engine, 3224870) == shas[3224870]
+
+    def test_a_reroll_to_exactly_the_reverted_pin_is_a_chromium_only_step(
+        self, branched
+    ):
+        """Revert 1008 back to 1006, then roll 1006..1008 again: nothing new
+        on the V8 side, but chromium moved, and the step onto the re-roll
+        says by how much."""
+        v8, cr, H, resolver = branched
+        cr.commit(5009, "Revert Roll V8", {"DEPS": _deps(H[1006], "  'skia': 'x',\n")})
+        cr.commit(
+            5010,
+            "Reland Roll V8 1006..1008",
+            {"DEPS": _deps(H[1008], "  'skia': 'x',\n")},
+        )
+        assert _walk(resolver, CommitKey(5008, 1008)) == [CommitKey(5010, 1008)]
