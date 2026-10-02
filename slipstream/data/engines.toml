@@ -34,6 +34,45 @@ use_thin_lto = true
 v8_enable_google_benchmark = true
 """
 
+# chrome's series is V8's as chromium took it in: the builder reads chromium's
+# history for commits that move v8_revision in DEPS and expands each roll into
+# the V8 commits it covers, checking out the roll CL and pinning src/v8 to
+# each of them in turn. The keys are (chromium position, V8 position); nothing
+# is built for chromium commits outside a roll.
+[chrome]
+embeds = "v8"
+pin = "src/v8"
+roll_file = "DEPS"
+roll_regex = "'v8_revision': '([0-9a-f]{40})'"
+build_cmd = "autoninja -C out/release-lto chrome"
+sync_cmd = "gclient sync -RD"
+binary_path = "out/release-lto/Chromium.app/Contents/MacOS/Chromium"
+# The whole bundle: the framework, helpers and resources all live inside it
+# and the binary finds them relative to itself.
+run_set = [
+    "out/release-lto/Chromium.app",
+]
+id_regex = '^ *Cr-Commit-Position:.*#([0-9]+)'
+path_filter = ""
+# The same shape as v8's, so the V8 inside chrome is compiled the way d8 is
+# and a difference between the two series is chrome's, not the toolchain's.
+# PGO stays off as it is for d8; a profile that lags the tree by days would
+# move the numbers on its own schedule.
+gn_args = """
+is_component_build = false
+is_debug = false
+target_cpu = "arm64"
+dcheck_always_on = false
+use_remoteexec = true
+use_siso = true
+is_official_build = true
+chrome_pgo_phase = 0
+thin_lto_enable_optimizations = true
+use_thin_lto = true
+is_chrome_branded = false
+symbol_level = 0
+"""
+
 # Linux notes (TODO: investigate and add a linux-jsc config):
 #
 # build-jsc should work on Linux as-is: the xcconfig pre_build_patches are

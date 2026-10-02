@@ -565,6 +565,11 @@ class TestStrictKeys:
         with pytest.raises(ValueError, match="bundled config"):
             load_config(_write(tmp_path, "[engines.v8]\nid_regex = '#([0-9]+)'\n"))
 
+    def test_an_embedding_is_not_the_users_to_set_either(self, tmp_path):
+        for key in ("embeds", "pin", "roll_file", "roll_regex"):
+            with pytest.raises(ValueError, match="bundled config"):
+                load_config(_write(tmp_path, f'[engines.chrome]\n{key} = "x"\n'))
+
     def test_a_benchmark_key_typo(self, tmp_path):
         with pytest.raises(ValueError, match=r"unknown keys \['directory'\]"):
             load_config(_write(tmp_path, '[benchmarks.js3]\ndirectory = "~/js3"\n'))
@@ -696,3 +701,27 @@ def test_delivery_identity_collisions_are_rejected(tmp_path):
         validate_delivery_identities(
             push, [RelaySource("localhost", str(tmp_path / "spool"), "other", tmp_path)]
         )
+
+
+class TestEmbeddedEngine:
+    def test_chrome_is_built_around_v8(self, tmp_path):
+        import re
+
+        cfg = load_config(_write(tmp_path, '[engines.chrome]\nsrc_dir = "~/cr/src"\n'))
+        chrome = cfg.engines["chrome"]
+        assert chrome.embeds == "v8" and chrome.pin == "src/v8"
+        assert chrome.roll_file == "DEPS"
+        sha = "c32b6c79527ce535c28dd68d0a38096229675e9d"
+        line = f"  'v8_revision': '{sha}',"  # as chromium's DEPS spells it
+        assert re.search(chrome.roll_regex, line).group(1) == sha
+
+    def test_an_own_checkout_engine_embeds_nothing(self, tmp_path):
+        cfg = load_config(_write(tmp_path, '[engines.v8]\nsrc_dir = "~/v8"\n'))
+        v8 = cfg.engines["v8"]
+        assert v8.embeds is None and v8.pin is None and v8.roll_regex is None
+
+    def test_a_bench_only_box_needs_no_inner_engine(self, tmp_path):
+        """Whether v8 is configured is the builder's question: a box that
+        only runs chrome artifacts from the bus has no use for a V8 tree."""
+        cfg = load_config(_write(tmp_path, '[engines.chrome]\nsrc_dir = "~/cr/src"\n'))
+        assert set(cfg.engines) == {"chrome"}

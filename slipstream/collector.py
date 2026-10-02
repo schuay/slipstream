@@ -388,7 +388,12 @@ class BenchCollector:
         return engine.require_src_dir()
 
     def build_at(
-        self, engine: EngineConfig, commit_hash: str, log: Path | None = None
+        self,
+        engine: EngineConfig,
+        commit_hash: str,
+        log: Path | None = None,
+        *,
+        pins: dict[str, str] | None = None,
     ) -> BuildStepError | None:
         """Check out and build one commit. Returns the first step that failed.
 
@@ -397,6 +402,11 @@ class BenchCollector:
         fail here, and collapsing them into one bool would let the builder
         blame the commit and burn it permanently. sync runs before the compile
         rather than instead of it, for the same reason.
+
+        ``pins`` maps gclient dep paths to the revisions this build wants
+        under the checkout, written into the deps file before sync so that
+        sync is what moves them; the reset at the start of the next build
+        takes the edit back out.
         """
         src = engine.require_src_dir()
         steps: list[tuple[str, str, bool]] = [
@@ -418,6 +428,12 @@ class BenchCollector:
         rc = self._ensure_gn_args(engine, log)
         if rc != 0:
             return BuildStepError("gn", rc)
+
+        for dep, rev in (pins or {}).items():
+            cmd = f"gclient setdep --deps-file={engine.roll_file} -r {dep}@{rev}"
+            rc = self._run(cmd + self._quiet(log), cwd=src, caffeinate=False).returncode
+            if rc != 0:
+                return BuildStepError("pin", rc)
 
         if engine.sync_cmd:
             rc = self._run(engine.sync_cmd + self._quiet(log), cwd=src).returncode

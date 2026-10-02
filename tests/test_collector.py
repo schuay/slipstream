@@ -609,6 +609,68 @@ class TestGnGenRecovery:
         assert len(runs) == 2
 
 
+class TestPinStep:
+    """An embedded engine's build writes the inner revision into the deps
+    file before sync, so that sync is what moves the inner checkout."""
+
+    def _collector(self, config, tmp_path, monkeypatch, fail=None):
+        from slipstream.collector import BenchCollector
+        from slipstream.config import EngineConfig
+
+        config.engines["chrome"] = EngineConfig(
+            name="chrome",
+            src_dir=tmp_path / "src",
+            build_cmd="autoninja chrome",
+            sync_cmd="gclient sync",
+            binary_path="out/chrome",
+            id_regex=r"#([0-9]+)",
+            embeds="v8",
+            pin="src/v8",
+            roll_regex="x",
+        )
+        c = BenchCollector(config)
+        runs = []
+
+        def run(cmd, **kwargs):
+            runs.append(cmd.split(" >")[0])
+            import subprocess as sp
+
+            return sp.CompletedProcess(cmd, 1 if fail and fail in cmd else 0)
+
+        monkeypatch.setattr(c, "_run", run)
+        return c, runs
+
+    def test_the_pin_goes_between_checkout_and_sync(
+        self, config, tmp_path, monkeypatch
+    ):
+        c, runs = self._collector(config, tmp_path, monkeypatch)
+        assert (
+            c.build_at(config.engines["chrome"], "roll", pins={"src/v8": "v8sha"})
+            is None
+        )
+        assert runs == [
+            "git reset --hard",
+            "git clean -fd",
+            "git checkout roll",
+            "gclient setdep --deps-file=DEPS -r src/v8@v8sha",
+            "gclient sync",
+            "autoninja chrome",
+        ]
+
+    def test_no_pins_means_no_step(self, config, tmp_path, monkeypatch):
+        c, runs = self._collector(config, tmp_path, monkeypatch)
+        c.build_at(config.engines["chrome"], "roll")
+        assert not any("setdep" in r for r in runs)
+
+    def test_a_failed_pin_is_infrastructure(self, config, tmp_path, monkeypatch):
+        """gclient missing or the deps file not parsing says nothing about
+        the commit, so the kind is one the builder retries."""
+        c, runs = self._collector(config, tmp_path, monkeypatch, fail="setdep")
+        failure = c.build_at(config.engines["chrome"], "roll", pins={"src/v8": "v8sha"})
+        assert failure.kind == "pin"
+        assert runs[-1].startswith("gclient setdep"), "sync ran after a failed pin"
+
+
 class TestInterruptedCommitIsRemeasured:
     def test_partial_scores_are_cleared_on_the_git_path_too(
         self, config, tmp_path, monkeypatch

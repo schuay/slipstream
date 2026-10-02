@@ -257,9 +257,11 @@ def render(report: BusStatus, echo) -> None:
             if st.paused_by_floor:
                 echo("  builder paused: below its free-space floor")
             if st.builder_in_flight:
+                roll = st.builder_in_flight.get("embedder_hash", "")
                 echo(
                     f"  builder is on {_key_of(st.builder_in_flight)} "
-                    f"({st.builder_in_flight.get('phase')})"
+                    f"({st.builder_in_flight.get('phase')}"
+                    f"{f', under {roll[:12]}' if roll else ''})"
                 )
             if st.builder_error:
                 echo(f"  builder last error: {st.builder_error}")

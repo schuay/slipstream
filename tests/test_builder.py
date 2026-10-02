@@ -15,6 +15,7 @@ from slipstream.builder import BuildError, Builder, build_cfg_hash, package
 from slipstream.bus import Bus
 from slipstream.collector import BuildStepError
 from slipstream.config import EngineConfig
+from slipstream.models import CommitKey
 from keys import K, K1
 
 
@@ -58,12 +59,14 @@ def builder(config, tmp_path, monkeypatch):
     # History: 100 is the starting frontier, the rest are buildable.
     b.history = [100, 101, 102, 103, 104]
     b.failures: list = []  # scripted build_at results, one per call
+    b.built: list = []  # (commit_hash, pins) per build_at call
 
     def next_commit_after(engine, commit_id):
         later = [c for c in b.history if c > commit_id]
         return _commit(later[0]) if later else None
 
-    def build_at(engine, commit_hash, log=None):
+    def build_at(engine, commit_hash, log=None, *, pins=None):
+        b.built.append((commit_hash, dict(pins or {})))
         if log is not None:
             log.parent.mkdir(parents=True, exist_ok=True)
             log.write_text("build log\n")
@@ -164,8 +167,8 @@ class TestResolverSeam:
         checked_out = []
         in_flight_seen = []
 
-        def build_at(engine, commit_hash, log=None):
-            checked_out.append(commit_hash)
+        def build_at(engine, commit_hash, log=None, *, pins=None):
+            checked_out.append((commit_hash, pins))
             in_flight_seen.append(builder.bus.read_builder_state("chrome").in_flight)
             return None
 
@@ -195,7 +198,7 @@ class TestResolverSeam:
         builder.cfg.build.start_from["chrome"] = CommitKey(1534000, 0)
         result = builder.build_one("chrome")
         assert result.published and result.key == key
-        assert checked_out == ["elsewhere"]
+        assert checked_out == [("elsewhere", {"src/v8": "hash101"})]
         entry = builder.bus.read_entry("chrome", key)
         assert entry.hash == "hash101"  # the entry describes the engine commit
         assert entry.pins == {"src/v8": "hash101"}
@@ -209,7 +212,7 @@ class TestResolverSeam:
     ):
         seen = []
 
-        def build_at(engine, commit_hash, log=None):
+        def build_at(engine, commit_hash, log=None, *, pins=None):
             seen.append(builder.bus.read_builder_state("v8").in_flight)
             return None
 
@@ -240,6 +243,42 @@ class TestResolverSeam:
         )
         builder.run_cycle(["v8"], lambda: False)
         assert fetched[0] == ("v8", True)
+
+    def _chrome(self, builder, **kw):
+        fields = {
+            "name": "chrome",
+            "embeds": "v8",
+            "pin": "src/v8",
+            "roll_regex": r"'v8_revision': '([0-9a-f]+)'",
+            **kw,
+        }
+        return replace(builder.cfg.engines["v8"], **fields)
+
+    def test_an_engine_that_embeds_another_reads_the_embedders_history(self, builder):
+        from slipstream.resolve import EmbedderResolver, IdentityResolver
+
+        builder.cfg.engines["chrome"] = self._chrome(builder)
+        resolver = builder.resolver("chrome")
+        assert isinstance(resolver, EmbedderResolver)
+        assert resolver.outer is builder.cfg.engines["chrome"]
+        assert resolver.inner is builder.cfg.engines["v8"]
+        assert resolver.pin == "src/v8" and resolver.roll_file == "DEPS"
+        assert isinstance(builder.resolver("v8"), IdentityResolver)
+
+    def test_an_embedded_engine_needs_the_inner_one_on_this_box(self, builder):
+        """The inner checkout is where the series is read from, so a box
+        without it cannot build the outer engine -- but can still build the
+        others, which is why this is the per-engine error and not a load one."""
+        builder.cfg.engines["chrome"] = self._chrome(builder, embeds="jsc")
+        with pytest.raises(ValueError, match=r"no \[engines.jsc\]"):
+            builder.resolver("chrome")
+        builder.cfg.engines["chrome"] = self._chrome(builder)
+        builder.cfg.engines["v8"] = replace(builder.cfg.engines["v8"], src_dir=None)
+        with pytest.raises(ValueError, match="no checkout"):
+            builder.resolver("chrome")
+        builder.cfg.build.start_from["chrome"] = CommitKey(1, 0)
+        assert builder.run_cycle(["chrome"], lambda: False) == 0
+        assert any("no checkout" in m for m in builder.logs)
 
 
 class TestFailureClassification:
@@ -732,6 +771,31 @@ class TestBuildCfgHashCoversOverrides:
 
     def test_identical_config_still_matches(self, tmp_path):
         assert build_cfg_hash(self._e(tmp_path)) == build_cfg_hash(self._e(tmp_path))
+
+    def test_an_own_checkout_engine_hashes_as_it_always_did(self, tmp_path):
+        """Every v8 and jsc artifact on every bus carries this hash, and the
+        consumer's run_env check compares against it; growing the payload
+        for embedding must not touch it."""
+        import hashlib
+
+        e = self._e(tmp_path, sync_cmd="gclient sync", pre_build_patches=["p"])
+        payload = "\n--\n".join(
+            [
+                "is_debug=false",
+                e.build_cmd,
+                "gclient sync",
+                "p",
+                "\n".join(sorted(e.run_set)),
+            ]
+        )
+        expected = "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
+        assert build_cfg_hash(e) == expected
+
+    def test_where_the_inner_engine_is_pinned_is_covered(self, tmp_path):
+        a = self._e(tmp_path, embeds="v8", pin="src/v8")
+        b = self._e(tmp_path, embeds="v8", pin="third_party/v8")
+        assert build_cfg_hash(a) != build_cfg_hash(b)
+        assert build_cfg_hash(a) != build_cfg_hash(self._e(tmp_path))
 
 
 class TestStateIsRefreshedOnEveryPublish:

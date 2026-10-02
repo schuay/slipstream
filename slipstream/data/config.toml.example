@@ -34,6 +34,17 @@ src_dir = "~/src/v8/v8"
 [engines.jsc]
 src_dir = "~/src/WebKit"
 
+# chrome is built from chromium's checkout around V8: the builder reads
+# chromium's history for the CLs that roll v8_revision in DEPS and builds the
+# roll CL once per V8 commit it covers, with src/v8 pinned to that commit. So
+# on the building box it needs [engines.v8] with a src_dir too, read for V8's
+# history (the copy under src/v8 sits wherever the last sync left it), and
+# gclient on PATH. A box that only benches chrome from the bus needs neither.
+# Its keys have two parts, "<chromium position>-<v8 position>", wherever a
+# key is spelled: [build] from, --retry, bus status.
+# [engines.chrome]
+# src_dir = "~/src/chromium/src"
+
 [benchmarks.js2]
 dir = "~/JetStream2"
 

@@ -31,7 +31,7 @@ from .collector import BenchCollector, BuildStepError, FetchError
 from .config import Config, EngineConfig
 from .lock import MachineLock
 from .models import CommitKey
-from .resolve import BuildJob, IdentityResolver, Resolver
+from .resolve import BuildJob, EmbedderResolver, IdentityResolver, Resolver
 
 # A stalled engine still retries, or the guard against a permanent burn becomes
 # a permanent stall. Each attempt is a full checkout, sync and compile holding
@@ -83,6 +83,11 @@ def build_cfg_hash(engine: EngineConfig) -> str:
         "\n".join(engine.pre_build_patches),
         "\n".join(sorted(engine.run_set)),
     ]
+    if engine.embeds:
+        # Where the inner engine goes is part of what was built. Appended
+        # only when there is one, so an engine built from its own checkout
+        # hashes exactly as it did before embedding existed.
+        parts.append(f"{engine.embeds}@{engine.pin}")
     payload = "\n--\n".join(parts)
     return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
 
@@ -157,11 +162,30 @@ class Builder:
 
         One per engine, made on first use: the collector it wraps is shared,
         and the choice of resolver is a property of the engine's config, not
-        of the cycle.
+        of the cycle. An embedded engine needs the inner one's checkout on
+        this box as well as its own; a missing one is this engine's problem,
+        raised on the channel run_cycle already treats as misconfiguration.
         """
         if engine_name not in self._resolvers:
             engine = self.cfg.engines[engine_name]
-            self._resolvers[engine_name] = IdentityResolver(self.collector, engine)
+            if engine.embeds:
+                inner = self.cfg.engines.get(engine.embeds)
+                if inner is None:
+                    raise ValueError(
+                        f"{engine_name} is built around {engine.embeds}, which "
+                        f"this machine has no [engines.{engine.embeds}] for"
+                    )
+                inner.require_src_dir()
+                self._resolvers[engine_name] = EmbedderResolver(
+                    self.collector,
+                    engine,
+                    inner,
+                    pin=engine.pin,
+                    roll_file=engine.roll_file,
+                    roll_regex=engine.roll_regex,
+                )
+            else:
+                self._resolvers[engine_name] = IdentityResolver(self.collector, engine)
         return self._resolvers[engine_name]
 
     def frontier(self, engine_name: str) -> CommitKey | None:
@@ -277,7 +301,9 @@ class Builder:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         started = time.time()
         self.log(f"{engine_name}: building {key} ({job.hash[:8]})")
-        failure = self.collector.build_at(engine, job.checkout_hash, log_path)
+        failure = self.collector.build_at(
+            engine, job.checkout_hash, log_path, pins=job.pins
+        )
         if failure is not None:
             return self._record_failure(
                 engine_name,

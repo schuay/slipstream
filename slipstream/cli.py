@@ -988,10 +988,18 @@ def _build_probe(builder, engine_names: list[str]) -> None:
         try:
             engine.require_src_dir()
             engine.require_run_set()
+            # Constructing the resolver is what checks the inner checkout.
+            builder.resolver(name)
             typer.echo(f"{name}: frontier {builder.frontier(name)}")
         except ValueError as e:
             typer.echo(f"{name}: {e}", err=True)
             ok = False
+        if engine.embeds:
+            found = _shutil.which("gclient")
+            typer.echo(
+                f"{name}: pins {engine.embeds} at {engine.pin} via gclient: {found or 'NOT FOUND'}"
+            )
+            ok = ok and bool(found)
     if not ok:
         raise typer.Exit(1)
 

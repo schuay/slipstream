@@ -122,6 +122,11 @@ class EngineConfig:
     ``run_set`` lists what has to be packaged for the binary to run elsewhere,
     relative to src_dir. It is a shared input to both boxes' numbers, so it is
     hashed into the artifact's build_cfg_hash along with the build args.
+
+    An engine built inside another's tree (chrome around v8) names the inner
+    one in ``embeds``; its series is then the inner engine's commits as the
+    outer tree's ``roll_file`` took them in, found with ``roll_regex``, and
+    each build pins the inner engine at ``pin`` under the outer checkout.
     """
 
     name: str
@@ -135,6 +140,10 @@ class EngineConfig:
     pre_build_patches: list[str] = field(default_factory=list)
     gn_args: str | None = None  # GN args for build dir setup
     run_set: list[str] = field(default_factory=list)
+    embeds: str | None = None  # the inner engine's name
+    pin: str | None = None  # gclient dep path of the inner engine, e.g. src/v8
+    roll_file: str = "DEPS"  # relative to src_dir
+    roll_regex: str | None = None  # group(1) is the inner commit hash
 
     def require_src_dir(self) -> Path:
         if self.src_dir is None:
@@ -396,6 +405,19 @@ def load_config(user_config_path: Path | None = None) -> Config:
             user_engine, _ENGINE_KEYS, f"[engines.{name}]", settable=defaults
         )
         src_dir = user_engine.get("src_dir")
+        # An embedding is a bundled fact about the engine, checked against the
+        # bundled list rather than the user's: a bench-only box can run chrome
+        # artifacts from the bus with no V8 checkout, so whether the inner
+        # engine is configured here is the builder's question, not load's.
+        embeds = defaults.get("embeds")
+        if embeds is not None:
+            if embeds not in engine_defaults or embeds == name:
+                raise ValueError(f"[{name}] embeds {embeds!r}, which is not an engine")
+            for required in ("pin", "roll_regex"):
+                if not defaults.get(required):
+                    raise ValueError(
+                        f"[{name}] embeds {embeds!r} but has no {required}"
+                    )
         # The build inputs are overridable: the two boxes do not have to build
         # the same way, and run_set is discovered per platform.
         engines[name] = EngineConfig(
@@ -412,6 +434,10 @@ def load_config(user_config_path: Path | None = None) -> Config:
             run_set=_parse_run_set(
                 name, user_engine.get("run_set", defaults.get("run_set", []))
             ),
+            embeds=embeds,
+            pin=defaults.get("pin"),
+            roll_file=defaults.get("roll_file", "DEPS"),
+            roll_regex=defaults.get("roll_regex"),
         )
 
     benchmarks: dict[str, BenchmarkConfig] = {}
