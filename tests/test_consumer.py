@@ -54,7 +54,7 @@ def setup(config, tmp_path, monkeypatch):
 
     bus = Bus(bus_root)
 
-    def publish(commit_id, binary=b"#!/bin/sh\nexit 0\n"):
+    def publish(commit_id, binary=b"#!/bin/sh\nexit 0\n", **entry_fields):
         src = tmp_path / "build" / str(commit_id)
         (src / "out").mkdir(parents=True, exist_ok=True)
         (src / "out" / "d8").write_bytes(binary)
@@ -74,6 +74,7 @@ def setup(config, tmp_path, monkeypatch):
             builder={"bot": "box2-m4", "toolchain": "clang-21"},
             built_at=1757116999,
             build_secs=1183,
+            **entry_fields,
         )
         bus.publish(entry, blob)
         return entry
@@ -149,6 +150,20 @@ class TestEngineWithNoRunEntries:
         assert res.benched == 0
         assert "would measure nothing" in res.error
         assert setup.consumer.cursor(setup.source, "v8") == before
+
+
+class TestWhatTheCommitsRowRecords:
+    def test_the_outer_commit_of_an_embedded_entry(self, setup, scored):
+        """A chrome entry says which roll CL it was built under; the row keeps
+        it, so a change point can name the chromium side when the V8 side
+        did not move."""
+        setup.publish(100, embedder={"hash": "cr" * 20, "commit_id": 1534000})
+        setup.publish(101)
+        assert _drain(setup) == 2
+        rows = setup.collector.store.conn.execute(
+            "SELECT commit_id, embedder_hash FROM commits ORDER BY commit_id"
+        ).fetchall()
+        assert [tuple(r) for r in rows] == [(100, "cr" * 20), (101, "")]
 
 
 class TestDraining:

@@ -268,12 +268,7 @@ class Builder:
             return BuildResult()
 
         key = job.key
-        state.in_flight = {
-            "commit_id": key.commit_id,
-            "embedder_id": key.embedder_id,
-            "phase": "build",
-            "started_at": time.time(),
-        }
+        state.in_flight = self._in_flight(job, "build")
         self._publish_state(engine_name, state)
 
         row = self.store.get_build_state(engine_name, key)
@@ -294,12 +289,7 @@ class Builder:
                 was_retry=was_retry,
             )
 
-        state.in_flight = {
-            "commit_id": key.commit_id,
-            "embedder_id": key.embedder_id,
-            "phase": "package",
-            "started_at": time.time(),
-        }
+        state.in_flight = self._in_flight(job, "package")
         self._publish_state(engine_name, state)
         try:
             entry = self._package_and_publish(engine, job, int(time.time() - started))
@@ -336,6 +326,24 @@ class Builder:
         )
         return BuildResult(key=key, published=True)
 
+    @staticmethod
+    def _in_flight(job: BuildJob, phase: str) -> dict:
+        """What the state file says is being worked on.
+
+        The outer commit's hash goes in only when there is one: bus status
+        names the roll being built for an embedded engine, and an engine
+        built from its own checkout keeps the record it always wrote.
+        """
+        record = {
+            "commit_id": job.key.commit_id,
+            "embedder_id": job.key.embedder_id,
+            "phase": phase,
+            "started_at": time.time(),
+        }
+        if job.embedder:
+            record["embedder_hash"] = job.embedder.get("hash", "")
+        return record
+
     def _package_and_publish(
         self, engine: EngineConfig, job: BuildJob, build_secs: int
     ) -> Entry:
@@ -347,6 +355,8 @@ class Builder:
             engine=engine.name,
             commit_id=key.commit_id,
             embedder_id=key.embedder_id,
+            embedder=dict(job.embedder),
+            pins=dict(job.pins),
             hash=commit["hash"],
             date=commit.get("date", ""),
             timestamp=int(commit.get("timestamp", 0)),

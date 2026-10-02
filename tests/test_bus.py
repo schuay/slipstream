@@ -427,3 +427,39 @@ class TestKeySpellingOnDisk:
         path.write_text(json.dumps(data))
         with pytest.raises(BusError):
             bus.read_builder_state("v8")
+
+
+class TestEmbedderFields:
+    """``embedder`` and ``pins`` describe how an embedded engine's entry was
+    produced; an engine built from its own checkout leaves them empty, and
+    entries from before the fields existed read back the same way."""
+
+    def test_round_trip(self, bus):
+        from slipstream.models import CommitKey
+
+        key = CommitKey(1534000, 109680)
+        tmp = bus.tmp_blob("chrome", key)
+        tmp.write_bytes(b"x")
+        entry = _entry(
+            key.commit_id,
+            engine="chrome",
+            embedder_id=key.embedder_id,
+            embedder={"hash": "cr" * 20, "commit_id": 1534000, "title": "Roll V8"},
+            pins={"src/v8": "hash109680"},
+        )
+        entry.blob_sha256 = sha256_file(tmp)
+        entry.blob_bytes = 1
+        bus.publish(entry, tmp)
+        read = bus.read_entry("chrome", key)
+        assert read.embedder["hash"] == "cr" * 20
+        assert read.embedder_hash == "cr" * 20
+        assert read.pins == {"src/v8": "hash109680"}
+
+    def test_absent_fields_read_as_empty(self, bus):
+        _publish(bus, 100)
+        path = bus.entry_path("v8", 100)
+        data = json.loads(path.read_text())
+        del data["embedder"], data["pins"]
+        path.write_text(json.dumps(data))
+        read = bus.read_entry("v8", 100)
+        assert read.embedder == {} and read.pins == {} and read.embedder_hash == ""

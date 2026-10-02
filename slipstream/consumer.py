@@ -277,6 +277,7 @@ class BusConsumer:
             "hash": entry.hash,
             "commit_id": entry.commit_id,
             "embedder_id": entry.embedder_id,
+            "embedder_hash": entry.embedder_hash,
             "date": entry.date,
             "timestamp": entry.timestamp,
             "title": entry.title,

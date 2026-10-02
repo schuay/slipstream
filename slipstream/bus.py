@@ -92,6 +92,12 @@ class Entry:
     row straight from this. ``embedder_id`` defaults to 0 so an entry written
     before keys had two parts reads back as the scalar key it always was; the
     commit fields stay the engine's own commit, which is what names the entry.
+
+    ``embedder`` is the outer commit a two-coordinate key was built under
+    (``hash``, ``commit_id``, ``title`` of the chromium roll CL) and ``pins``
+    what was pinned beneath it (``{"src/v8": hash}``); both are empty for an
+    engine built from its own checkout, and absent from the entries such an
+    engine wrote before the fields existed.
     """
 
     engine: str
@@ -104,6 +110,8 @@ class Entry:
     blob_sha256: str
     blob_bytes: int
     embedder_id: int = 0
+    embedder: dict = field(default_factory=dict)
+    pins: dict = field(default_factory=dict)
     builder: dict = field(default_factory=dict)
     built_at: int = 0
     build_secs: int = 0
@@ -112,6 +120,10 @@ class Entry:
     @property
     def key(self) -> CommitKey:
         return CommitKey(self.embedder_id, self.commit_id)
+
+    @property
+    def embedder_hash(self) -> str:
+        return str(self.embedder.get("hash", "")) if self.embedder else ""
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=1, sort_keys=True)

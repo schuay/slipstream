@@ -737,6 +737,53 @@ class TestEmbedderKeyMigration:
         assert s.conn.execute("SELECT COUNT(*) FROM scores").fetchone()[0] == 2
         s.close()
 
+    def test_commits_gains_embedder_hash_through_the_rebuild(self, tmp_path):
+        s = self._open(tmp_path)
+        rows = s.conn.execute(
+            "SELECT commit_id, embedder_hash FROM commits ORDER BY commit_id"
+        ).fetchall()
+        assert [tuple(r) for r in rows] == [(100, ""), (101, "")]
+        s.close()
+
+
+class TestEmbedderHash:
+    def test_upsert_writes_and_updates_it(self, store):
+        store.upsert_commit(
+            "chrome", "v8h", CommitKey(1534000, 100), "d", 0, "t", "crA"
+        )
+        store.upsert_commit(
+            "chrome", "v8h", CommitKey(1534000, 100), "d", 0, "t", "crB"
+        )
+        row = store.get_commits_in_range(
+            "chrome", CommitKey(1534000, 99), CommitKey(1534000, 100)
+        )[0]
+        assert row["embedder_hash"] == "crB" and row["embedder_id"] == 1534000
+
+    def test_record_done_takes_it_from_the_commit_dict(self, store):
+        store.record_done(
+            "chrome",
+            "arm64",
+            {"hash": "v8h", "commit_id": 100, "embedder_id": 7, "embedder_hash": "cr"},
+        )
+        assert store.get_all_commits("chrome")[0]["embedder_hash"] == "cr"
+        store.record_done("v8", "arm64", {"hash": "h", "commit_id": 1})
+        assert store.get_all_commits("v8")[0]["embedder_hash"] == ""
+
+    def test_a_v3_db_from_before_the_column_gains_it(self, tmp_path):
+        """The column arrived after the key rebuild; a db rebuilt without it
+        is already version 3, so it comes by ALTER, not by another rebuild."""
+        from slipstream.store import CommitStore
+
+        db = tmp_path / "t.db"
+        s = CommitStore(db)
+        s.upsert_commit("v8", "h", 1, "d", 0, "t")
+        s.conn.execute("ALTER TABLE commits DROP COLUMN embedder_hash")
+        s.conn.commit()
+        s.close()
+        s = CommitStore(db)
+        assert s.get_all_commits("v8")[0]["embedder_hash"] == ""
+        s.close()
+
 
 class TestBotGuardSurvivesALockedDb:
     def test_a_foreign_db_is_refused_even_when_the_migration_defers(

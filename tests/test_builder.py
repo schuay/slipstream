@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import subprocess
 import tarfile
 import time
@@ -157,15 +158,22 @@ class TestResolverSeam:
     """
 
     def test_build_one_builds_what_the_resolver_hands_it(self, builder, monkeypatch):
+        from slipstream.models import CommitKey
         from slipstream.resolve import BuildJob
 
         checked_out = []
+        in_flight_seen = []
 
         def build_at(engine, commit_hash, log=None):
             checked_out.append(commit_hash)
+            in_flight_seen.append(builder.bus.read_builder_state("chrome").in_flight)
             return None
 
         monkeypatch.setattr(builder.collector, "build_at", build_at)
+        builder.cfg.engines["chrome"] = replace(
+            builder.cfg.engines["v8"], name="chrome"
+        )
+        key = CommitKey(1534000, 101)
 
         class Scripted:
             def fetch(self):
@@ -173,20 +181,43 @@ class TestResolverSeam:
 
             def next_after(self, frontier):
                 return BuildJob(
-                    key=K1(101),
+                    key=key,
                     commit=_commit(101),
                     checkout_hash="elsewhere",  # not the commit's own hash
+                    pins={"src/v8": "hash101"},
+                    embedder={"hash": "cr" * 20, "commit_id": 1534000, "title": "Roll"},
                 )
 
             def for_key(self, key):
                 return None
 
-        builder._resolvers["v8"] = Scripted()
-        result = builder.build_one("v8")
-        assert result.published and result.key == K1(101)
+        builder._resolvers["chrome"] = Scripted()
+        builder.cfg.build.start_from["chrome"] = CommitKey(1534000, 0)
+        result = builder.build_one("chrome")
+        assert result.published and result.key == key
         assert checked_out == ["elsewhere"]
-        entry = builder.bus.read_entry("v8", K1(101))
+        entry = builder.bus.read_entry("chrome", key)
         assert entry.hash == "hash101"  # the entry describes the engine commit
+        assert entry.pins == {"src/v8": "hash101"}
+        assert entry.embedder_hash == "cr" * 20
+        # While it built, the state file named the roll, so bus status can.
+        assert in_flight_seen[0]["embedder_hash"] == "cr" * 20
+        assert in_flight_seen[0]["embedder_id"] == 1534000
+
+    def test_an_own_checkout_engine_writes_the_in_flight_record_it_always_did(
+        self, builder, monkeypatch
+    ):
+        seen = []
+
+        def build_at(engine, commit_hash, log=None):
+            seen.append(builder.bus.read_builder_state("v8").in_flight)
+            return None
+
+        monkeypatch.setattr(builder.collector, "build_at", build_at)
+        builder.build_one("v8")
+        assert set(seen[0]) == {"commit_id", "embedder_id", "phase", "started_at"}
+        entry = builder.bus.read_entry("v8", K1(101))
+        assert entry.embedder == {} and entry.pins == {}
 
     def test_an_embedder_key_on_an_identity_engine_is_a_misconfiguration(self, builder):
         """[build] from = { v8 = "7-100" } names a series v8 does not have."""

@@ -53,6 +53,7 @@ _ADDED_COLUMNS = [
     ("processing_state", "configs_ok", "INTEGER"),
     ("processing_state", "configs_total", "INTEGER"),
     ("push_state", "bot", "TEXT"),
+    ("commits", "embedder_hash", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 # Version 3 put embedder_id into every key. It is a primary key column, which
@@ -69,15 +70,20 @@ _MIGRATE_RETRY_SECS = 5.0
 # drift. Every keyed table carries embedder_id ahead of commit_id, so the
 # natural row order is CommitKey order.
 _KEYED_TABLES = {
+    # embedder_hash is the outer commit a two-coordinate key was built under
+    # (the chromium roll CL for chrome); '' for an engine that is its own
+    # embedder. The id is in the key; the hash is here because a position is
+    # not something git can check out.
     "commits": """
         CREATE TABLE IF NOT EXISTS commits (
-            engine      TEXT    NOT NULL,
-            embedder_id INTEGER NOT NULL DEFAULT 0,
-            hash        TEXT    NOT NULL,
-            commit_id   INTEGER,
-            date        TEXT    NOT NULL DEFAULT '',
-            timestamp   INTEGER NOT NULL DEFAULT 0,
-            title       TEXT    NOT NULL DEFAULT '',
+            engine        TEXT    NOT NULL,
+            embedder_id   INTEGER NOT NULL DEFAULT 0,
+            hash          TEXT    NOT NULL,
+            commit_id     INTEGER,
+            date          TEXT    NOT NULL DEFAULT '',
+            timestamp     INTEGER NOT NULL DEFAULT 0,
+            title         TEXT    NOT NULL DEFAULT '',
+            embedder_hash TEXT    NOT NULL DEFAULT '',
             PRIMARY KEY (engine, embedder_id, hash)
         )""",
     "scores": """
@@ -531,6 +537,7 @@ class CommitStore:
         date: str,
         timestamp: int,
         title: str,
+        embedder_hash: str = "",
     ):
         """Write commit metadata that did not come from a local git log.
 
@@ -545,7 +552,9 @@ class CommitStore:
         incumbent row when another hash holds that key, orphaning that
         commit's scores from the export join.
         """
-        self._upsert_commit(engine, hash, CommitKey.of(key), date, timestamp, title)
+        self._upsert_commit(
+            engine, hash, CommitKey.of(key), date, timestamp, title, embedder_hash
+        )
         self.conn.commit()
 
     def _upsert_commit(
@@ -556,16 +565,28 @@ class CommitStore:
         date: str,
         timestamp: int,
         title: str,
+        embedder_hash: str = "",
     ):
         try:
             self.conn.execute(
                 "INSERT INTO commits"
-                " (engine, embedder_id, hash, commit_id, date, timestamp, title)"
-                " VALUES (?,?,?,?,?,?,?)"
+                " (engine, embedder_id, hash, commit_id, date, timestamp, title,"
+                "  embedder_hash)"
+                " VALUES (?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(engine, embedder_id, hash) DO UPDATE SET"
                 "   commit_id=excluded.commit_id, date=excluded.date,"
-                "   timestamp=excluded.timestamp, title=excluded.title",
-                (engine, key.embedder_id, hash, key.commit_id, date, timestamp, title),
+                "   timestamp=excluded.timestamp, title=excluded.title,"
+                "   embedder_hash=excluded.embedder_hash",
+                (
+                    engine,
+                    key.embedder_id,
+                    hash,
+                    key.commit_id,
+                    date,
+                    timestamp,
+                    title,
+                    embedder_hash or "",
+                ),
             )
         except sqlite3.IntegrityError as e:
             self.conn.rollback()
@@ -618,7 +639,7 @@ class CommitStore:
     ) -> list[sqlite3.Row]:
         placeholders = ",".join("?" * len(hashes))
         return self.conn.execute(
-            f"SELECT hash, embedder_id, commit_id, date, timestamp, title FROM commits"
+            f"SELECT hash, embedder_id, commit_id, date, timestamp, title, embedder_hash FROM commits"
             f" WHERE engine=? AND embedder_id=0 AND hash IN ({placeholders})"
             f" AND commit_id IS NOT NULL"
             f" ORDER BY commit_id",
@@ -714,6 +735,7 @@ class CommitStore:
             commit.get("date", ""),
             int(commit.get("timestamp", 0)),
             commit.get("title", ""),
+            commit.get("embedder_hash", ""),
         )
         self._mark_done(
             engine,
@@ -853,7 +875,7 @@ class CommitStore:
     def get_all_commits(self, engine: str) -> list[sqlite3.Row]:
         """All commits with metadata, in key order."""
         return self.conn.execute(
-            "SELECT hash, embedder_id, commit_id, date, timestamp, title FROM commits"
+            "SELECT hash, embedder_id, commit_id, date, timestamp, title, embedder_hash FROM commits"
             " WHERE engine=? AND commit_id IS NOT NULL"
             " ORDER BY embedder_id, commit_id",
             (engine,),
@@ -864,7 +886,7 @@ class CommitStore:
         after = CommitKey.of(after)
         up_to = CommitKey.of(up_to)
         return self.conn.execute(
-            "SELECT hash, embedder_id, commit_id, date, timestamp, title FROM commits"
+            "SELECT hash, embedder_id, commit_id, date, timestamp, title, embedder_hash FROM commits"
             " WHERE engine=? AND commit_id IS NOT NULL"
             " AND (embedder_id, commit_id) > (?, ?)"
             " AND (embedder_id, commit_id) <= (?, ?)"
