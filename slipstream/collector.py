@@ -125,13 +125,20 @@ class BenchCollector:
 
     def _commit_hash_from_id(self, engine: EngineConfig, commit_id: int) -> str:
         src = engine.require_src_dir()
-        # The capture group becomes the literal id, closed by a non-digit or
-        # the end of the line: git's --grep is a substring match, so #5003
-        # alone would also find #50031 and, newest first, return it. ERE for
-        # the alternation; the bundled patterns read the same either way.
-        literal = f"{commit_id}([^0-9]|$)"
-        grep_pattern = re.sub(r"\(\[0-9\][+?]\)", literal, engine.id_regex)
-        grep_pattern = re.sub(r"\(\[0-9\]\{6\}\)", literal, grep_pattern)
+        # The capture group becomes the literal id. git's --grep is a substring
+        # match, so #5003 alone would also find #50031 and, newest first,
+        # return it: when nothing follows the group, close the id with a
+        # non-digit or end of line. When the pattern goes on (jsc's `@`), that
+        # tail already delimits it, and a boundary in front of it would eat
+        # the character the tail then fails to find. ERE for the alternation;
+        # the bundled patterns read the same either way.
+        group = re.search(r"\(\[0-9\](?:[+?]|\{6\})\)", engine.id_regex)
+        if group is None:
+            grep_pattern = engine.id_regex
+        else:
+            tail = engine.id_regex[group.end() :]
+            literal = str(commit_id) if tail else f"{commit_id}([^0-9]|$)"
+            grep_pattern = engine.id_regex[: group.start()] + literal + tail
         res = self._run(
             f"git log origin/main --pretty=format:%H --extended-regexp"
             f' --grep="{grep_pattern}" -n 5',

@@ -336,3 +336,30 @@ class TestCommitIdLookup:
         collector, engine = resolver.collector, config.engines["v8"]
         assert collector._commit_hash_from_id(engine, 5003) == wanted
         assert collector._commit_hash_from_id(engine, 4242) == ""
+
+    def test_a_pattern_with_text_after_the_id_still_matches(self, tmp_path, config):
+        """jsc's id ends in `@main`; the delimiter is the pattern's own tail,
+        not an appended boundary, which here would swallow the `@`."""
+        repo = Repo(tmp_path / "r")
+        shas = {}
+        for pos in (322487, 3224870):
+            repo.git(
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                f"webkit {pos}\n\nCanonical link: https://commits.webkit.org/{pos}@main",
+            )
+            shas[pos] = repo.git("rev-parse", "HEAD")
+        repo.git("fetch", "-q", "origin", "main")
+        collector = BenchCollector(config, role="build")
+        engine = EngineConfig(
+            name="jsc",
+            src_dir=repo.path,
+            build_cmd="true",
+            binary_path="jsc",
+            id_regex=r"Canonical link:.*/([0-9]+)@",
+            run_set=["jsc"],
+        )
+        assert collector._commit_hash_from_id(engine, 322487) == shas[322487]
+        assert collector._commit_hash_from_id(engine, 3224870) == shas[3224870]
