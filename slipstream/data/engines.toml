@@ -101,8 +101,9 @@ enable_check_container_fields = false
 
 # Linux notes (TODO: investigate and add a linux-jsc config):
 #
-# build-jsc should work on Linux as-is: the xcconfig pre_build_patches are
-# no-ops (files don't exist on Linux), and DYLD_* vars are harmless.
+# On Linux, override build_cmd to omit the macOS arm64e architecture option.
+# The xcconfig pre_build_patches are no-ops (files don't exist on Linux), and
+# DYLD_* vars are harmless.
 # The main unknown is whether thin LTO is available on the Linux clang install.
 #
 # An alternative known-working Linux build (no LTO, used historically):
@@ -113,20 +114,39 @@ enable_check_container_fields = false
 #   binary: build/bin/jsc  (static, no dyld_lib_path needed)
 # To add LTO to the cmake build: -DLTO_MODE=thin (needs clang).
 [jsc]
-build_cmd = "Tools/Scripts/build-jsc --cmakeargs='-DLTO_MODE=thin'"
+# Safari on Apple Silicon uses the arm64e ABI, including pointer authentication
+# and JSC's architecture-specific JIT paths. The result arch remains the host's
+# arm64 label; the build command is recorded through build_cfg_hash.
+# Use Xcode directly: build-jsc currently consumes --architecture without
+# forwarding it to make. A generic destination permits arm64e on an arm64 Mac.
+build_cmd = "xcodebuild -workspace WebKit.xcworkspace -scheme \"Everything up to MiniBrowser\" -configuration Release -destination \"generic/platform=macOS\" ARCHS=arm64e VALID_ARCHS=arm64e SDKROOT=macosx WK_LTO_MODE=thin GCC_TREAT_WARNINGS_AS_ERRORS=NO SYMROOT=\"$PWD/WebKitBuild\" OBJROOT=\"$PWD/WebKitBuild\" SHARED_PRECOMPS_DIR=\"$PWD/WebKitBuild/PrecompiledHeaders\""
 binary_path = "WebKitBuild/Release/jsc"
 id_regex = 'Canonical link:.*/([0-9]+)@'
 path_filter = "Source/JavaScriptCore"
 dyld_lib_path = "WebKitBuild/Release"
-# The framework, not libJavaScriptCore.a: WTF and bmalloc are static archives
-# linked into it, so nothing but the framework is needed at run time. Its
-# install name is /System/Library/Frameworks/..., since the Xcode build sets no
-# rpath, so jsc silently loads Apple's shipped JavaScriptCore unless
-# dyld_lib_path redirects it. Packaging the framework is half of that; the
-# DYLD_ vars the collector sets are the other half.
+# Matching browser runtime alongside the shell. XPC bundles and loose dylibs
+# live outside frameworks and are targets of relative symlinks inside them.
+# Keep complete bundles and paths for extraction on another benchmark host.
 run_set = [
     "WebKitBuild/Release/jsc",
+    "WebKitBuild/Release/MiniBrowser.app",
     "WebKitBuild/Release/JavaScriptCore.framework",
+    "WebKitBuild/Release/WebCore.framework",
+    "WebKitBuild/Release/WebKit.framework",
+    "WebKitBuild/Release/WebKitLegacy.framework",
+    "WebKitBuild/Release/WebInspectorUI.framework",
+    "WebKitBuild/Release/WebGPU.framework",
+    "WebKitBuild/Release/_WebKit_SwiftUI.framework",
+    "WebKitBuild/Release/libANGLE-shared.dylib",
+    "WebKitBuild/Release/libwebrtc.dylib",
+    "WebKitBuild/Release/libWebKitSwift.dylib",
+    "WebKitBuild/Release/com.apple.WebKit.Networking.xpc",
+    "WebKitBuild/Release/com.apple.WebKit.WebContent.CaptivePortal.xpc",
+    "WebKitBuild/Release/com.apple.WebKit.WebContent.xpc",
+    "WebKitBuild/Release/com.apple.WebKit.WebContent.Development.xpc",
+    "WebKitBuild/Release/com.apple.WebKit.Model.xpc",
+    "WebKitBuild/Release/com.apple.WebKit.GPU.xpc",
+    "WebKitBuild/Release/com.apple.WebKit.WebContent.EnhancedSecurity.xpc",
 ]
 pre_build_patches = [
     "Source/JavaScriptCore/Configurations/Base.xcconfig",

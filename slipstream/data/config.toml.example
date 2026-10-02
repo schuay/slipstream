@@ -32,6 +32,9 @@ src_dir = "~/src/v8/v8"
 
 [engines.jsc]
 src_dir = "~/src/WebKit"
+# The default archives matching arm64e WebKit frameworks, XPC helpers and MiniBrowser.
+# Only Source/JavaScriptCore commits are selected. Keep ARCHS/VALID_ARCHS=arm64e
+# and the generic Mac destination on overrides; see docs/jsc-build.md.
 
 # chrome is built from chromium's checkout around V8: the builder reads
 # chromium's history for the CLs that roll v8_revision in DEPS and builds the

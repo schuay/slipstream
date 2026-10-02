@@ -18,6 +18,21 @@ build scripts. The defaults are tuned for arm64 macOS, which is what the bots
 run; the bundled V8 `gn_args` set `use_remoteexec = true`, so override them if
 you have no RBE backend.
 
+For the untrusted RBE setup, each V8/Chromium checkout's `.gclient` solution
+needs these `custom_vars` before running `gclient runhooks`:
+
+```python
+"custom_vars": {
+    "download_remoteexec_cfg": True,
+    "rbe_instance": "projects/rbe-chromium-untrusted/instances/default_instance",
+},
+```
+
+Without the download flag, Chromium's hooks skip fetching the rewrapper
+configuration. `gn gen` then fails with a missing `rewrapper_mac.cfg`, even
+after a successful `gclient sync`. RBE credentials and service access are
+also required; successful GN generation alone does not verify remote execution.
+
 ## Install
 
 ```sh
@@ -38,6 +53,12 @@ schema migration can cause incompatible writes and retained SQLite locks.
 
 See [background analysis on benchmark hosts](docs/benchmark-host.md) for disabling
 macOS media and photo analysis on a dedicated benchmark account.
+
+JSC archives include matching WebKit frameworks, XPC helpers and MiniBrowser,
+selecting commits that touch `Source/JavaScriptCore`. Builds target `arm64e` to
+use the pointer-authentication ABI and JIT paths used by Safari on Apple Silicon. Results keep the host architecture label
+`arm64` and the existing series. See [JSC build configuration](docs/jsc-build.md)
+for build overrides, verification, and browser compatibility.
 
 ## Measuring
 
