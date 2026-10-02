@@ -55,23 +55,48 @@ run_set = [
 ]
 id_regex = '^ *Cr-Commit-Position:.*#([0-9]+)'
 path_filter = ""
-# The same shape as v8's, so the V8 inside chrome is compiled the way d8 is
-# and a difference between the two series is chrome's, not the toolchain's.
+# An official build minus PGO, as closely as a non-official build can get.
+#
+# It cannot be official: the bots are not corp machines, and an official
+# build pulls in things they have no access to. But is_official_build is not
+# one flag, it is the default for a dozen others, and flipping it off flips
+# those too: DCHECKs come on, thin LTO goes off, PartitionAlloc starts
+# counting every allocation, stack variables get pattern-filled instead of
+# zeroed. Each of those costs speed, so each one that matters for performance
+# is set back to its official value by hand below. The rest of what official
+# changes (branding, mojom id scrambling, ANGLE's null and wgpu backends) does
+# not touch generated code and is left at its default. The clang plugin's
+# raw_ptr checks are the one exception: official PartitionAlloc compiles
+# RAW_PTR_EXCLUSION away, and the checks, left on, then reject every field
+# that relied on it, so they go to their official setting too.
+#
 # PGO stays off as it is for d8; a profile that lags the tree by days would
 # move the numbers on its own schedule.
+#
+# Validated by a full `gn args --list` diff against an official configuration
+# and a real build; linux boxes additionally need use_mold = false (LTO wants
+# lld), which is not listed because the arg is undeclared on mac and gn
+# rejects unknown args.
 gn_args = """
 is_component_build = false
 is_debug = false
 target_cpu = "arm64"
-dcheck_always_on = false
+is_official_build = false
 use_remoteexec = true
 use_siso = true
-is_official_build = true
-chrome_pgo_phase = 0
-thin_lto_enable_optimizations = true
-use_thin_lto = true
-is_chrome_branded = false
 symbol_level = 0
+is_chrome_branded = false
+chrome_pgo_phase = 0
+dcheck_always_on = false
+use_thin_lto = true
+thin_lto_enable_optimizations = true
+init_stack_vars_zero = true
+exclude_unwind_tables = true
+partition_alloc_is_official_build = true
+use_viz_debugger = false
+enable_check_raw_ptr_fields = false
+enable_check_raw_ref_fields = false
+enable_check_container_fields = false
 """
 
 # Linux notes (TODO: investigate and add a linux-jsc config):
