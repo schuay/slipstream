@@ -460,6 +460,77 @@ class TestBotIdentity:
             pass
 
 
+class TestSchemaTooNew:
+    """A db migrated by a newer slipstream is refused at open, not at the
+    first write that happens to hit a reshaped key."""
+
+    def _future_db(self, tmp_path):
+        from slipstream.store import CommitStore
+
+        db = tmp_path / "t.db"
+        s = CommitStore(db, bot="box1-m1")
+        s.conn.execute("UPDATE meta SET value='99' WHERE key='schema_version'")
+        s.conn.commit()
+        s.close()
+        return db
+
+    def test_a_writer_is_refused_before_backup_or_migration(self, tmp_path):
+        import pytest
+
+        from slipstream.store import CommitStore, SchemaTooNew
+
+        db = self._future_db(tmp_path)
+        before = sorted(tmp_path.glob("t.*.bak"))
+        with pytest.raises(SchemaTooNew, match="schema version 99.*\\.bak"):
+            CommitStore(db, bot="box1-m1")
+        # Nothing was written: no new snapshot, version untouched.
+        assert sorted(tmp_path.glob("t.*.bak")) == before
+        import sqlite3
+
+        c = sqlite3.connect(db)
+        assert (
+            c.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+            == "99"
+        )
+        c.close()
+
+    def test_a_readonly_open_is_refused_too(self, tmp_path):
+        import pytest
+
+        from slipstream.store import CommitStore, SchemaTooNew
+
+        db = self._future_db(tmp_path)
+        with pytest.raises(SchemaTooNew):
+            CommitStore(db, readonly=True)
+
+    def test_an_older_or_unnumbered_db_is_not_newer(self, tmp_path):
+        """No meta table, no version row and a non-numeric value are all the
+        migration's business, not the guard's."""
+        import sqlite3
+
+        from slipstream.store import SCHEMA_VERSION, CommitStore
+
+        for name, setup in (
+            ("nometa.db", "CREATE TABLE commits (engine TEXT, hash TEXT)"),
+            (
+                "norow.db",
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            ),
+            (
+                "junk.db",
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+                "INSERT INTO meta VALUES ('schema_version', 'v2-ish')",
+            ),
+        ):
+            c = sqlite3.connect(tmp_path / name)
+            c.executescript(setup)
+            c.commit()
+            c.close()
+            s = CommitStore(tmp_path / name)
+            assert s.get_meta("schema_version") == SCHEMA_VERSION, name
+            s.close()
+
+
 class TestMigration:
     """The pre-bot schema must gain its columns on the next open."""
 

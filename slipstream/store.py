@@ -25,6 +25,17 @@ class BotMismatch(StoreError):
     """
 
 
+class SchemaTooNew(StoreError):
+    """The db was migrated by a newer slipstream than this one.
+
+    Migrations are one-way: a key rebuild leaves upserts of the older code
+    with an ON CONFLICT target that no longer names a key, and SQLite reports
+    that at the first write, not at open. Refusing here names the real
+    problem -- a downgrade -- and the way back, which is the ``.bak`` taken
+    before the migration, not the code revert alone.
+    """
+
+
 class CommitIdCollision(StoreError):
     """Two hashes claim the same key for one engine.
 
@@ -227,14 +238,21 @@ class CommitStore:
         # writer instead of deadlocking on lock promotion. It is a persistent
         # property of the db file, so setting it on any connection converts it.
         self.conn.execute("PRAGMA journal_mode=WAL")
-        if backup and pre_existing:
-            # Snapshot before _init_schema so the backup predates any migration.
-            self._backup(self.conn, db_path)
-        # A reporting command reads what is there rather than migrating a live
-        # db on every run. A db that does not exist yet has nothing to read, so
-        # it is created either way: otherwise the first export or analyze on a
-        # fresh machine fails on a missing table instead of reporting nothing.
         try:
+            # Before the backup and before any schema work: a db from a newer
+            # slipstream is refused whole, readonly or not, since even its
+            # reads may name columns this version does not know.
+            if pre_existing:
+                self._check_schema_version()
+            if backup and pre_existing:
+                # Snapshot before _init_schema so the backup predates any
+                # migration.
+                self._backup(self.conn, db_path)
+            # A reporting command reads what is there rather than migrating a
+            # live db on every run. A db that does not exist yet has nothing
+            # to read, so it is created either way: otherwise the first export
+            # or analyze on a fresh machine fails on a missing table instead
+            # of reporting nothing.
             if init_schema and (not readonly or not pre_existing):
                 self._init_schema()
             elif bot is not None:
@@ -242,6 +260,33 @@ class CommitStore:
         except BaseException:
             self.conn.close()
             raise
+
+    def _check_schema_version(self) -> None:
+        """Refuse a db migrated past this version's schema.
+
+        A db without a meta table or a version row predates the number and
+        is older, not newer; the migration handles it. A value that is not a
+        number is left to the migration too, which overwrites it.
+        """
+        try:
+            row = self.conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return  # no meta table: older than any version number
+        if row is None:
+            return
+        try:
+            found = int(row[0])
+        except (TypeError, ValueError):
+            return
+        if found > int(SCHEMA_VERSION):
+            raise SchemaTooNew(
+                f"{self._db_path} has schema version {found}, but this "
+                f"slipstream reads version {SCHEMA_VERSION}. Migrations are "
+                f"one-way: upgrade slipstream, or restore the .bak snapshot "
+                f"taken before the migration alongside the db."
+            )
 
     @staticmethod
     def _backup(conn: sqlite3.Connection, db_path: Path, keep: int = 10):
