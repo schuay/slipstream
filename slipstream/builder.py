@@ -304,6 +304,9 @@ class Builder:
         key = job.key
         state.in_flight = self._in_flight(job, "build")
         self._publish_state(engine_name, state)
+        # Said out loud: without -v nothing else reaches the console until the
+        # build has published or failed, and a long one looks like a hang.
+        self.log(f"{engine_name}: building {key}")
 
         row = self.store.get_build_state(engine_name, key)
         was_retry = row is not None and row["status"] == "retry_requested"
