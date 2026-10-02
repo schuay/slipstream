@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from slipstream.config import PushTarget, load_config
+from slipstream.models import CommitKey
 
 
 def _write(tmp_path, push_section):
@@ -408,7 +409,7 @@ class TestBuildAndBenchConfig:
             )
         )
         assert cfg.build.engines == ["v8"] and cfg.build.retain_gb == 250
-        assert cfg.build.start_from == {"v8": 109680}
+        assert cfg.build.start_from == {"v8": CommitKey(0, 109680)}
         assert cfg.build.max_consecutive_burns == 4
         assert (cfg.bench.min_free_gb, cfg.bench.run_roots) == (50, 3)
 

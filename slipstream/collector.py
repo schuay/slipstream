@@ -23,6 +23,7 @@ from rich.markup import escape
 
 from .config import Config, EngineConfig, RunSpec
 from .lock import MachineLock
+from .models import CommitKey
 from .store import CommitIdCollision, CommitStore
 
 console = Console()
@@ -552,14 +553,14 @@ class BenchCollector:
         return True
 
     def _run_benchmarks(
-        self, engine: EngineConfig, commit_id: str, runs: int, run_root: Path
+        self, engine: EngineConfig, key: CommitKey, runs: int, run_root: Path
     ) -> BenchOutcome:
         """Run every benchmark configuration and record what came back.
 
         Counts are over (run, config) pairs, so a suite that fails on one run
         of three shows as partial rather than as a clean pass.
         """
-        res_dir = self.cfg.commit_results_dir(engine.name, commit_id)
+        res_dir = self.cfg.commit_results_dir(engine.name, key)
         res_dir.mkdir(parents=True, exist_ok=True)
 
         patterns = {
@@ -662,7 +663,7 @@ class BenchCollector:
                         self.store.insert_scores(
                             engine.name,
                             self.cfg.platform,
-                            int(commit_id),
+                            key,
                             int(time.time()),
                             scores,
                         )
@@ -686,12 +687,9 @@ class BenchCollector:
     def bench_at_root(self, engine, commit, run_root, runs, provenance=None):
         if self.dry_run:
             return self._bench_at_root(engine, commit, run_root, runs, provenance)
-        with self.store.result_locks(
-            engine.name, self.cfg.platform, [int(commit["commit_id"])]
-        ):
-            self.store.check_pending(
-                engine.name, self.cfg.platform, [int(commit["commit_id"])]
-            )
+        key = CommitKey.from_commit(commit)
+        with self.store.result_locks(engine.name, self.cfg.platform, [key]):
+            self.store.check_pending(engine.name, self.cfg.platform, [key])
             return self._bench_at_root(engine, commit, run_root, runs, provenance)
 
     def _bench_at_root(
@@ -713,22 +711,20 @@ class BenchCollector:
         "built here", which is what a git-driven engine and an ad-hoc bench
         range both are.
         """
-        commit_id = str(commit["commit_id"])
+        key = CommitKey.from_commit(commit)
         # Scores of a commit interrupted part way through must go before it is
         # measured again: insert_scores is INSERT OR IGNORE with run in the
         # primary key, so the surviving rows would win for the configs they
         # cover and leave a run number half measured on each side of the
         # interrupt. Both the git path and the bus path arrive here.
         if not self.dry_run:
-            self.store.clear_scores(
-                engine.name, self.cfg.platform, [int(commit["commit_id"])]
-            )
+            self.store.clear_scores(engine.name, self.cfg.platform, [key])
         outcome = BenchOutcome(0, 0, 0)
         try:
-            outcome = self._run_benchmarks(engine, commit_id, runs, run_root)
+            outcome = self._run_benchmarks(engine, key, runs, run_root)
         except KeyboardInterrupt:
             self._log(
-                f"  [yellow]Interrupted on {commit_id} — will retry on next run[/yellow]"
+                f"  [yellow]Interrupted on {key} — will retry on next run[/yellow]"
             )
             raise
         except Exception as exc:
@@ -740,9 +736,7 @@ class BenchCollector:
             # measured. "failed" means no scores everywhere else.
             self._log(f"  [red]Fatal error during benchmarks: {escape(str(exc))}[/red]")
             if not self.dry_run:
-                self.store.clear_scores(
-                    engine.name, self.cfg.platform, [int(commit["commit_id"])]
-                )
+                self.store.clear_scores(engine.name, self.cfg.platform, [key])
 
         if self.dry_run:
             return outcome
@@ -765,15 +759,8 @@ class BenchCollector:
             # numbers under the other one's git hash. The missing-commit-row
             # guard cannot see that, because a row for the id does exist.
             self._log(f"  [red]{escape(str(e))}[/red]")
-            self.store.clear_scores(
-                engine.name, self.cfg.platform, [int(commit["commit_id"])]
-            )
-            self.store.mark_done(
-                engine.name,
-                self.cfg.platform,
-                int(commit["commit_id"]),
-                status="failed",
-            )
+            self.store.clear_scores(engine.name, self.cfg.platform, [key])
+            self.store.mark_done(engine.name, self.cfg.platform, key, status="failed")
             # Zero scores, because they were just deleted. The caller's circuit
             # breaker reads this: returning the original outcome would look
             # like a clean run, and systematic collisions (a restored db, a
@@ -781,9 +768,7 @@ class BenchCollector:
             # the breaker never firing.
             return BenchOutcome(0, outcome.configs_total, 0)
         self.store.record_run_env(
-            engine.name,
-            int(commit["commit_id"]),
-            provenance or self.local_provenance(engine, runs),
+            engine.name, key, provenance or self.local_provenance(engine, runs)
         )
         return outcome
 
@@ -851,9 +836,18 @@ class BenchCollector:
     def find_frontier(
         self, engine_name: str, fetch: bool = True
     ) -> tuple[int | None, int | None]:
-        """Return (last_done_id, head_id) for an engine."""
-        last_done = self.store.max_done_commit_id(engine_name, self.cfg.platform)
-        return last_done, self.head_commit_id(engine_name, fetch=fetch)
+        """Return (last_done_id, head_id) for an engine.
+
+        Scalar ids: this is the git-driven path, which builds the engine from
+        its own checkout and so is embedder 0 by construction.
+        """
+        last_done = self.store.max_done_key(
+            engine_name, self.cfg.platform, embedder_id=0
+        )
+        return (
+            last_done.commit_id if last_done else None,
+            self.head_commit_id(engine_name, fetch=fetch),
+        )
 
     def head_commit_id(self, engine_name: str, fetch: bool = True) -> int | None:
         """The newest commit id on origin/main for this engine.
@@ -928,27 +922,29 @@ class BenchCollector:
 
         # Commits a dry run would have cleared: nothing was, so is_done below
         # would skip every one of them and the plan would show no work at all.
-        cleared: set[int] = set()
+        cleared: set[CommitKey] = set()
         if clear:
-            clear_ids = [r["commit_id"] for r in sampled]
+            clear_keys = [CommitKey.from_commit(r) for r in sampled]
             self._log(
-                f"[yellow]Clearing results and state for {len(clear_ids)} commits...[/yellow]"
+                f"[yellow]Clearing results and state for {len(clear_keys)} commits...[/yellow]"
             )
             if not self.dry_run:
-                with self.store.result_locks(engine_name, self.cfg.platform, clear_ids):
-                    self.store.clear_range(engine_name, self.cfg.platform, clear_ids)
-                    for cid in clear_ids:
-                        p = self.cfg.commit_results_dir(engine_name, cid)
+                with self.store.result_locks(
+                    engine_name, self.cfg.platform, clear_keys
+                ):
+                    self.store.clear_range(engine_name, self.cfg.platform, clear_keys)
+                    for key in clear_keys:
+                        p = self.cfg.commit_results_dir(engine_name, key)
                         if p.exists():
                             shutil.rmtree(p)
             else:
-                cleared = set(clear_ids)
+                cleared = set(clear_keys)
 
         t_start = time.time()
         total = len(sampled)
         for idx, row in enumerate(sampled):
-            commit_id_int = row["commit_id"]
-            commit_id = str(commit_id_int)
+            key = CommitKey.from_commit(row)
+            commit_id = str(key)
             commit_hash = row["hash"]
 
             eta = ""
@@ -961,8 +957,8 @@ class BenchCollector:
                 f"({commit_hash[:8]}) | ETA: {eta or 'N/A'}[/bold green]"
             )
 
-            if commit_id_int not in cleared and self.store.is_done(
-                engine_name, self.cfg.platform, commit_id_int
+            if key not in cleared and self.store.is_done(
+                engine_name, self.cfg.platform, key
             ):
                 self._log("  [yellow]Skipping: already done[/yellow]")
                 continue

@@ -14,6 +14,7 @@ from slipstream.builder import BuildError, Builder, build_cfg_hash, package
 from slipstream.bus import Bus
 from slipstream.collector import BuildStepError
 from slipstream.config import EngineConfig
+from keys import K, K1
 
 
 def _engine(src_dir, run_set=("out/d8",), **kw):
@@ -46,7 +47,7 @@ def builder(config, tmp_path, monkeypatch):
     (src / "out" / "d8").write_bytes(b"binary")
     config.engines["v8"] = _engine(src)
     config.build.engines = ["v8"]
-    config.build.start_from = {"v8": 100}
+    config.build.start_from = {"v8": K1(100)}
     config.build.min_free_gb = 0.001  # the floor has its own tests
 
     b = Builder(config, Bus(tmp_path / "bus"))
@@ -90,8 +91,8 @@ class TestPublishing:
 
     def test_publishes_the_next_commit_above_the_frontier(self, builder):
         result = builder.build_one("v8")
-        assert result.published and result.commit_id == 101
-        assert builder.bus.commit_ids("v8") == [101]
+        assert result.published and result.key == K1(101)
+        assert builder.bus.keys("v8") == K(101)
         entry = builder.bus.read_entry("v8", 101)
         assert entry.hash == "hash101" and entry.title == "commit 101"
         assert entry.blob_sha256 and entry.blob_bytes > 0
@@ -100,17 +101,17 @@ class TestPublishing:
     def test_walks_upward_one_commit_per_cycle(self, builder):
         for _ in range(3):
             builder.build_one("v8")
-        assert builder.bus.commit_ids("v8") == [101, 102, 103]
+        assert builder.bus.keys("v8") == K(101, 102, 103)
 
     def test_up_to_date_publishes_nothing(self, builder):
         builder.history = [100]
         assert builder.build_one("v8").published is False
-        assert builder.bus.commit_ids("v8") == []
+        assert builder.bus.keys("v8") == K()
 
     def test_the_state_file_reports_the_frontier(self, builder):
         builder.build_one("v8")
         state = builder.bus.read_builder_state("v8")
-        assert state.frontier == 101 and state.lowest_retained == 101
+        assert state.frontier == K1(101) and state.lowest_retained == K1(101)
         assert state.in_flight is None and state.updated_at > 0
 
     def test_an_engine_with_no_run_set_is_refused(self, builder, config):
@@ -121,25 +122,25 @@ class TestPublishing:
 
 class TestFrontier:
     def test_from_is_only_consulted_when_there_is_no_state(self, builder):
-        assert builder.frontier("v8") == 100
+        assert builder.frontier("v8") == K1(100)
         builder.build_one("v8")
-        assert builder.frontier("v8") == 101
+        assert builder.frontier("v8") == K1(101)
         # A restart must not rewind past what was published.
-        builder.cfg.build.start_from = {"v8": 50}
-        assert builder.frontier("v8") == 101
+        builder.cfg.build.start_from = {"v8": K1(50)}
+        assert builder.frontier("v8") == K1(101)
 
     def test_a_terminal_failure_advances_it(self, builder):
         """Otherwise a compile failure at the head is rebuilt every cycle."""
         builder.failures = [BuildStepError("compile", 1)]
         builder.build_one("v8")
-        assert builder.frontier("v8") == 101
-        assert builder.build_one("v8").commit_id == 102
+        assert builder.frontier("v8") == K1(101)
+        assert builder.build_one("v8").key == K1(102)
 
     def test_a_non_terminal_failure_does_not(self, builder):
         builder.failures = [BuildStepError("sync", 1)]
         builder.build_one("v8")
-        assert builder.frontier("v8") == 100
-        assert builder.build_one("v8").commit_id == 101
+        assert builder.frontier("v8") == K1(100)
+        assert builder.build_one("v8").key == K1(101)
 
     def test_no_history_and_no_from_is_an_error(self, builder):
         builder.cfg.build.start_from = {}
@@ -162,7 +163,7 @@ class TestFailureClassification:
         builder.failures = [BuildStepError(kind, 1)]
         result = builder.build_one("v8")
         assert result.status == "infra_retry"
-        assert builder.frontier("v8") == 100
+        assert builder.frontier("v8") == K1(100)
 
     def test_a_packaging_failure_is_infrastructure(self, builder, monkeypatch):
         def boom(*a, **k):
@@ -171,7 +172,7 @@ class TestFailureClassification:
         monkeypatch.setattr("slipstream.builder.package", boom)
         result = builder.build_one("v8")
         assert result.status == "infra_retry"
-        assert builder.bus.commit_ids("v8") == []
+        assert builder.bus.keys("v8") == K()
 
     def test_infra_retries_are_bounded(self, builder):
         """A bad DEPS pin is indistinguishable by exit code from an outage, so
@@ -180,9 +181,9 @@ class TestFailureClassification:
         for attempt in range(1, 4):
             builder.failures = [BuildStepError("sync", 1)]
             result = builder.build_one("v8")
-            assert result.commit_id == 101
+            assert result.key == K1(101)
             assert result.status == ("infra_burned" if attempt == 3 else "infra_retry")
-        assert builder.frontier("v8") == 101
+        assert builder.frontier("v8") == K1(101)
 
     def test_a_success_clears_the_failure_row(self, builder):
         builder.failures = [BuildStepError("sync", 1)]
@@ -241,9 +242,9 @@ class TestCircuitBreaker:
         self._burn(builder, 2)
         assert builder.bus.read_builder_state("v8").stalled_since is not None
         # Backed off: this cycle does nothing at all.
-        published_before = builder.bus.commit_ids("v8")
-        assert builder.build_one("v8").commit_id is None
-        assert builder.bus.commit_ids("v8") == published_before
+        published_before = builder.bus.keys("v8")
+        assert builder.build_one("v8").key is None
+        assert builder.bus.keys("v8") == published_before
         # Once the window opens it tries again, and a success un-stalls it.
         _open_stall_window(builder)
         builder.cfg.build.max_infra_attempts = 5
@@ -274,7 +275,7 @@ class TestRetry:
         builder.failures = [BuildStepError("compile", 1)]
         builder.build_one("v8")
         builder.store.request_build_retry("v8", 101)
-        assert builder.build_one("v8").commit_id == 101
+        assert builder.build_one("v8").key == K1(101)
         assert builder.store.get_build_state("v8", 101) is None
         assert builder.next_commit("v8")["commit_id"] == 102
 
@@ -303,7 +304,7 @@ class TestDiskFloor:
         monkeypatch.setattr(builder, "free_gb", lambda: 5.0)
         builder.cfg.build.min_free_gb = 100
         assert builder.build_one("v8").published is False
-        assert builder.bus.commit_ids("v8") == []
+        assert builder.bus.keys("v8") == K()
         state = builder.bus.read_builder_state("v8")
         assert state.publishing_paused_by_floor
         assert "free" in state.last_error
@@ -315,7 +316,7 @@ class TestDiskFloor:
         monkeypatch.setattr(builder, "free_gb", lambda: 5.0)
         builder.cfg.build.min_free_gb = 100
         builder.build_one("v8")
-        assert builder.bus.commit_ids("v8") == [101]
+        assert builder.bus.keys("v8") == K(101)
 
 
 class TestRetention:
@@ -323,8 +324,8 @@ class TestRetention:
         builder.cfg.build.retain_gb = 30 / 1_000_000_000  # 30 bytes
         for _ in range(3):
             builder.build_one("v8")
-        ids = builder.bus.commit_ids("v8")
-        assert ids and ids[-1] == 103
+        ids = builder.bus.keys("v8")
+        assert ids and ids[-1] == K1(103)
         assert builder.bus.read_builder_state("v8").lowest_retained == ids[0]
 
 
@@ -434,7 +435,7 @@ class TestCycle:
 
     def test_a_stop_request_ends_the_cycle(self, builder):
         assert builder.run_cycle(["v8"], lambda: True) == 0
-        assert builder.bus.commit_ids("v8") == []
+        assert builder.bus.keys("v8") == K()
 
 
 class TestReportedFrontier:
@@ -444,14 +445,14 @@ class TestReportedFrontier:
         builder.failures = [BuildStepError("compile", 1)]
         builder.build_one("v8")
         state = builder.bus.read_builder_state("v8")
-        assert state.frontier == 101
+        assert state.frontier == K1(101)
         assert state.failed[0]["commit_id"] == 101
 
     def test_a_non_terminal_failure_does_not_move_it(self, builder):
         builder.build_one("v8")  # publish 101
         builder.failures = [BuildStepError("sync", 1)]
         builder.build_one("v8")
-        assert builder.bus.read_builder_state("v8").frontier == 101
+        assert builder.bus.read_builder_state("v8").frontier == K1(101)
 
 
 class TestStatePublishing:
@@ -550,8 +551,8 @@ class TestRetryFailureIsNotStranded:
         builder.store.request_build_retry("v8", 101)
 
         builder.failures = [BuildStepError("sync", 1)]
-        assert builder.build_one("v8").commit_id == 101
-        assert builder.store.build_retries_requested("v8") == [101]
+        assert builder.build_one("v8").key == K1(101)
+        assert builder.store.build_retries_requested("v8") == K(101)
         assert builder.next_commit("v8")["commit_id"] == 101
 
     def test_it_still_burns_once_the_attempts_run_out(self, builder):
@@ -564,7 +565,7 @@ class TestRetryFailureIsNotStranded:
             builder.build_one("v8")
         row = builder.store.get_build_state("v8", 101)
         assert row["status"] == "infra_burned"
-        assert builder.store.build_retries_requested("v8") == []
+        assert builder.store.build_retries_requested("v8") == K()
         # Terminal, so it is visible rather than silently gone.
         assert [r["commit_id"] for r in builder.store.build_failures("v8")] == [101]
 
@@ -587,7 +588,7 @@ class TestNoStaleInFlight:
         builder.bus.write_builder_state(
             "v8",
             BuilderState(
-                frontier=100,
+                frontier=K1(100),
                 in_flight={"commit_id": 100, "phase": "package", "started_at": 1},
             ),
         )
@@ -652,8 +653,8 @@ class TestStateIsRefreshedOnEveryPublish:
         builder.build_one("v8")
 
         state = builder.bus.read_builder_state("v8")
-        assert state.frontier == 102
-        assert state.lowest_retained == 101
+        assert state.frontier == K1(102)
+        assert state.lowest_retained == K1(101)
         assert [f["commit_id"] for f in state.failed] == [102]
 
     def test_the_floor_branch_reports_the_same_facts(self, builder, monkeypatch):
@@ -663,7 +664,7 @@ class TestStateIsRefreshedOnEveryPublish:
         builder.cfg.build.min_free_gb = 100
         builder.build_one("v8")
         state = builder.bus.read_builder_state("v8")
-        assert state.frontier == 101 and state.publishing_paused_by_floor
+        assert state.frontier == K1(101) and state.publishing_paused_by_floor
 
 
 class TestBurnsAreCountedAgainstTheTopic:
@@ -674,8 +675,8 @@ class TestBurnsAreCountedAgainstTheTopic:
         for cid in (10, 20, 30):
             builder.store.record_build_failure("v8", cid, "infra_burned", "sync")
         # The bus root was recreated; start_from says where we are now.
-        assert builder.bus.commit_ids("v8") == []
-        assert builder.cfg.build.start_from == {"v8": 100}
+        assert builder.bus.keys("v8") == K()
+        assert builder.cfg.build.start_from == {"v8": K1(100)}
         assert builder.consecutive_burns("v8") == 0
 
     def test_burns_above_the_floor_still_count(self, builder):

@@ -22,6 +22,7 @@ from .bus import Bus, BusError, cursor_path, read_cursor
 from .config import BusSource, Config
 from .consumer import TRANSPORT_ERRORS, open_source
 from .lock import MachineLock, paused_until
+from .models import CommitKey
 from .store import CommitStore
 
 GB = 1_000_000_000
@@ -32,11 +33,11 @@ class EngineStatus:
     engine: str
     source: str | None = None
     driven_by: str = "git"
-    frontier: int | None = None
-    cursor: int | None = None
+    frontier: CommitKey | None = None
+    cursor: CommitKey | None = None
     lag: int | None = None
-    lowest_retained: int | None = None
-    dropped_unread_up_to: int | None = None
+    lowest_retained: CommitKey | None = None
+    dropped_unread_up_to: CommitKey | None = None
     failed_builds: list[dict] = field(default_factory=list)
     failed_builds_total: int = 0
     stalled_since: float | None = None
@@ -51,7 +52,7 @@ class EngineStatus:
     bench_in_flight: dict | None = None
     bench_age: float | None = None
     bench_stalled_since: float | None = None
-    bench_skipped_dropped: int | None = None
+    bench_skipped_dropped: CommitKey | None = None
     status_counts: dict = field(default_factory=dict)
     orphan_scores: int = 0
     provenance: dict = field(default_factory=dict)
@@ -180,7 +181,7 @@ def _fill_bus_status(cfg, bus, store, source, name, st, mine):
     st.builder_age = time.time() - builder.updated_at if builder.updated_at else None
     st.paused_by_floor = builder.publishing_paused_by_floor
     st.builder_in_flight = builder.in_flight
-    st.lag = len(handle.ids_above(name, st.cursor))
+    st.lag = len(handle.keys_above(name, st.cursor))
 
     mine_state = bus.read_bench_state(name)
     st.bench_paused_by_floor = mine_state.benching_paused_by_floor
@@ -209,6 +210,17 @@ def _fill_bus_status(cfg, bus, store, source, name, st, mine):
 
     st.blob_gb = _dir_bytes(bus.blob_dir(name)) / GB
     st.roots_gb = _dir_bytes(bus.root / "roots" / name) / GB
+
+
+def _key_of(record: dict) -> str:
+    """The key a state-file record names, in its CLI spelling.
+
+    Records written before keys had two parts carry only commit_id, and one
+    whose commit_id is missing is not a key at all.
+    """
+    if record.get("commit_id") is None:
+        return "?"
+    return str(CommitKey.from_commit(record))
 
 
 def render(report: BusStatus, echo) -> None:
@@ -246,7 +258,7 @@ def render(report: BusStatus, echo) -> None:
                 echo("  builder paused: below its free-space floor")
             if st.builder_in_flight:
                 echo(
-                    f"  builder is on {st.builder_in_flight.get('commit_id')} "
+                    f"  builder is on {_key_of(st.builder_in_flight)} "
                     f"({st.builder_in_flight.get('phase')})"
                 )
             if st.builder_error:
@@ -270,14 +282,14 @@ def render(report: BusStatus, echo) -> None:
                 echo(f"  bench state written {int(st.bench_age / 60)}m ago")
             if st.bench_in_flight:
                 echo(
-                    f"  benching {st.bench_in_flight.get('commit_id')} since "
+                    f"  benching {_key_of(st.bench_in_flight)} since "
                     f"{when(st.bench_in_flight.get('started_at', 0))}"
                 )
             if st.bench_error:
                 echo(f"  bencher last error: {st.bench_error}")
             if st.failed_builds:
                 shown = ", ".join(
-                    f"{f['commit_id']} ({f.get('kind', '?')})"
+                    f"{_key_of(f)} ({f.get('kind', '?')})"
                     for f in st.failed_builds[-5:]
                 )
                 echo(f"  {st.failed_builds_total} failed builds, latest: {shown}")

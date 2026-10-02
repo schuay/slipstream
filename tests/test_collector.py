@@ -12,6 +12,7 @@ import pytest
 
 from slipstream.collector import BenchCollector, FetchError
 from slipstream.config import EngineConfig, RunSpec
+from keys import K1
 
 
 class TestParseStdout:
@@ -165,7 +166,7 @@ class TestFindFrontier:
             },
             platform="arm64",
         )
-        collector.store = SimpleNamespace(max_done_commit_id=lambda *a: 320132)
+        collector.store = SimpleNamespace(max_done_key=lambda *a, **k: K1(320132))
         calls = []
 
         def fake_run(cmd, **kwargs):
@@ -716,7 +717,7 @@ class TestDryRunIsInert:
             c, "_run_benchmarks", lambda *a: benched.append(a[1]) or _outcome()
         )
         c.collect("v8", 99, 100, clear=True)
-        assert benched == ["100"], "the dry run skipped the commit it would clear"
+        assert benched == [K1(100)], "the dry run skipped the commit it would clear"
         assert c.store.is_done("v8", config.platform, 100), "state was really cleared"
 
 

@@ -10,6 +10,7 @@ import pytest
 from slipstream.bus import Bus, BuilderState, Entry, sha256_file
 from slipstream.config import BusSource
 from slipstream.remote import SshSource, quote_remote
+from keys import K, K1
 
 
 def _entry(commit_id):
@@ -74,16 +75,16 @@ class TestListing:
     def test_lists_ids_above_the_cursor(self, remote):
         for cid in (100, 101, 102):
             _publish(remote.far, cid)
-        assert remote.source.ids_above("v8", 100) == [101, 102]
-        assert remote.source.ids_above("v8", None) == [100, 101, 102]
+        assert remote.source.keys_above("v8", 100) == K(101, 102)
+        assert remote.source.keys_above("v8", None) == K(100, 101, 102)
 
     def test_an_empty_topic_is_not_an_error(self, remote):
-        assert remote.source.ids_above("v8", None) == []
+        assert remote.source.keys_above("v8", None) == K()
 
     def test_tmp_files_are_ignored(self, remote):
         _publish(remote.far, 100)
         (remote.far.topic_dir("v8") / "101.json.tmp-1-a").write_text("{}")
-        assert remote.source.ids_above("v8", None) == [100]
+        assert remote.source.keys_above("v8", None) == K(100)
 
     def test_an_ssh_failure_is_raised(self, remote, monkeypatch):
         def broken(cmd, timeout=None):
@@ -91,7 +92,7 @@ class TestListing:
 
         monkeypatch.setattr("slipstream.remote._run", broken)
         with pytest.raises(subprocess.CalledProcessError):
-            remote.source.ids_above("v8", None)
+            remote.source.keys_above("v8", None)
 
 
 class TestEntries:
@@ -162,7 +163,7 @@ class TestBuilderState:
             "v8", BuilderState(frontier=109680, lowest_retained=109120)
         )
         state = remote.source.builder_state("v8")
-        assert state.frontier == 109680 and state.lowest_retained == 109120
+        assert state.frontier == K1(109680) and state.lowest_retained == K1(109120)
 
     def test_a_missing_state_file_reads_as_empty(self, remote):
         assert remote.source.builder_state("v8").frontier is None
@@ -319,7 +320,7 @@ class TestTransportHardening:
             ),
         )
         with pytest.raises(subprocess.CalledProcessError):
-            source.ids_above("v8", None)
+            source.keys_above("v8", None)
         with pytest.raises(subprocess.CalledProcessError):
             source.read_entry("v8", 100)
 
@@ -335,7 +336,7 @@ class TestTransportHardening:
             ),
         )
         assert source.read_entry("v8", 100) is None
-        assert source.ids_above("v8", None) == []
+        assert source.keys_above("v8", None) == K()
         assert source.builder_state("v8").frontier is None
 
     def test_a_localised_error_message_is_still_an_error(self, monkeypatch):

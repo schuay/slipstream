@@ -10,6 +10,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from .models import CommitKey
+
 
 class StoreError(RuntimeError):
     """A store invariant was violated."""
@@ -24,9 +26,10 @@ class BotMismatch(StoreError):
 
 
 class CommitIdCollision(StoreError):
-    """Two hashes claim the same commit_id for one engine.
+    """Two hashes claim the same key for one engine.
 
-    The partial unique index on (engine, commit_id) rejects the second one.
+    The partial unique index on (engine, embedder_id, commit_id) rejects the
+    second one.
     """
 
 
@@ -41,12 +44,129 @@ _ADDED_COLUMNS = [
     ("push_state", "bot", "TEXT"),
 ]
 
-SCHEMA_VERSION = "2"
+# Version 3 put embedder_id into every key. It is a primary key column, which
+# SQLite cannot ALTER in, so a db that lacks it is rebuilt table by table.
+SCHEMA_VERSION = "3"
 
 # A long writer can hold the db past busy_timeout. Retried rather than
 # deferred, because a daemon has no "next open".
 _MIGRATE_ATTEMPTS = 3
 _MIGRATE_RETRY_SECS = 5.0
+
+# One definition per table, shared by the fresh-db path and the rebuild: the
+# migration recreates a table from this text, so there is no second copy to
+# drift. Every keyed table carries embedder_id ahead of commit_id, so the
+# natural row order is CommitKey order.
+_KEYED_TABLES = {
+    "commits": """
+        CREATE TABLE IF NOT EXISTS commits (
+            engine      TEXT    NOT NULL,
+            embedder_id INTEGER NOT NULL DEFAULT 0,
+            hash        TEXT    NOT NULL,
+            commit_id   INTEGER,
+            date        TEXT    NOT NULL DEFAULT '',
+            timestamp   INTEGER NOT NULL DEFAULT 0,
+            title       TEXT    NOT NULL DEFAULT '',
+            PRIMARY KEY (engine, embedder_id, hash)
+        )""",
+    "scores": """
+        CREATE TABLE IF NOT EXISTS scores (
+            engine      TEXT    NOT NULL,
+            platform    TEXT    NOT NULL,
+            embedder_id INTEGER NOT NULL DEFAULT 0,
+            commit_id   INTEGER NOT NULL,
+            suite       TEXT    NOT NULL,
+            flags       TEXT    NOT NULL DEFAULT 'default',
+            benchmark   TEXT    NOT NULL,
+            metric      TEXT    NOT NULL,
+            run         INTEGER NOT NULL,
+            score       REAL    NOT NULL,
+            timestamp   INTEGER NOT NULL,
+            bot         TEXT,
+            PRIMARY KEY (engine, platform, embedder_id, commit_id, suite, flags,
+                         benchmark, metric, run)
+        )""",
+    "processing_state": """
+        CREATE TABLE IF NOT EXISTS processing_state (
+            engine        TEXT    NOT NULL,
+            platform      TEXT    NOT NULL,
+            embedder_id   INTEGER NOT NULL DEFAULT 0,
+            commit_id     INTEGER NOT NULL,
+            bot           TEXT,
+            status        TEXT    NOT NULL DEFAULT 'ok',
+            configs_ok    INTEGER,
+            configs_total INTEGER,
+            PRIMARY KEY (engine, platform, embedder_id, commit_id)
+        )""",
+    "push_state": """
+        CREATE TABLE IF NOT EXISTS push_state (
+            engine      TEXT    NOT NULL,
+            platform    TEXT    NOT NULL,
+            embedder_id INTEGER NOT NULL DEFAULT 0,
+            commit_id   INTEGER NOT NULL,
+            pushed_at   INTEGER NOT NULL,
+            bot         TEXT,
+            PRIMARY KEY (engine, platform, embedder_id, commit_id)
+        )""",
+    "run_env": """
+        CREATE TABLE IF NOT EXISTS run_env (
+            engine             TEXT    NOT NULL,
+            bot                TEXT    NOT NULL DEFAULT '',
+            embedder_id        INTEGER NOT NULL DEFAULT 0,
+            commit_id          INTEGER NOT NULL,
+            source             TEXT    NOT NULL DEFAULT 'local',
+            runs               INTEGER,
+            run_configs        TEXT    NOT NULL DEFAULT '[]',
+            harness_revs       TEXT    NOT NULL DEFAULT '{}',
+            hw_model           TEXT    NOT NULL DEFAULT '',
+            os_version         TEXT    NOT NULL DEFAULT '',
+            toolchain          TEXT    NOT NULL DEFAULT '',
+            build_cfg_hash     TEXT    NOT NULL DEFAULT '',
+            slipstream_version TEXT    NOT NULL DEFAULT '',
+            recorded_at        INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (engine, bot, embedder_id, commit_id)
+        )""",
+    "build_state": """
+        CREATE TABLE IF NOT EXISTS build_state (
+            engine       TEXT    NOT NULL,
+            embedder_id  INTEGER NOT NULL DEFAULT 0,
+            commit_id    INTEGER NOT NULL,
+            status       TEXT    NOT NULL,
+            kind         TEXT    NOT NULL DEFAULT '',
+            log_path     TEXT    NOT NULL DEFAULT '',
+            attempts     INTEGER NOT NULL DEFAULT 0,
+            last_attempt INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (engine, embedder_id, commit_id)
+        )""",
+}
+
+# Indexes by table, so the rebuild can recreate exactly the ones that belong
+# to it. Names changed with the key: an index of the old name survives on the
+# renamed table until it is dropped, and CREATE IF NOT EXISTS would see it.
+_INDEXES = {
+    "commits": """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_commit_key
+            ON commits (engine, embedder_id, commit_id)
+            WHERE commit_id IS NOT NULL""",
+    "scores": """
+        CREATE INDEX IF NOT EXISTS idx_scores_series
+            ON scores (engine, suite, flags, benchmark, metric,
+                       embedder_id, commit_id)""",
+}
+_OLD_INDEXES = ("idx_commit_id", "idx_scores_lookup")
+
+
+def _key_filter(keys: list[CommitKey]) -> tuple[str, list]:
+    """A WHERE fragment matching any of ``keys``, with its parameters.
+
+    One (embedder_id, commit_id) pair per key rather than a row-value IN,
+    which SQLite only accepts against a subquery.
+    """
+    sql = " OR ".join("(embedder_id=? AND commit_id=?)" for _ in keys)
+    params: list = []
+    for k in keys:
+        params.extend(k)
+    return f"({sql})", params
 
 
 class CommitStore:
@@ -55,6 +175,11 @@ class CommitStore:
     One db holds one bot: ``bot`` is an informational column on the row tables,
     never a key and never filtered on, and the invariant is kept at the
     ingress boundary (``import``) instead. See DECISIONS.md D014.
+
+    Rows are keyed by ``CommitKey``. Every method that takes a key accepts
+    the scalar spelling too (an int is embedder 0), because that is what the
+    CLI, the interchange CSV and the perf database all speak; what comes back
+    is always a ``CommitKey``.
     """
 
     def __init__(
@@ -136,94 +261,21 @@ class CommitStore:
             old.unlink()
 
     def _init_schema(self):
-        self.conn.executescript("""
+        self.conn.executescript(
+            """
             CREATE TABLE IF NOT EXISTS delivery_attempts (
                 source TEXT PRIMARY KEY, record TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS commits (
-                engine      TEXT    NOT NULL,
-                hash        TEXT    NOT NULL,
-                commit_id   INTEGER,
-                date        TEXT    NOT NULL DEFAULT '',
-                timestamp   INTEGER NOT NULL DEFAULT 0,
-                title       TEXT    NOT NULL DEFAULT '',
-                PRIMARY KEY (engine, hash)
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_commit_id
-                ON commits (engine, commit_id)
-                WHERE commit_id IS NOT NULL;
-
-            CREATE TABLE IF NOT EXISTS scores (
-                engine     TEXT    NOT NULL,
-                platform   TEXT    NOT NULL,
-                commit_id  INTEGER NOT NULL,
-                suite      TEXT    NOT NULL,
-                flags      TEXT    NOT NULL DEFAULT 'default',
-                benchmark  TEXT    NOT NULL,
-                metric     TEXT    NOT NULL,
-                run        INTEGER NOT NULL,
-                score      REAL    NOT NULL,
-                timestamp  INTEGER NOT NULL,
-                bot        TEXT,
-                PRIMARY KEY (engine, platform, commit_id, suite, flags, benchmark, metric, run)
-            );
-            CREATE INDEX IF NOT EXISTS idx_scores_lookup
-                ON scores (engine, suite, flags, benchmark, metric, commit_id);
-
-            CREATE TABLE IF NOT EXISTS processing_state (
-                engine        TEXT    NOT NULL,
-                platform      TEXT    NOT NULL,
-                commit_id     INTEGER NOT NULL,
-                bot           TEXT,
-                status        TEXT    NOT NULL DEFAULT 'ok',
-                configs_ok    INTEGER,
-                configs_total INTEGER,
-                PRIMARY KEY (engine, platform, commit_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS push_state (
-                engine     TEXT    NOT NULL,
-                platform   TEXT    NOT NULL,
-                commit_id  INTEGER NOT NULL,
-                pushed_at  INTEGER NOT NULL,
-                bot        TEXT,
-                PRIMARY KEY (engine, platform, commit_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS run_env (
-                engine             TEXT    NOT NULL,
-                bot                TEXT    NOT NULL DEFAULT '',
-                commit_id          INTEGER NOT NULL,
-                source             TEXT    NOT NULL DEFAULT 'local',
-                runs               INTEGER,
-                run_configs        TEXT    NOT NULL DEFAULT '[]',
-                harness_revs       TEXT    NOT NULL DEFAULT '{}',
-                hw_model           TEXT    NOT NULL DEFAULT '',
-                os_version         TEXT    NOT NULL DEFAULT '',
-                toolchain          TEXT    NOT NULL DEFAULT '',
-                build_cfg_hash     TEXT    NOT NULL DEFAULT '',
-                slipstream_version TEXT    NOT NULL DEFAULT '',
-                recorded_at        INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (engine, bot, commit_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS build_state (
-                engine       TEXT    NOT NULL,
-                commit_id    INTEGER NOT NULL,
-                status       TEXT    NOT NULL,
-                kind         TEXT    NOT NULL DEFAULT '',
-                log_path     TEXT    NOT NULL DEFAULT '',
-                attempts     INTEGER NOT NULL DEFAULT 0,
-                last_attempt INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (engine, commit_id)
-            );
-
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-        """)
-        # Migrate scores: UNIQUE constraint -> PRIMARY KEY (idempotent)
+            """
+            + ";\n".join(_KEYED_TABLES.values())
+            + ";\n"
+        )
+        # Migrate scores: UNIQUE constraint -> PRIMARY KEY (idempotent). Older
+        # than the key rebuild below, which takes this table's shape from it.
         row = self.conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='scores'"
         ).fetchone()
@@ -250,8 +302,6 @@ class CommitStore:
                     SELECT engine, platform, commit_id, suite, flags, benchmark,
                            metric, run, score, timestamp FROM _scores_old;
                 DROP TABLE _scores_old;
-                CREATE INDEX IF NOT EXISTS idx_scores_lookup
-                    ON scores (engine, suite, flags, benchmark, metric, commit_id);
             """)
         self.conn.commit()
         self._migrate()
@@ -298,8 +348,18 @@ class CommitStore:
     def _run_migration(self):
         for table, column, decl in _ADDED_COLUMNS:
             self._add_column(table, column, decl)
+        # After the ALTERs: the rebuild copies every column the old table has,
+        # so the ones added above must be there first or the new table would
+        # be created without them and the ALTER never run again.
+        for table in _KEYED_TABLES:
+            if "embedder_id" not in self._columns(table):
+                self._rebuild_with_embedder(table)
+        for name in _OLD_INDEXES:
+            self.conn.execute(f"DROP INDEX IF EXISTS {name}")
+        for ddl in _INDEXES.values():
+            self.conn.execute(ddl)
         self.conn.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
             (SCHEMA_VERSION,),
         )
         if self._bot is not None and self.get_meta("bot_backfilled") is None:
@@ -319,6 +379,28 @@ class CommitStore:
                 (self._bot,),
             )
         self.conn.commit()
+
+    def _columns(self, table: str) -> list[str]:
+        return [r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")]
+
+    def _rebuild_with_embedder(self, table: str) -> None:
+        """Recreate ``table`` with embedder_id in its key, keeping every row.
+
+        Every existing row is embedder 0 by definition -- nothing wrote any
+        other kind before the column existed -- so the copy names only the
+        old columns and the new one takes its default. The old table's
+        indexes go with it when it is dropped.
+        """
+        old = f"_{table}_old"
+        cols = ", ".join(self._columns(table))
+        self.conn.executescript(
+            f"""
+            ALTER TABLE {table} RENAME TO {old};
+            {_KEYED_TABLES[table]};
+            INSERT INTO {table} ({cols}) SELECT {cols} FROM {old};
+            DROP TABLE {old};
+            """
+        )
 
     def _add_column(self, table: str, column: str, decl: str) -> None:
         try:
@@ -353,11 +435,17 @@ class CommitStore:
         return self._bot or self.get_meta("local_bot")
 
     # --- Commit insert ---
+    #
+    # insert_commits, count_missing_metadata, update_commit_metadata and
+    # get_commits_with_metadata serve the git-driven path, which resolves
+    # hashes in the engine's own checkout: embedder 0 by construction. An
+    # embedded engine's rows arrive through record_done with a full key.
 
     def insert_commits(self, engine: str, commits: list[dict]):
         """Insert (hash, title) rows; no-op if already present."""
         self.conn.executemany(
-            "INSERT OR IGNORE INTO commits (engine, hash, title) VALUES (?,?,?)",
+            "INSERT OR IGNORE INTO commits (engine, embedder_id, hash, title)"
+            " VALUES (?,0,?,?)",
             [(engine, c["hash"], c.get("title", "")) for c in commits],
         )
         self.conn.commit()
@@ -368,7 +456,8 @@ class CommitStore:
         placeholders = ",".join("?" * len(hashes))
         row = self.conn.execute(
             f"SELECT COUNT(*) FROM commits"
-            f" WHERE engine=? AND hash IN ({placeholders}) AND commit_id IS NULL",
+            f" WHERE engine=? AND embedder_id=0 AND hash IN ({placeholders})"
+            f" AND commit_id IS NULL",
             [engine, *hashes],
         ).fetchone()
         return row[0] if row else 0
@@ -385,7 +474,7 @@ class CommitStore:
         """Set metadata only if not already populated."""
         self.conn.execute(
             """UPDATE commits SET commit_id=?, date=?, timestamp=?, title=?
-               WHERE engine=? AND hash=? AND commit_id IS NULL""",
+               WHERE engine=? AND embedder_id=0 AND hash=? AND commit_id IS NULL""",
             (commit_id, date, timestamp, title, engine, hash),
         )
 
@@ -393,7 +482,7 @@ class CommitStore:
         self,
         engine: str,
         hash: str,
-        commit_id: int,
+        key,
         date: str,
         timestamp: int,
         title: str,
@@ -407,39 +496,41 @@ class CommitStore:
         good.
 
         Not INSERT OR REPLACE: ``commits`` carries a partial unique index on
-        (engine, commit_id), and replace through it deletes the incumbent row
-        when another hash holds that id, orphaning that commit's scores from
-        the export join.
+        (engine, embedder_id, commit_id), and replace through it deletes the
+        incumbent row when another hash holds that key, orphaning that
+        commit's scores from the export join.
         """
-        self._upsert_commit(engine, hash, commit_id, date, timestamp, title)
+        self._upsert_commit(engine, hash, CommitKey.of(key), date, timestamp, title)
         self.conn.commit()
 
     def _upsert_commit(
         self,
         engine: str,
         hash: str,
-        commit_id: int,
+        key: CommitKey,
         date: str,
         timestamp: int,
         title: str,
     ):
         try:
             self.conn.execute(
-                "INSERT INTO commits (engine, hash, commit_id, date, timestamp, title)"
-                " VALUES (?,?,?,?,?,?)"
-                " ON CONFLICT(engine, hash) DO UPDATE SET"
+                "INSERT INTO commits"
+                " (engine, embedder_id, hash, commit_id, date, timestamp, title)"
+                " VALUES (?,?,?,?,?,?,?)"
+                " ON CONFLICT(engine, embedder_id, hash) DO UPDATE SET"
                 "   commit_id=excluded.commit_id, date=excluded.date,"
                 "   timestamp=excluded.timestamp, title=excluded.title",
-                (engine, hash, commit_id, date, timestamp, title),
+                (engine, key.embedder_id, hash, key.commit_id, date, timestamp, title),
             )
         except sqlite3.IntegrityError as e:
             self.conn.rollback()
             other = self.conn.execute(
-                "SELECT hash FROM commits WHERE engine=? AND commit_id=?",
-                (engine, commit_id),
+                "SELECT hash FROM commits"
+                " WHERE engine=? AND embedder_id=? AND commit_id=?",
+                (engine, *key),
             ).fetchone()
             raise CommitIdCollision(
-                f"{engine} {commit_id} is already held by "
+                f"{engine} {key} is already held by "
                 f"{other[0] if other else '?'}, not {hash}"
             ) from e
 
@@ -460,11 +551,16 @@ class CommitStore:
         runs this after every benched commit and is meant to be cheap, and
         unbounded it is a DISTINCT LEFT JOIN over the engine's whole history.
         A range rather than an id list, so the caller's set can be any size.
+
+        Delivery speaks scalar commit numbers, so this sees embedder 0 only;
+        how an embedded series is projected into the perf database is not
+        decided yet, and until it is those rows are not candidates.
         """
         rows = self.conn.execute(
             "SELECT DISTINCT s.commit_id FROM scores s"
-            " LEFT JOIN commits c ON s.engine=c.engine AND s.commit_id=c.commit_id"
-            " WHERE s.engine=? AND s.platform=? AND c.hash IS NULL"
+            " LEFT JOIN commits c ON s.engine=c.engine"
+            "   AND s.embedder_id=c.embedder_id AND s.commit_id=c.commit_id"
+            " WHERE s.engine=? AND s.platform=? AND s.embedder_id=0 AND c.hash IS NULL"
             "   AND (? IS NULL OR s.commit_id >= ?)"
             "   AND (? IS NULL OR s.commit_id <= ?)"
             " ORDER BY s.commit_id",
@@ -477,19 +573,20 @@ class CommitStore:
     ) -> list[sqlite3.Row]:
         placeholders = ",".join("?" * len(hashes))
         return self.conn.execute(
-            f"SELECT hash, commit_id, date, timestamp, title FROM commits"
-            f" WHERE engine=? AND hash IN ({placeholders}) AND commit_id IS NOT NULL"
+            f"SELECT hash, embedder_id, commit_id, date, timestamp, title FROM commits"
+            f" WHERE engine=? AND embedder_id=0 AND hash IN ({placeholders})"
+            f" AND commit_id IS NOT NULL"
             f" ORDER BY commit_id",
             [engine, *hashes],
         ).fetchall()
 
     # --- Processing state ---
 
-    def is_done(self, engine: str, platform: str, commit_id: int) -> bool:
+    def is_done(self, engine: str, platform: str, key) -> bool:
         row = self.conn.execute(
             "SELECT 1 FROM processing_state"
-            " WHERE engine=? AND platform=? AND commit_id=?",
-            (engine, platform, commit_id),
+            " WHERE engine=? AND platform=? AND embedder_id=? AND commit_id=?",
+            (engine, platform, *CommitKey.of(key)),
         ).fetchone()
         return row is not None
 
@@ -497,7 +594,7 @@ class CommitStore:
         self,
         engine: str,
         platform: str,
-        commit_id: int,
+        key,
         status: str | None = None,
         configs_ok: int | None = None,
         configs_total: int | None = None,
@@ -509,24 +606,27 @@ class CommitStore:
         preserves whatever is already recorded (``import`` has no run to
         report), and defaults to ``ok`` for a row that does not exist yet.
         """
-        self._mark_done(engine, platform, commit_id, status, configs_ok, configs_total)
+        self._mark_done(
+            engine, platform, CommitKey.of(key), status, configs_ok, configs_total
+        )
         self.conn.commit()
 
     def _mark_done(
         self,
         engine: str,
         platform: str,
-        commit_id: int,
+        key: CommitKey,
         status: str | None,
         configs_ok: int | None,
         configs_total: int | None,
     ):
         self.conn.execute(
             "INSERT INTO processing_state"
-            " (engine, platform, commit_id, bot, status, configs_ok, configs_total)"
-            " VALUES (:engine, :platform, :commit_id, :bot,"
+            " (engine, platform, embedder_id, commit_id, bot, status,"
+            "  configs_ok, configs_total)"
+            " VALUES (:engine, :platform, :embedder_id, :commit_id, :bot,"
             "         COALESCE(:status, 'ok'), :configs_ok, :configs_total)"
-            " ON CONFLICT(engine, platform, commit_id) DO UPDATE SET"
+            " ON CONFLICT(engine, platform, embedder_id, commit_id) DO UPDATE SET"
             "   status        = COALESCE(:status, processing_state.status),"
             "   configs_ok    = COALESCE(:configs_ok, processing_state.configs_ok),"
             "   configs_total = COALESCE(:configs_total, processing_state.configs_total),"
@@ -534,7 +634,8 @@ class CommitStore:
             {
                 "engine": engine,
                 "platform": platform,
-                "commit_id": commit_id,
+                "embedder_id": key.embedder_id,
+                "commit_id": key.commit_id,
                 "bot": self._bot,
                 "status": status,
                 "configs_ok": configs_ok,
@@ -560,10 +661,11 @@ class CommitStore:
         marked pushed and never sent. On a bus consumer the metadata comes from
         the entry rather than from git, so this is the normal path.
         """
+        key = CommitKey.from_commit(commit)
         self._upsert_commit(
             engine,
             commit["hash"],
-            int(commit["commit_id"]),
+            key,
             commit.get("date", ""),
             int(commit.get("timestamp", 0)),
             commit.get("title", ""),
@@ -571,18 +673,18 @@ class CommitStore:
         self._mark_done(
             engine,
             platform,
-            int(commit["commit_id"]),
+            key,
             status,
             configs_ok,
             configs_total,
         )
         self.conn.commit()
 
-    def get_status(self, engine: str, platform: str, commit_id: int) -> str | None:
+    def get_status(self, engine: str, platform: str, key) -> str | None:
         row = self.conn.execute(
             "SELECT status FROM processing_state"
-            " WHERE engine=? AND platform=? AND commit_id=?",
-            (engine, platform, commit_id),
+            " WHERE engine=? AND platform=? AND embedder_id=? AND commit_id=?",
+            (engine, platform, *CommitKey.of(key)),
         ).fetchone()
         return row[0] if row else None
 
@@ -599,22 +701,31 @@ class CommitStore:
         return self._db_path
 
     @contextlib.contextmanager
-    def result_locks(self, engine, platform, commit_ids, **kwargs):
+    def result_locks(self, engine, platform, keys, **kwargs):
         from .durability import FileLock, identity_digest
 
         with contextlib.ExitStack() as stack:
-            for cid in sorted(set(commit_ids)):
-                key = (engine, platform, cid)
-                if key in self._result_locks:
+            for key in sorted({CommitKey.of(k) for k in keys}):
+                ident = (engine, platform, key)
+                if ident in self._result_locks:
                     continue
                 path = self._db_path.parent / ("." + self._db_path.name + ".locks")
+                # to_json, so a scalar key digests to the same lock file it
+                # always did: delivery takes these too, by commit number.
                 stack.enter_context(
                     FileLock(
-                        path / (identity_digest(json.dumps(key)) + ".lock"), **kwargs
+                        path
+                        / (
+                            identity_digest(
+                                json.dumps((engine, platform, key.to_json()))
+                            )
+                            + ".lock"
+                        ),
+                        **kwargs,
                     )
                 )
-                self._result_locks[key] = True
-                stack.callback(self._result_locks.pop, key)
+                self._result_locks[ident] = True
+                stack.callback(self._result_locks.pop, ident)
             yield
 
     def pending_attempt(self, source):
@@ -634,91 +745,86 @@ class CommitStore:
         self.conn.execute("DELETE FROM delivery_attempts WHERE source=?", (source,))
         self.conn.commit()
 
-    def check_pending(self, engine, platform, commit_ids):
+    def check_pending(self, engine, platform, keys):
+        wanted = {CommitKey.of(k) for k in keys}
         for row in self.conn.execute("SELECT record FROM delivery_attempts"):
             record = json.loads(row[0])
             if (
                 record["engine"] == engine
                 and record["platform"] == platform
-                and record["unit"] in commit_ids
+                and CommitKey.of(record["unit"]) in wanted
             ):
                 raise StoreError(
                     f"unresolved delivery attempt {record['attempt']} protects "
                     f"{engine}/{platform}/{record['unit']}; retry delivery first"
                 )
 
-    def clear_scores(self, engine: str, platform: str, commit_ids: list[int]):
-        with self.result_locks(engine, platform, commit_ids):
-            self.check_pending(engine, platform, commit_ids)
-            self._clear_scores(engine, platform, commit_ids)
+    def clear_scores(self, engine: str, platform: str, keys: list):
+        with self.result_locks(engine, platform, keys):
+            self.check_pending(engine, platform, keys)
+            self._clear_scores(engine, platform, keys)
 
-    def _clear_scores(self, engine: str, platform: str, commit_ids: list[int]):
+    def _clear_scores(self, engine: str, platform: str, keys: list):
         """Delete only the scores of commits, leaving their state alone.
 
         For resuming an interrupted commit: ``scores`` is INSERT OR IGNORE with
         ``run`` in the primary key, so a retry that kept the partial rows would
         leave one run number half measured on each side of the interrupt.
         """
-        if not commit_ids:
+        if not keys:
             return
-        ph = ",".join("?" * len(commit_ids))
+        where, params = _key_filter([CommitKey.of(k) for k in keys])
         self.conn.execute(
-            f"DELETE FROM scores WHERE engine=? AND platform=? AND commit_id IN ({ph})",
-            [engine, platform, *commit_ids],
+            f"DELETE FROM scores WHERE engine=? AND platform=? AND {where}",
+            [engine, platform, *params],
         )
         self.conn.commit()
 
-    def clear_range(self, engine: str, platform: str, commit_ids: list[int]):
-        with self.result_locks(engine, platform, commit_ids):
-            self.check_pending(engine, platform, commit_ids)
-            self._clear_range(engine, platform, commit_ids)
+    def clear_range(self, engine: str, platform: str, keys: list):
+        with self.result_locks(engine, platform, keys):
+            self.check_pending(engine, platform, keys)
+            self._clear_range(engine, platform, keys)
 
-    def _clear_range(self, engine: str, platform: str, commit_ids: list[int]):
+    def _clear_range(self, engine: str, platform: str, keys: list):
         """Delete scores, processing state, and push state for specific commits.
 
         Clearing push_state too means any re-benchmarked commit will be
         re-pushed on the next push cycle.
         """
-        if not commit_ids:
+        if not keys:
             return
-        ph = ",".join("?" * len(commit_ids))
+        where, params = _key_filter([CommitKey.of(k) for k in keys])
+        for table in ("scores", "processing_state", "push_state"):
+            self.conn.execute(
+                f"DELETE FROM {table} WHERE engine=? AND platform=? AND {where}",
+                [engine, platform, *params],
+            )
         self.conn.execute(
-            f"DELETE FROM scores WHERE engine=? AND platform=? AND commit_id IN ({ph})",
-            [engine, platform, *commit_ids],
-        )
-        self.conn.execute(
-            f"DELETE FROM processing_state WHERE engine=? AND platform=? AND commit_id IN ({ph})",
-            [engine, platform, *commit_ids],
-        )
-        self.conn.execute(
-            f"DELETE FROM push_state WHERE engine=? AND platform=? AND commit_id IN ({ph})",
-            [engine, platform, *commit_ids],
-        )
-        self.conn.execute(
-            f"DELETE FROM run_env WHERE engine=? AND commit_id IN ({ph})",
-            [engine, *commit_ids],
+            f"DELETE FROM run_env WHERE engine=? AND {where}",
+            [engine, *params],
         )
         self.conn.commit()
 
     def get_all_commits(self, engine: str) -> list[sqlite3.Row]:
-        """All commits with metadata, ordered by commit_id."""
+        """All commits with metadata, in key order."""
         return self.conn.execute(
-            "SELECT hash, commit_id, date, timestamp, title FROM commits"
+            "SELECT hash, embedder_id, commit_id, date, timestamp, title FROM commits"
             " WHERE engine=? AND commit_id IS NOT NULL"
-            " ORDER BY commit_id",
+            " ORDER BY embedder_id, commit_id",
             (engine,),
         ).fetchall()
 
-    def get_commits_in_range(
-        self, engine: str, after_id: int, up_to_id: int
-    ) -> list[sqlite3.Row]:
-        """All commits with after_id < commit_id <= up_to_id, ordered by commit_id."""
+    def get_commits_in_range(self, engine: str, after, up_to) -> list[sqlite3.Row]:
+        """All commits with after < key <= up_to, in key order."""
+        after = CommitKey.of(after)
+        up_to = CommitKey.of(up_to)
         return self.conn.execute(
-            "SELECT hash, commit_id, date, timestamp, title FROM commits"
+            "SELECT hash, embedder_id, commit_id, date, timestamp, title FROM commits"
             " WHERE engine=? AND commit_id IS NOT NULL"
-            " AND commit_id > ? AND commit_id <= ?"
-            " ORDER BY commit_id",
-            (engine, after_id, up_to_id),
+            " AND (embedder_id, commit_id) > (?, ?)"
+            " AND (embedder_id, commit_id) <= (?, ?)"
+            " ORDER BY embedder_id, commit_id",
+            (engine, *after, *up_to),
         ).fetchall()
 
     # --- Scores ---
@@ -727,20 +833,22 @@ class CommitStore:
         self,
         engine: str,
         platform: str,
-        commit_id: int,
+        key,
         timestamp: int,
         scores: list[dict],
     ):
         """Insert raw score rows. Each dict: {suite, flags, benchmark, metric, run, score}."""
+        key = CommitKey.of(key)
         self.conn.executemany(
-            "INSERT OR IGNORE INTO scores (engine, platform, commit_id, suite, flags,"
-            " benchmark, metric, run, score, timestamp, bot)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO scores (engine, platform, embedder_id, commit_id,"
+            " suite, flags, benchmark, metric, run, score, timestamp, bot)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 (
                     engine,
                     platform,
-                    commit_id,
+                    key.embedder_id,
+                    key.commit_id,
                     s["suite"],
                     s["flags"],
                     s["benchmark"],
@@ -756,11 +864,15 @@ class CommitStore:
         self.conn.commit()
 
     def bulk_insert_scores(self, engine: str, platform: str, rows: list[tuple]):
-        """Insert raw score tuples: (commit_id, suite, flags, benchmark, metric, run, score, timestamp)."""
+        """Insert raw score tuples: (commit_id, suite, flags, benchmark, metric, run, score, timestamp).
+
+        The interchange CSV's shape, which is scalar: an imported row is
+        embedder 0.
+        """
         self.conn.executemany(
-            "INSERT OR IGNORE INTO scores (engine, platform, commit_id, suite, flags,"
-            " benchmark, metric, run, score, timestamp, bot)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO scores (engine, platform, embedder_id, commit_id,"
+            " suite, flags, benchmark, metric, run, score, timestamp, bot)"
+            " VALUES (?,?,0,?,?,?,?,?,?,?,?,?)",
             [(engine, platform, *r, self._bot) for r in rows],
         )
         self.conn.commit()
@@ -773,11 +885,11 @@ class CommitStore:
         benchmark: str,
         metric: str,
     ) -> list[sqlite3.Row]:
-        """Return (commit_id, score) rows ordered by commit_id for one benchmark series."""
+        """Return (embedder_id, commit_id, score) rows in key order for one series."""
         return self.conn.execute(
-            "SELECT commit_id, score FROM scores"
+            "SELECT embedder_id, commit_id, score FROM scores"
             " WHERE engine=? AND suite=? AND flags=? AND benchmark=? AND metric=?"
-            " ORDER BY commit_id",
+            " ORDER BY embedder_id, commit_id",
             (engine, suite, flags, benchmark, metric),
         ).fetchall()
 
@@ -793,6 +905,10 @@ class CommitStore:
         Benchmarks are filtered per suite so that e.g. js2-only names don't
         leak into js3. ``commit_ids`` restricts the export; it is materialised
         in a temp table to sidestep SQLite's bound-parameter limit.
+
+        Embedder 0 only, like everything delivery reads: the perf database
+        keys on a scalar commit number, and the projection of an embedded
+        series onto it is a decision not yet made.
         """
         clauses = []
         params: list = [engine, platform]
@@ -830,8 +946,10 @@ class CommitStore:
                 "       s.benchmark, s.metric, s.run, s.score, s.timestamp,"
                 "       c.hash, c.date, c.timestamp, c.title"
                 " FROM scores s"
-                " JOIN commits c ON s.engine = c.engine AND s.commit_id = c.commit_id"
-                f" WHERE s.engine = ? AND s.platform = ? AND ({where_suite})"
+                " JOIN commits c ON s.engine = c.engine"
+                "   AND s.embedder_id = c.embedder_id AND s.commit_id = c.commit_id"
+                f" WHERE s.engine = ? AND s.platform = ? AND s.embedder_id = 0"
+                f"   AND ({where_suite})"
                 f"{commit_filter}"
                 " ORDER BY s.commit_id, s.suite, s.flags, s.benchmark, s.metric, s.run",
                 params,
@@ -844,14 +962,16 @@ class CommitStore:
         """Score rows in the interchange CSV's column order, minus the bot.
 
         Filtered to the configured benchmark names, so an engine's ad-hoc or
-        renamed benchmarks stay out of a file meant to be read elsewhere.
+        renamed benchmarks stay out of a file meant to be read elsewhere. The
+        CSV is scalar, so embedder 0 only.
         """
         if not valid_names:
             return []
         placeholders = ",".join("?" * len(valid_names))
         rows = self.conn.execute(
             "SELECT suite, flags, benchmark, metric, commit_id, score"
-            f" FROM scores WHERE engine=? AND benchmark IN ({placeholders})"
+            f" FROM scores WHERE engine=? AND embedder_id=0"
+            f" AND benchmark IN ({placeholders})"
             " ORDER BY commit_id, suite, benchmark, metric, run",
             (engine, *sorted(valid_names)),
         ).fetchall()
@@ -867,7 +987,7 @@ class CommitStore:
 
     # --- Provenance ---
 
-    def record_run_env(self, engine: str, commit_id: int, env: dict) -> None:
+    def record_run_env(self, engine: str, key, env: dict) -> None:
         """What produced one commit's numbers, for the bot that measured them.
 
         The builder's toolchain matters because an Xcode or macOS update on it
@@ -879,6 +999,7 @@ class CommitStore:
         beside archive-built neighbours, and that mixture should be visible
         rather than forbidden in one command and silently allowed in another.
         """
+        key = CommitKey.of(key)
         # runs is the only nullable column: the rest are NOT NULL with a text
         # default, so a caller that knows less than all of it still writes a row.
         defaults = {
@@ -905,18 +1026,20 @@ class CommitStore:
         ]
         assignments = ", ".join(f"{c}=excluded.{c}" for c in columns)
         self.conn.execute(
-            f"INSERT INTO run_env (engine, bot, commit_id, {', '.join(columns)},"
-            f" recorded_at) VALUES (?,?,?,{','.join('?' * len(columns))},?)"
-            f" ON CONFLICT(engine, bot, commit_id) DO UPDATE SET"
+            f"INSERT INTO run_env (engine, bot, embedder_id, commit_id,"
+            f" {', '.join(columns)}, recorded_at)"
+            f" VALUES (?,?,?,?,{','.join('?' * len(columns))},?)"
+            f" ON CONFLICT(engine, bot, embedder_id, commit_id) DO UPDATE SET"
             f" {assignments}, recorded_at=excluded.recorded_at",
-            (engine, self._bot or "", commit_id, *values, int(time.time())),
+            (engine, self._bot or "", *key, *values, int(time.time())),
         )
         self.conn.commit()
 
-    def get_run_env(self, engine: str, commit_id: int) -> sqlite3.Row | None:
+    def get_run_env(self, engine: str, key) -> sqlite3.Row | None:
         return self.conn.execute(
-            "SELECT * FROM run_env WHERE engine=? AND bot=? AND commit_id=?",
-            (engine, self._bot or "", commit_id),
+            "SELECT * FROM run_env"
+            " WHERE engine=? AND bot=? AND embedder_id=? AND commit_id=?",
+            (engine, self._bot or "", *CommitKey.of(key)),
         ).fetchone()
 
     def run_env_source_counts(self, engine: str, last: int = 50) -> dict[str, int]:
@@ -924,7 +1047,7 @@ class CommitStore:
         rows = self.conn.execute(
             "SELECT source, COUNT(*) FROM ("
             "  SELECT source FROM run_env WHERE engine=?"
-            "  ORDER BY commit_id DESC LIMIT ?"
+            "  ORDER BY embedder_id DESC, commit_id DESC LIMIT ?"
             ") GROUP BY source",
             (engine, last),
         ).fetchall()
@@ -937,36 +1060,40 @@ class CommitStore:
     # rebuilt every cycle forever, and what lets the frontier advance past it.
 
     def record_build_failure(
-        self, engine: str, commit_id: int, status: str, kind: str, log_path: str = ""
+        self, engine: str, key, status: str, kind: str, log_path: str = ""
     ) -> int:
         """Record a failed build attempt; returns the new attempt count."""
+        key = CommitKey.of(key)
         row = self.conn.execute(
-            "SELECT attempts FROM build_state WHERE engine=? AND commit_id=?",
-            (engine, commit_id),
+            "SELECT attempts FROM build_state"
+            " WHERE engine=? AND embedder_id=? AND commit_id=?",
+            (engine, *key),
         ).fetchone()
         attempts = (row[0] if row else 0) + 1
         self.conn.execute(
             "INSERT INTO build_state"
-            " (engine, commit_id, status, kind, log_path, attempts, last_attempt)"
-            " VALUES (?,?,?,?,?,?,?)"
-            " ON CONFLICT(engine, commit_id) DO UPDATE SET"
+            " (engine, embedder_id, commit_id, status, kind, log_path, attempts,"
+            "  last_attempt)"
+            " VALUES (?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(engine, embedder_id, commit_id) DO UPDATE SET"
             "   status=excluded.status, kind=excluded.kind,"
             "   log_path=excluded.log_path, attempts=excluded.attempts,"
             "   last_attempt=excluded.last_attempt",
-            (engine, commit_id, status, kind, log_path, attempts, int(time.time())),
+            (engine, *key, status, kind, log_path, attempts, int(time.time())),
         )
         self.conn.commit()
         return attempts
 
-    def set_build_status(self, engine: str, commit_id: int, status: str) -> None:
+    def set_build_status(self, engine: str, key, status: str) -> None:
         """Reclassify an existing failure without counting another attempt."""
         self.conn.execute(
-            "UPDATE build_state SET status=? WHERE engine=? AND commit_id=?",
-            (status, engine, commit_id),
+            "UPDATE build_state SET status=?"
+            " WHERE engine=? AND embedder_id=? AND commit_id=?",
+            (status, engine, *CommitKey.of(key)),
         )
         self.conn.commit()
 
-    def request_build_retry(self, engine: str, commit_id: int) -> bool:
+    def request_build_retry(self, engine: str, key) -> bool:
         """Allow one more attempt at a commit the frontier has moved past.
 
         Persisted rather than an effect of the command: entries above the
@@ -976,34 +1103,35 @@ class CommitStore:
         """
         cur = self.conn.execute(
             "UPDATE build_state SET status='retry_requested'"
-            " WHERE engine=? AND commit_id=?",
-            (engine, commit_id),
+            " WHERE engine=? AND embedder_id=? AND commit_id=?",
+            (engine, *CommitKey.of(key)),
         )
         self.conn.commit()
         return cur.rowcount > 0
 
-    def clear_build_state(self, engine: str, commit_id: int) -> None:
+    def clear_build_state(self, engine: str, key) -> None:
         self.conn.execute(
-            "DELETE FROM build_state WHERE engine=? AND commit_id=?",
-            (engine, commit_id),
+            "DELETE FROM build_state WHERE engine=? AND embedder_id=? AND commit_id=?",
+            (engine, *CommitKey.of(key)),
         )
         self.conn.commit()
 
-    def get_build_state(self, engine: str, commit_id: int) -> sqlite3.Row | None:
+    def get_build_state(self, engine: str, key) -> sqlite3.Row | None:
         return self.conn.execute(
-            "SELECT * FROM build_state WHERE engine=? AND commit_id=?",
-            (engine, commit_id),
+            "SELECT * FROM build_state WHERE engine=? AND embedder_id=? AND commit_id=?",
+            (engine, *CommitKey.of(key)),
         ).fetchone()
 
-    def build_retries_requested(self, engine: str) -> list[int]:
+    def build_retries_requested(self, engine: str) -> list[CommitKey]:
         rows = self.conn.execute(
-            "SELECT commit_id FROM build_state"
-            " WHERE engine=? AND status='retry_requested' ORDER BY commit_id",
+            "SELECT embedder_id, commit_id FROM build_state"
+            " WHERE engine=? AND status='retry_requested'"
+            " ORDER BY embedder_id, commit_id",
             (engine,),
         ).fetchall()
-        return [r[0] for r in rows]
+        return [CommitKey.from_commit(r) for r in rows]
 
-    def max_terminal_build_id(self, engine: str) -> int | None:
+    def max_terminal_build_key(self, engine: str) -> CommitKey | None:
         """Highest commit with a terminal build failure.
 
         Non-terminal rows are excluded by construction: including them would
@@ -1013,26 +1141,34 @@ class CommitStore:
         since that leaves a non-terminal row.
         """
         row = self.conn.execute(
-            "SELECT MAX(commit_id) FROM build_state"
-            " WHERE engine=? AND status IN ('compile_failed', 'infra_burned')",
+            "SELECT embedder_id, commit_id FROM build_state"
+            " WHERE engine=? AND status IN ('compile_failed', 'infra_burned')"
+            " ORDER BY embedder_id DESC, commit_id DESC LIMIT 1",
             (engine,),
         ).fetchone()
-        return row[0] if row and row[0] is not None else None
+        return CommitKey.from_commit(row) if row else None
 
-    def build_failures(
-        self, engine: str, above: int | None = None
-    ) -> list[sqlite3.Row]:
+    def build_failures(self, engine: str, above=None) -> list[sqlite3.Row]:
         """Terminal failures, for the state file and the circuit breaker."""
+        above = CommitKey.of(above) if above is not None else None
         return self.conn.execute(
-            "SELECT commit_id, status, kind, log_path, attempts, last_attempt"
+            "SELECT embedder_id, commit_id, status, kind, log_path, attempts,"
+            "       last_attempt"
             " FROM build_state"
             " WHERE engine=? AND status IN ('compile_failed', 'infra_burned')"
-            "   AND (? IS NULL OR commit_id > ?)"
-            " ORDER BY commit_id",
-            (engine, above, above),
+            "   AND (? IS NULL OR (embedder_id, commit_id) > (?, ?))"
+            " ORDER BY embedder_id, commit_id",
+            (
+                engine,
+                above.commit_id if above else None,
+                above.embedder_id if above else None,
+                above.commit_id if above else None,
+            ),
         ).fetchall()
 
     # --- Push state ---
+    #
+    # Scalar, like the rest of delivery: see commit_ids_missing_commit_row.
 
     def unpushed_commit_ids(
         self, engine: str, platform: str, limit: int | None = None
@@ -1042,8 +1178,9 @@ class CommitStore:
             "SELECT ps.commit_id FROM processing_state ps"
             " LEFT JOIN push_state pu"
             "   ON pu.engine=ps.engine AND pu.platform=ps.platform"
-            "  AND pu.commit_id=ps.commit_id"
-            " WHERE ps.engine=? AND ps.platform=? AND pu.commit_id IS NULL"
+            "  AND pu.embedder_id=ps.embedder_id AND pu.commit_id=ps.commit_id"
+            " WHERE ps.engine=? AND ps.platform=? AND ps.embedder_id=0"
+            "   AND pu.commit_id IS NULL"
             " ORDER BY ps.commit_id LIMIT ?",
             (engine, platform, limit if limit is not None else -1),
         ).fetchall()
@@ -1056,7 +1193,8 @@ class CommitStore:
         now = int(time.time())
         self.conn.executemany(
             "INSERT OR REPLACE INTO push_state"
-            " (engine, platform, commit_id, pushed_at, bot) VALUES (?,?,?,?,?)",
+            " (engine, platform, embedder_id, commit_id, pushed_at, bot)"
+            " VALUES (?,?,0,?,?,?)",
             [(engine, platform, cid, now, self._bot) for cid in commit_ids],
         )
         self.conn.commit()
@@ -1068,13 +1206,22 @@ class CommitStore:
         )
         self.conn.commit()
 
-    def max_done_commit_id(self, engine: str, platform: str) -> int | None:
-        """Return the highest commit_id processed on this platform, or None."""
+    def max_done_key(
+        self, engine: str, platform: str, *, embedder_id: int | None = None
+    ) -> CommitKey | None:
+        """The highest key processed on this platform, or None.
+
+        ``embedder_id`` restricts to one embedder's rows: the git-driven
+        frontier is a scalar id and must not read a key from another series
+        as its own.
+        """
         row = self.conn.execute(
-            "SELECT MAX(commit_id) FROM processing_state WHERE engine=? AND platform=?",
-            (engine, platform),
+            "SELECT embedder_id, commit_id FROM processing_state"
+            " WHERE engine=? AND platform=? AND (? IS NULL OR embedder_id=?)"
+            " ORDER BY embedder_id DESC, commit_id DESC LIMIT 1",
+            (engine, platform, embedder_id, embedder_id),
         ).fetchone()
-        return row[0] if row and row[0] is not None else None
+        return CommitKey.from_commit(row) if row else None
 
     def close(self):
         self.conn.close()

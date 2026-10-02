@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from slipstream.models import CommitKey
+
 
 class TestCommitOperations:
     def test_insert_and_query_commits(self, store):
@@ -90,16 +92,18 @@ class TestProcessingState:
         assert store.is_done("v8", "arm64", 200)
         assert store.get_series("v8", "js3", "default", "b", "m") == []
 
-    def test_max_done_commit_id(self, store):
-        assert store.max_done_commit_id("v8", "arm64") is None
+    def test_max_done_key(self, store):
+        assert store.max_done_key("v8", "arm64") is None
 
         store.insert_commits("v8", [{"hash": "a"}, {"hash": "b"}])
         store.update_commit_metadata("v8", "a", 100, "d", 0, "t")
         store.update_commit_metadata("v8", "b", 200, "d", 0, "t")
         store.mark_done("v8", "arm64", 100)
         store.mark_done("v8", "arm64", 200)
-        assert store.max_done_commit_id("v8", "arm64") == 200
-        assert store.max_done_commit_id("v8", "x86_64") is None
+        assert store.max_done_key("v8", "arm64") == CommitKey(0, 200)
+        assert store.max_done_key("v8", "arm64", embedder_id=0) == CommitKey(0, 200)
+        assert store.max_done_key("v8", "arm64", embedder_id=7) is None
+        assert store.max_done_key("v8", "x86_64") is None
 
 
 class TestScores:
@@ -525,6 +529,142 @@ class TestMigration:
         for s in (a, b):
             assert s.get_status("v8", "arm64", 100) == "ok"
             s.close()
+
+
+class TestEmbedderKeyMigration:
+    """A v2 db keys rows by commit_id alone; v3 puts embedder_id ahead of it.
+
+    SQLite cannot ALTER a primary key, so every keyed table is rebuilt. What
+    matters: no row is lost, every old row is embedder 0, the old index names
+    are gone, and the same commit_id under a second embedder is a new row.
+    """
+
+    def _v2_db(self, path):
+        import sqlite3
+
+        conn = sqlite3.connect(str(path))
+        conn.executescript("""
+            CREATE TABLE commits (
+                engine TEXT NOT NULL, hash TEXT NOT NULL, commit_id INTEGER,
+                date TEXT NOT NULL DEFAULT '', timestamp INTEGER NOT NULL DEFAULT 0,
+                title TEXT NOT NULL DEFAULT '', PRIMARY KEY (engine, hash));
+            CREATE UNIQUE INDEX idx_commit_id ON commits (engine, commit_id)
+                WHERE commit_id IS NOT NULL;
+            CREATE TABLE scores (
+                engine TEXT NOT NULL, platform TEXT NOT NULL, commit_id INTEGER NOT NULL,
+                suite TEXT NOT NULL, flags TEXT NOT NULL DEFAULT 'default',
+                benchmark TEXT NOT NULL, metric TEXT NOT NULL, run INTEGER NOT NULL,
+                score REAL NOT NULL, timestamp INTEGER NOT NULL, bot TEXT,
+                PRIMARY KEY (engine, platform, commit_id, suite, flags, benchmark, metric, run));
+            CREATE INDEX idx_scores_lookup
+                ON scores (engine, suite, flags, benchmark, metric, commit_id);
+            CREATE TABLE processing_state (
+                engine TEXT NOT NULL, platform TEXT NOT NULL, commit_id INTEGER NOT NULL,
+                bot TEXT, status TEXT NOT NULL DEFAULT 'ok',
+                configs_ok INTEGER, configs_total INTEGER,
+                PRIMARY KEY (engine, platform, commit_id));
+            CREATE TABLE push_state (
+                engine TEXT NOT NULL, platform TEXT NOT NULL, commit_id INTEGER NOT NULL,
+                pushed_at INTEGER NOT NULL, bot TEXT,
+                PRIMARY KEY (engine, platform, commit_id));
+            CREATE TABLE run_env (
+                engine TEXT NOT NULL, bot TEXT NOT NULL DEFAULT '',
+                commit_id INTEGER NOT NULL, source TEXT NOT NULL DEFAULT 'local',
+                runs INTEGER, run_configs TEXT NOT NULL DEFAULT '[]',
+                harness_revs TEXT NOT NULL DEFAULT '{}', hw_model TEXT NOT NULL DEFAULT '',
+                os_version TEXT NOT NULL DEFAULT '', toolchain TEXT NOT NULL DEFAULT '',
+                build_cfg_hash TEXT NOT NULL DEFAULT '',
+                slipstream_version TEXT NOT NULL DEFAULT '',
+                recorded_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (engine, bot, commit_id));
+            CREATE TABLE build_state (
+                engine TEXT NOT NULL, commit_id INTEGER NOT NULL, status TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT '', log_path TEXT NOT NULL DEFAULT '',
+                attempts INTEGER NOT NULL DEFAULT 0, last_attempt INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (engine, commit_id));
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta VALUES ('schema_version', '2');
+            INSERT INTO commits VALUES ('v8','abc',100,'2026-01-01',17,'t100');
+            INSERT INTO commits VALUES ('v8','def',101,'2026-01-02',18,'t101');
+            INSERT INTO scores VALUES ('v8','arm64',100,'js3','default','b','Total-Score',1,1.0,0,'box1');
+            INSERT INTO scores VALUES ('v8','arm64',101,'js3','default','b','Total-Score',1,2.0,0,'box1');
+            INSERT INTO processing_state VALUES ('v8','arm64',100,'box1','ok',1,1);
+            INSERT INTO processing_state VALUES ('v8','arm64',101,'box1','failed',0,1);
+            INSERT INTO push_state VALUES ('v8','arm64',100,17,'box1');
+            INSERT INTO run_env (engine, bot, commit_id) VALUES ('v8','box1',100);
+            INSERT INTO build_state VALUES ('v8',101,'compile_failed','compile','/log',2,5);
+        """)
+        conn.commit()
+        conn.close()
+
+    def _open(self, tmp_path):
+        from slipstream.store import CommitStore
+
+        db = tmp_path / "v2.db"
+        self._v2_db(db)
+        return CommitStore(db, bot="box1")
+
+    def test_every_keyed_table_gains_embedder_id_at_zero(self, tmp_path):
+        from slipstream.store import _KEYED_TABLES
+
+        s = self._open(tmp_path)
+        for table in _KEYED_TABLES:
+            info = {r[1]: r for r in s.conn.execute(f"PRAGMA table_info({table})")}
+            assert "embedder_id" in info, table
+            assert info["embedder_id"][5] > 0, f"{table}: embedder_id not in the key"
+            rows = s.conn.execute(
+                f"SELECT DISTINCT embedder_id FROM {table}"
+            ).fetchall()
+            assert [r[0] for r in rows] in ([0], []), table
+        assert s.get_meta("schema_version") == "3"
+        s.close()
+
+    def test_rows_survive_and_read_back_through_the_api(self, tmp_path):
+        s = self._open(tmp_path)
+        assert s.conn.execute("SELECT COUNT(*) FROM scores").fetchone()[0] == 2
+        assert s.is_done("v8", "arm64", 100) and s.is_done("v8", "arm64", 101)
+        assert s.get_status("v8", "arm64", 101) == "failed"
+        assert s.max_done_key("v8", "arm64") == CommitKey(0, 101)
+        assert s.unpushed_commit_ids("v8", "arm64") == [101]
+        series = s.get_series("v8", "js3", "default", "b", "Total-Score")
+        assert [(r["embedder_id"], r["commit_id"], r["score"]) for r in series] == [
+            (0, 100, 1.0),
+            (0, 101, 2.0),
+        ]
+        assert [r["commit_id"] for r in s.build_failures("v8")] == [101]
+        s.close()
+
+    def test_old_index_names_are_gone_and_new_ones_exist(self, tmp_path):
+        s = self._open(tmp_path)
+        names = {
+            r[0]
+            for r in s.conn.execute("SELECT name FROM sqlite_master WHERE type='index'")
+        }
+        assert not names & {"idx_commit_id", "idx_scores_lookup"}
+        assert {"idx_commit_key", "idx_scores_series"} <= names
+        s.close()
+
+    def test_the_same_commit_id_under_another_embedder_is_a_new_row(self, tmp_path):
+        s = self._open(tmp_path)
+        s.mark_done("v8", "arm64", CommitKey(7, 100))
+        assert s.is_done("v8", "arm64", CommitKey(7, 100))
+        assert s.max_done_key("v8", "arm64") == CommitKey(7, 100)
+        assert s.max_done_key("v8", "arm64", embedder_id=0) == CommitKey(0, 101)
+        s.clear_range("v8", "arm64", [CommitKey(0, 100), CommitKey(0, 101)])
+        assert s.is_done("v8", "arm64", CommitKey(7, 100))
+        assert not s.is_done("v8", "arm64", 100)
+        s.close()
+
+    def test_reopening_is_a_no_op(self, tmp_path):
+        s = self._open(tmp_path)
+        s.close()
+        from slipstream.store import CommitStore
+
+        s = CommitStore(tmp_path / "v2.db", bot="box1")
+        cols = [r[1] for r in s.conn.execute("PRAGMA table_info(scores)")]
+        assert cols.count("embedder_id") == 1
+        assert s.conn.execute("SELECT COUNT(*) FROM scores").fetchone()[0] == 2
+        s.close()
 
 
 class TestBotGuardSurvivesALockedDb:

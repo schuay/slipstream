@@ -33,7 +33,8 @@ class LocalDbSource:
 
     def acknowledged(self, unit):
         row = self.store.conn.execute(
-            "SELECT 1 FROM push_state WHERE engine=? AND platform=? AND commit_id=?",
+            "SELECT 1 FROM push_state WHERE engine=? AND platform=? "
+            "AND embedder_id=0 AND commit_id=?",
             (self.engine, self.platform, unit),
         ).fetchone()
         return row is not None
@@ -59,11 +60,13 @@ class LocalDbSource:
         # characters; budget four bytes per character plus CSV escaping overhead.
         size = self.store.conn.execute(
             "SELECT COUNT(*), COALESCE(SUM(length(suite)+length(flags)+length(benchmark)"
-            "+length(metric)+length(engine)+length(platform)+160), 0) FROM scores WHERE engine=? AND platform=? AND commit_id=?",
+            "+length(metric)+length(engine)+length(platform)+160), 0) FROM scores "
+            "WHERE engine=? AND platform=? AND embedder_id=0 AND commit_id=?",
             (self.engine, self.platform, unit),
         ).fetchone()
         meta = self.store.conn.execute(
-            "SELECT length(hash)+length(date)+length(title)+32 FROM commits WHERE engine=? AND commit_id=?",
+            "SELECT length(hash)+length(date)+length(title)+32 FROM commits "
+            "WHERE engine=? AND embedder_id=0 AND commit_id=?",
             (self.engine, unit),
         ).fetchone()
         if (

@@ -30,6 +30,7 @@ from .bus import Bus, BuilderState, BusError, Entry, sha256_file
 from .collector import BenchCollector, BuildStepError, FetchError
 from .config import Config, EngineConfig
 from .lock import MachineLock
+from .models import CommitKey
 
 # A stalled engine still retries, or the guard against a permanent burn becomes
 # a permanent stall. Each attempt is a full checkout, sync and compile holding
@@ -54,7 +55,7 @@ class BuildError(RuntimeError):
 
 @dataclass
 class BuildResult:
-    commit_id: int | None = None
+    key: CommitKey | None = None
     published: bool = False
     failed_kind: str | None = None
     status: str | None = None
@@ -149,16 +150,16 @@ class Builder:
 
     # --- resolving what to build ---
 
-    def frontier(self, engine_name: str) -> int | None:
-        """The highest commit this builder has finished with.
+    def frontier(self, engine_name: str) -> CommitKey | None:
+        """The highest key this builder has finished with.
 
         Published entries and terminal build failures both count, so a compile
         failure at the head is not rebuilt every cycle. [build] from is
         consulted only when there is neither, so a restart cannot rewind.
         """
-        ids = self.bus.commit_ids(engine_name)
-        published = ids[-1] if ids else None
-        failed = self.store.max_terminal_build_id(engine_name)
+        keys = self.bus.keys(engine_name)
+        published = keys[-1] if keys else None
+        failed = self.store.max_terminal_build_key(engine_name)
         candidates = [c for c in (published, failed) if c is not None]
         if candidates:
             return max(candidates)
@@ -171,8 +172,8 @@ class Builder:
         leaves no row there, so counting rows alone would trip on three
         unrelated outages months apart and stall a healthy engine.
         """
-        ids = self.bus.commit_ids(engine_name)
-        floor = ids[-1] if ids else self.cfg.build.start_from.get(engine_name)
+        keys = self.bus.keys(engine_name)
+        floor = keys[-1] if keys else self.cfg.build.start_from.get(engine_name)
         if floor is None:
             # Nothing published and nowhere told to start: there is no history
             # to be consecutive with, and build_failures with no bound would
@@ -192,8 +193,11 @@ class Builder:
         anyone retries, so the frontier rule would never pick it up again.
         """
         engine = self.cfg.engines[engine_name]
-        for commit_id in self.store.build_retries_requested(engine_name):
-            commit = self.collector.commit_metadata_for_id(engine, commit_id)
+        # The collector resolves scalar ids in the engine's own checkout, so
+        # the key's commit_id is what it is asked for; an engine built inside
+        # another's tree gets its own resolver, not this path.
+        for key in self.store.build_retries_requested(engine_name):
+            commit = self.collector.commit_metadata_for_id(engine, key.commit_id)
             if commit:
                 return commit
         frontier = self.frontier(engine_name)
@@ -202,7 +206,7 @@ class Builder:
                 f"{engine_name} has no build history and no [build] from entry; "
                 f"set one to say where to start"
             )
-        return self.collector.next_commit_after(engine, frontier)
+        return self.collector.next_commit_after(engine, frontier.commit_id)
 
     # --- one commit ---
 
@@ -252,25 +256,26 @@ class Builder:
             self._publish_state(engine_name, state)
             return BuildResult()
 
-        commit_id = int(commit["commit_id"])
+        key = CommitKey.from_commit(commit)
         state.in_flight = {
-            "commit_id": commit_id,
+            "commit_id": key.commit_id,
+            "embedder_id": key.embedder_id,
             "phase": "build",
             "started_at": time.time(),
         }
         self._publish_state(engine_name, state)
 
-        row = self.store.get_build_state(engine_name, commit_id)
+        row = self.store.get_build_state(engine_name, key)
         was_retry = row is not None and row["status"] == "retry_requested"
-        log_path = self.cfg.logs_dir / f"build-{engine_name}-{commit_id}.log"
+        log_path = self.cfg.logs_dir / f"build-{engine_name}-{key}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         started = time.time()
-        self.log(f"{engine_name}: building {commit_id} ({commit['hash'][:8]})")
+        self.log(f"{engine_name}: building {key} ({commit['hash'][:8]})")
         failure = self.collector.build_at(engine, commit["hash"], log_path)
         if failure is not None:
             return self._record_failure(
                 engine_name,
-                commit_id,
+                key,
                 failure,
                 log_path,
                 state,
@@ -279,7 +284,8 @@ class Builder:
             )
 
         state.in_flight = {
-            "commit_id": commit_id,
+            "commit_id": key.commit_id,
+            "embedder_id": key.embedder_id,
             "phase": "package",
             "started_at": time.time(),
         }
@@ -292,7 +298,7 @@ class Builder:
             # Packaging is this machine's business, not the commit's.
             return self._record_failure(
                 engine_name,
-                commit_id,
+                key,
                 BuildStepError("package", 1),
                 log_path,
                 state,
@@ -301,33 +307,36 @@ class Builder:
                 message=str(e),
             )
 
-        self.store.clear_build_state(engine_name, commit_id)
+        self.store.clear_build_state(engine_name, key)
         state.stall_retry_after = None
         dropped = self.bus.prune(
-            engine_name, self.cfg.build.retain_gb * GB, keep=entry.commit_id
+            engine_name, self.cfg.build.retain_gb * GB, keep=entry.key
         )
         if dropped:
             self.log(f"{engine_name}: retention dropped {len(dropped)} entries")
-            state.highest_dropped = max([state.highest_dropped or 0, *dropped])
+            state.highest_dropped = max(
+                k for k in (state.highest_dropped, *dropped) if k is not None
+            )
         state.stalled_since = None
         state.last_error = None
         state.in_flight = None
         self._publish_state(engine_name, state)
         self.log(
-            f"{engine_name}: published {commit_id} "
+            f"{engine_name}: published {key} "
             f"({entry.blob_bytes / MB:.0f}MB, {entry.build_secs}s)"
         )
-        return BuildResult(commit_id=commit_id, published=True)
+        return BuildResult(key=key, published=True)
 
     def _package_and_publish(
         self, engine: EngineConfig, commit: dict, build_secs: int
     ) -> Entry:
-        commit_id = int(commit["commit_id"])
-        blob = self.bus.tmp_blob(engine.name, commit_id)
+        key = CommitKey.from_commit(commit)
+        blob = self.bus.tmp_blob(engine.name, key)
         package(engine.require_src_dir(), engine.require_run_set(), blob)
         entry = Entry(
             engine=engine.name,
-            commit_id=commit_id,
+            commit_id=key.commit_id,
+            embedder_id=key.embedder_id,
             hash=commit["hash"],
             date=commit.get("date", ""),
             timestamp=int(commit.get("timestamp", 0)),
@@ -345,7 +354,7 @@ class Builder:
     def _record_failure(
         self,
         engine_name: str,
-        commit_id: int,
+        key: CommitKey,
         failure,
         log_path: Path,
         state: BuilderState,
@@ -359,7 +368,7 @@ class Builder:
         if kind == "compile":
             status = "compile_failed"
             attempts = self.store.record_build_failure(
-                engine_name, commit_id, status, kind, str(log_path)
+                engine_name, key, status, kind, str(log_path)
             )
         else:
             # A retry keeps its allowance while it still has attempts left.
@@ -369,7 +378,7 @@ class Builder:
             # absent from bus status too.
             pending = "retry_requested" if was_retry else "infra_retry"
             attempts = self.store.record_build_failure(
-                engine_name, commit_id, pending, kind, str(log_path)
+                engine_name, key, pending, kind, str(log_path)
             )
             status = pending
             if stalled:
@@ -384,10 +393,8 @@ class Builder:
                 status = "infra_burned"
                 # Reclassify the row this attempt just wrote rather than
                 # recording a second one, which would double-count the attempt.
-                self.store.set_build_status(engine_name, commit_id, status)
-        state.last_error = (
-            message or f"{kind} failed on {commit_id} (attempt {attempts})"
-        )
+                self.store.set_build_status(engine_name, key, status)
+        state.last_error = message or f"{kind} failed on {key} (attempt {attempts})"
         state.in_flight = None
         if self.consecutive_burns(engine_name) >= self.cfg.build.max_consecutive_burns:
             if state.stalled_since is None:
@@ -399,8 +406,8 @@ class Builder:
                 )
             self._arm_stall_backoff(state)
         self._publish_state(engine_name, state)
-        self.log(f"{engine_name}: {commit_id} {status} at {kind}, log {log_path}")
-        return BuildResult(commit_id=commit_id, failed_kind=kind, status=status)
+        self.log(f"{engine_name}: {key} {status} at {kind}, log {log_path}")
+        return BuildResult(key=key, failed_kind=kind, status=status)
 
     # --- stall backoff ---
 

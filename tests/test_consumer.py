@@ -15,6 +15,7 @@ from slipstream.bus import Bus, Entry, sha256_file
 from slipstream.collector import BenchCollector, BenchOutcome
 from slipstream.config import BusConfig, BusSource, EngineConfig
 from slipstream.consumer import BusConsumer, ConsumerError, ShaMismatch
+from keys import K1
 
 
 def _commit(commit_id):
@@ -114,7 +115,7 @@ def scored(setup, monkeypatch):
     seen = []
 
     def fake(engine, commit_id, runs, run_root):
-        seen.append((int(commit_id), Path(run_root)))
+        seen.append((commit_id.commit_id, Path(run_root)))
         return BenchOutcome(1, 1, 10)
 
     monkeypatch.setattr(setup.collector, "_run_benchmarks", fake)
@@ -157,7 +158,7 @@ class TestDraining:
             setup.publish(cid)
         assert _drain(setup) == 3
         assert [cid for cid, _ in scored] == [100, 101, 102]
-        assert setup.consumer.cursor(setup.source, "v8") == 102
+        assert setup.consumer.cursor(setup.source, "v8") == K1(102)
 
     def test_a_second_cycle_does_nothing(self, setup, scored):
         setup.publish(100)
@@ -169,7 +170,7 @@ class TestDraining:
         _drain(setup)
         setup.publish(101)
         assert _drain(setup) == 1
-        assert setup.consumer.cursor(setup.source, "v8") == 101
+        assert setup.consumer.cursor(setup.source, "v8") == K1(101)
 
     def test_a_done_commit_advances_without_fetching(self, setup, scored, monkeypatch):
         setup.publish(100)
@@ -187,7 +188,7 @@ class TestDraining:
         )
         _drain(setup)
         assert fetched == [101]
-        assert setup.consumer.cursor(setup.source, "v8") == 101
+        assert setup.consumer.cursor(setup.source, "v8") == K1(101)
 
     def test_a_stop_request_ends_the_drain(self, setup, scored):
         for cid in (100, 101):
@@ -207,7 +208,7 @@ class TestDraining:
         monkeypatch.setattr(setup.collector, "_run_benchmarks", fake)
         _drain(setup)
         assert seen["cursor_during"] is None
-        assert setup.consumer.cursor(setup.source, "v8") == 100
+        assert setup.consumer.cursor(setup.source, "v8") == K1(100)
 
     def test_a_dropped_entry_is_skipped_not_reported(self, setup, scored):
         """Retention between the listing and the read is not an error."""
@@ -344,7 +345,7 @@ class TestBenchState:
             setup.publish(cid)
         _drain(setup)
         state = setup.bus.read_bench_state("v8")
-        assert state.cursor == 101 and state.lag == 0
+        assert state.cursor == K1(101) and state.lag == 0
         assert state.bot == setup.cfg.bot_name
         assert state.status_counts == {"ok": 2}
         assert state.env["harness"] == {"js3": "abc1234"}
@@ -356,14 +357,14 @@ class TestBenchState:
         done = []
 
         def one_then_stop(engine, commit_id, runs, run_root):
-            done.append(int(commit_id))
+            done.append(commit_id.commit_id)
             return BenchOutcome(1, 1, 10)
 
         monkeypatch.setattr(setup.collector, "_run_benchmarks", one_then_stop)
         _drain(setup, should_stop=lambda: bool(done))
         state = setup.bus.read_bench_state("v8")
         assert done == [100]
-        assert state.cursor == 100 and state.lag == 2
+        assert state.cursor == K1(100) and state.lag == 2
 
     def test_since_is_kept_while_the_environment_is_unchanged(self, setup, scored):
         setup.publish(100)
@@ -405,7 +406,7 @@ class TestCursorRecovery:
         scored.clear()
         _drain(setup)
         assert scored == [], "the walk back up re-benched done commits"
-        assert setup.consumer.cursor(setup.source, "v8") == 101
+        assert setup.consumer.cursor(setup.source, "v8") == K1(101)
 
 
 class TestUnpackSafety:
@@ -465,7 +466,7 @@ def test_one_box_builds_and_benches_through_the_bus(config, tmp_path, monkeypatc
         sources=[BusSource(name="local", root=str(bus_root), engines=["v8"])],
     )
     config.build.engines = ["v8"]
-    config.build.start_from = {"v8": 100}
+    config.build.start_from = {"v8": K1(100)}
     config.build.min_free_gb = 0.001
     config.bench.min_free_gb = 0.001
     config.engines["v8"] = EngineConfig(
@@ -513,7 +514,7 @@ def test_one_box_builds_and_benches_through_the_bus(config, tmp_path, monkeypatc
     assert commit_row["commit_id"] == 101 and commit_row["title"] == "commit 101"
     assert store.get_status("v8", config.platform, 101) == "ok"
     assert store.get_run_env("v8", 101)["source"] == "bus"
-    assert consumer.cursor(config.bus.sources[0], "v8") == 101
+    assert consumer.cursor(config.bus.sources[0], "v8") == K1(101)
 
 
 class TestTransportFailures:
@@ -546,7 +547,7 @@ class TestTransportFailures:
 
     def test_a_failed_listing_leaves_the_cursor_alone(self, setup, scored, monkeypatch):
         setup.publish(100)
-        assert self._drain_with(setup, monkeypatch, "ids_above") == 0
+        assert self._drain_with(setup, monkeypatch, "keys_above") == 0
         assert setup.consumer.cursor(setup.source, "v8") is None
         assert "listing" in setup.bus.read_bench_state("v8").last_error
 
@@ -565,7 +566,7 @@ class TestTransportFailures:
         setup.publish(101)
         setup.bus.entry_path("v8", 100).unlink()
         _drain(setup)
-        assert setup.consumer.cursor(setup.source, "v8") == 101
+        assert setup.consumer.cursor(setup.source, "v8") == K1(101)
 
 
 class TestRunsInTheEnvBlock:
@@ -615,11 +616,11 @@ class TestBatchedListing:
 
         class Counting:
             def __getattr__(self, name):
-                if name == "ids_above":
+                if name == "keys_above":
 
                     def listed(*a, **k):
                         listings.append(a)
-                        return real.ids_above(*a, **k)
+                        return real.keys_above(*a, **k)
 
                     return listed
                 return getattr(real, name)
@@ -766,7 +767,7 @@ class TestDrainReportsWhyItStopped:
 
         class Broken:
             def __getattr__(self, name):
-                if name == "ids_above":
+                if name == "keys_above":
 
                     def boom(*a, **k):
                         raise subprocess.CalledProcessError(255, "ssh")
@@ -843,7 +844,7 @@ class TestConsumerCircuitBreaker:
         seen = []
 
         def no_scores(engine, commit_id, runs, run_root):
-            seen.append(int(commit_id))
+            seen.append(commit_id.commit_id)
             return BenchOutcome(0, 3, 0)  # the binary never ran
 
         monkeypatch.setattr(setup.collector, "_run_benchmarks", no_scores)
@@ -958,7 +959,7 @@ class TestConsumerCircuitBreaker:
             store.insert_scores(
                 "v8",
                 setup.cfg.platform,
-                int(commit_id),
+                commit_id.commit_id,
                 0,
                 [
                     {
@@ -1019,14 +1020,14 @@ class TestDroppedEntriesAreRecorded:
         setup.publish(151)
         _drain(setup)
         state = setup.bus.read_bench_state("v8")
-        assert state.skipped_dropped == 150
+        assert state.skipped_dropped == K1(150)
         assert any("dropped by retention" in m for m in setup.consumer.logs)
 
         # The cursor is now past it, so highest_dropped alone proves nothing.
         setup.publish(152)
         _drain(setup)
         after = setup.bus.read_bench_state("v8")
-        assert after.cursor == 152 and after.skipped_dropped == 150
+        assert after.cursor == K1(152) and after.skipped_dropped == K1(150)
 
     def test_nothing_is_claimed_when_retention_stayed_behind(self, setup, scored):
         from slipstream.bus import BuilderState
@@ -1181,7 +1182,7 @@ class TestStallClearsWhenThereIsNothingLeft:
 
         class Broken:
             def __getattr__(self, name):
-                if name == "ids_above":
+                if name == "keys_above":
 
                     def boom(*a, **k):
                         raise subprocess.CalledProcessError(255, "ssh")
@@ -1256,7 +1257,7 @@ class TestEntryIsRevalidatedUnderTheLock:
         )
         assert result.error is None, result.error
         assert [cid for cid, _ in scored] == [101]
-        assert setup.bus.read_bench_state("v8").skipped_dropped == 100
+        assert setup.bus.read_bench_state("v8").skipped_dropped == K1(100)
 
 
 class TestTheLockIsNeverLeaked:

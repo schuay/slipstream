@@ -17,7 +17,7 @@ from rich.table import Table
 from rich import box
 
 from . import compat
-from .models import ChangePoint, CommitInfo
+from .models import ChangePoint, CommitInfo, CommitKey
 from .store import CommitStore
 
 console = Console()
@@ -35,6 +35,16 @@ def _stats(samples: list[float]) -> tuple[float, float]:
     return mean, stdev
 
 
+def _commit_info(row) -> CommitInfo:
+    return CommitInfo(
+        key=CommitKey.from_commit(row),
+        hash=row["hash"],
+        date=row["date"],
+        timestamp=row["timestamp"],
+        title=row["title"],
+    )
+
+
 class PerfAnalyzer:
     def __init__(
         self,
@@ -45,9 +55,9 @@ class PerfAnalyzer:
         self.min_change = min_change
         self.penalty = penalty
         self.min_effect_size = min_effect_size
-        # data[bench_key][metric][commit_id] = [scores]
+        # data[bench_key][metric][key] = [scores]
         self.data: dict = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-        self.commits: dict[int, CommitInfo] = {}
+        self.commits: dict[CommitKey, CommitInfo] = {}
         self._store: CommitStore | None = None
         self._engine: str | None = None
 
@@ -62,16 +72,13 @@ class PerfAnalyzer:
             suite, flags, benchmark, metric = row
             bench_key = f"{suite}[{flags}] {benchmark}"
             for sr in store.get_series(engine, suite, flags, benchmark, metric):
-                self.data[bench_key][metric][sr["commit_id"]].append(sr["score"])
+                self.data[bench_key][metric][CommitKey.from_commit(sr)].append(
+                    sr["score"]
+                )
 
         for row in store.get_all_commits(engine):
-            self.commits[row["commit_id"]] = CommitInfo(
-                id=row["commit_id"],
-                hash=row["hash"],
-                date=row["date"],
-                timestamp=row["timestamp"],
-                title=row["title"],
-            )
+            info = _commit_info(row)
+            self.commits[info.key] = info
 
     def load_results(self, csv_path: Path) -> bool:
         """Load from the interchange CSV (see slipstream.compat).
@@ -119,9 +126,9 @@ class PerfAnalyzer:
                         key = f"{row['b_type']}[{row['flags']}] {row['benchmark']}"
                     else:
                         key = row["benchmark"]
-                    self.data[key][row["score_type"]][int(row["commit_id"])].append(
-                        float(row["score"])
-                    )
+                    self.data[key][row["score_type"]][
+                        CommitKey.of(int(row["commit_id"]))
+                    ].append(float(row["score"]))
                 except (ValueError, KeyError):
                     continue
         return True
@@ -134,9 +141,9 @@ class PerfAnalyzer:
                     if not row or len(row) < 5:
                         continue
                     try:
-                        cid = int(row[0].strip())
-                        self.commits[cid] = CommitInfo(
-                            id=cid,
+                        key = CommitKey.of(int(row[0].strip()))
+                        self.commits[key] = CommitInfo(
+                            key=key,
                             hash=row[1].strip(),
                             date=row[2].strip(),
                             title=row[3].strip(),
@@ -310,8 +317,8 @@ class PerfAnalyzer:
                 ChangePoint(
                     benchmark=bench_key,
                     score_type=metric,
-                    commit_id=cids[bk],
-                    prev_commit_id=cids[bk - 1],
+                    key=cids[bk],
+                    prev_key=cids[bk - 1],
                     direction=direction,
                     magnitude=abs(cohens_d),
                     pct_change=pct_change,
@@ -354,27 +361,29 @@ class PerfAnalyzer:
         return results
 
     def _get_commit_range(self, cp: ChangePoint) -> list[CommitInfo]:
-        """Get all commits between prev_commit_id and commit_id (exclusive/inclusive)."""
+        """Get all commits between prev_key and key (exclusive/inclusive)."""
         if self._store and self._engine:
-            rows = self._store.get_commits_in_range(
-                self._engine, cp.prev_commit_id, cp.commit_id
-            )
-            return [
-                CommitInfo(
-                    id=r["commit_id"],
-                    hash=r["hash"],
-                    date=r["date"],
-                    timestamp=r["timestamp"],
-                    title=r["title"],
-                )
-                for r in rows
-            ]
+            rows = self._store.get_commits_in_range(self._engine, cp.prev_key, cp.key)
+            return [_commit_info(r) for r in rows]
         # CSV fallback: return only the known commits in range
         return [
-            self.commits[cid]
-            for cid in sorted(self.commits)
-            if cp.prev_commit_id < cid <= cp.commit_id
+            self.commits[key]
+            for key in sorted(self.commits)
+            if cp.prev_key < key <= cp.key
         ]
+
+    @staticmethod
+    def _range_label(cp: ChangePoint) -> str:
+        """``prev+1..key`` when both ends share an embedder, else the two keys.
+
+        Across an embedder step the engine coordinate is not contiguous, so
+        there is no ``+1`` to take; naming both endpoints is the honest form.
+        """
+        if cp.prev_key.embedder_id == cp.key.embedder_id:
+            return (
+                f"{CommitKey(cp.key.embedder_id, cp.prev_key.commit_id + 1)}..{cp.key}"
+            )
+        return f"{cp.prev_key}..{cp.key}"
 
     # --- Reporting ---
 
@@ -401,35 +410,35 @@ class PerfAnalyzer:
             return
 
         if group_by_commit:
-            groups: dict[int, list[ChangePoint]] = defaultdict(list)
+            groups: dict[CommitKey, list[ChangePoint]] = defaultdict(list)
             for cp in results:
-                groups[cp.commit_id].append(cp)
+                groups[cp.key].append(cp)
 
-            for cid in sorted(groups):
-                info = self.commits.get(cid)
-                range_commits = self._get_commit_range(groups[cid][0])
+            for key in sorted(groups):
+                info = self.commits.get(key)
+                range_commits = self._get_commit_range(groups[key][0])
                 if len(range_commits) <= 1 and info:
                     h = info.hash[:10] if info.hash else ""
                     title = rich_escape(info.title[:70]) if info.title else ""
-                    header = f"Commit {cid} {h} {title}".strip()
+                    header = f"Commit {key} {h} {title}".strip()
                 else:
-                    prev_cid = groups[cid][0].prev_commit_id
-                    header = f"Commit range {prev_cid + 1}..{cid} ({len(range_commits)} commits)"
+                    label = self._range_label(groups[key][0])
+                    header = f"Commit range {label} ({len(range_commits)} commits)"
                 console.print(f"\n[bold]{header}[/bold]")
-                alt = self._format_candidates(groups[cid][0])
+                alt = self._format_candidates(groups[key][0])
                 if alt:
                     console.print(f"  candidates: {alt}")
-                    for c_cid, c_prob in groups[cid][0].candidates:
+                    for c_key, c_prob in groups[key][0].candidates:
                         if c_prob < 0.05:
                             continue
-                        c_info = self.commits.get(c_cid)
+                        c_info = self.commits.get(c_key)
                         if c_info:
                             t = rich_escape(c_info.title) if c_info.title else ""
-                            console.print(f"  [dim]{c_cid} {t}[/dim]")
+                            console.print(f"  [dim]{c_key} {t}[/dim]")
                 else:
                     for c in range_commits:
                         t = rich_escape(c.title) if c.title else ""
-                        console.print(f"  [dim]{c.id} {t}[/dim]")
+                        console.print(f"  [dim]{c.key} {t}[/dim]")
 
                 table = Table(
                     box=box.SIMPLE,
@@ -444,7 +453,7 @@ class PerfAnalyzer:
                 table.add_column("CONF")
 
                 for cp in sorted(
-                    groups[cid], key=lambda x: abs(x.pct_change), reverse=True
+                    groups[key], key=lambda x: abs(x.pct_change), reverse=True
                 ):
                     pct = cp.pct_change * 100
                     color = "green" if cp.direction == "improvement" else "red"
@@ -474,15 +483,13 @@ class PerfAnalyzer:
                 color = "green" if cp.direction == "improvement" else "red"
                 range_commits = self._get_commit_range(cp)
                 n = len(range_commits)
-                info = self.commits.get(cp.commit_id)
+                info = self.commits.get(cp.key)
                 if n <= 1 and info:
                     h = info.hash[:10] if info.hash else ""
                     title = rich_escape(info.title[:40]) if info.title else ""
-                    commit_desc = f"{cp.commit_id} {h} {title}".strip()
+                    commit_desc = f"{cp.key} {h} {title}".strip()
                 else:
-                    commit_desc = (
-                        f"{cp.prev_commit_id + 1}..{cp.commit_id} ({n} commits)"
-                    )
+                    commit_desc = f"{self._range_label(cp)} ({n} commits)"
                 alt = self._format_candidates(cp)
                 if alt:
                     commit_desc += f"\n  also: {alt}"

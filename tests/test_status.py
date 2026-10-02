@@ -19,6 +19,7 @@ from slipstream.collector import BenchCollector
 from slipstream.lock import MachineLock
 from slipstream.config import BusConfig, BusSource, EngineConfig, RunSpec
 from slipstream.status import collect_status, compare_env, render
+from keys import K1
 
 
 def _entry(commit_id):
@@ -94,7 +95,7 @@ class TestBusDrivenEngine:
 
         _, st = _status(env)
         assert st.driven_by == "bus" and st.source == "local"
-        assert (st.frontier, st.cursor, st.lag) == (102, 100, 2)
+        assert (st.frontier, st.cursor, st.lag) == (K1(102), K1(100), 2)
         assert st.builder_age is not None
 
     def test_entries_dropped_before_this_machine_read_them(self, env):
@@ -104,7 +105,7 @@ class TestBusDrivenEngine:
         )
         write_cursor(cursor_path(env.cfg.out_dir, "local", "v8"), 120)
         _, st = _status(env)
-        assert st.dropped_unread_up_to == 149
+        assert st.dropped_unread_up_to == K1(149)
 
     def test_no_drop_when_retention_is_behind_the_cursor(self, env):
         env.bus.write_builder_state(
@@ -421,7 +422,7 @@ class TestDropReportWithNoCursor:
         )
         _, st = _status(env)
         assert st.cursor is None
-        assert st.dropped_unread_up_to == 149
+        assert st.dropped_unread_up_to == K1(149)
 
         lines = []
         render(collect_status(env.cfg, env.collector, ["v8"]), lines.append)

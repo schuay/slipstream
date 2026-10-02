@@ -13,6 +13,7 @@ from typing import Annotated, Optional
 import typer
 
 from .config import load_config
+from .models import CommitKey
 from .collector import BenchCollector, FetchError
 from .analyzer import PerfAnalyzer
 from . import host as host_mod
@@ -299,8 +300,8 @@ def watch(
     reset_cursor: Optional[str] = typer.Option(
         None,
         "--reset-cursor",
-        metavar="ENGINE[=ID]",
-        help="Re-bench a bus-driven engine from above ID (default: from the start)",
+        metavar="ENGINE[=KEY]",
+        help="Re-bench a bus-driven engine from above KEY (default: from the start)",
     ),
     config: Optional[Path] = typer.Option(None, help="User config path"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would run"),
@@ -367,15 +368,19 @@ def watch(
                 f"Error: '{name}' has no bus source, so it has no cursor.", err=True
             )
             raise typer.Exit(1)
-        if raw and not raw.isdigit():
-            raise typer.BadParameter("--reset-cursor takes ENGINE or ENGINE=ID")
+        try:
+            # (0, 0) is below every key, including an embedded engine's, whose
+            # embedder id is a position and so never 0.
+            cursor = CommitKey.parse(raw) if raw else CommitKey(0, 0)
+        except ValueError:
+            raise typer.BadParameter("--reset-cursor takes ENGINE or ENGINE=KEY")
         if dry_run:
             typer.echo(
-                f"{name}: would reset the cursor to {raw or 0} (source {source.name})"
+                f"{name}: would reset the cursor to {cursor} (source {source.name})"
             )
             return
-        consumer.set_cursor(source, name, int(raw) if raw else 0)
-        typer.echo(f"{name}: cursor reset to {raw or 0} (source {source.name})")
+        consumer.set_cursor(source, name, cursor)
+        typer.echo(f"{name}: cursor reset to {cursor} (source {source.name})")
         typer.echo(
             "Entries at or below it are still skipped unless their scores are "
             f"cleared: slipstream clear {name} <first> <last>"
@@ -386,7 +391,7 @@ def watch(
     # commit. A bus-driven engine starts from a cursor instead.
     for name in engine_names:
         if source_for(name) is None and (
-            collector.store.max_done_commit_id(name, cfg.platform) is None
+            collector.store.max_done_key(name, cfg.platform, embedder_id=0) is None
         ):
             typer.echo(
                 f"Error: no done commits for '{name}'. "
@@ -485,9 +490,11 @@ def watch(
 @app.command()
 def clear(
     engine: Annotated[str, typer.Argument(help="Engine name (v8, jsc)")],
-    start: Annotated[int, typer.Argument(help="First commit ID to clear")],
+    start: Annotated[
+        str, typer.Argument(help="First key to clear, e.g. 109680 or 1534000-109680")
+    ],
     end: Annotated[
-        Optional[int], typer.Argument(help="Last commit ID (default: just start)")
+        Optional[str], typer.Argument(help="Last key (default: just start)")
     ] = None,
     config: Optional[Path] = typer.Option(None, help="User config path"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask"),
@@ -510,34 +517,39 @@ def clear(
     if engine not in cfg.engines:
         typer.echo(f"Error: engine '{engine}' not configured.", err=True)
         raise typer.Exit(1)
-    end = start if end is None else end
-    if end < start:
+    try:
+        first = CommitKey.parse(start)
+        last = CommitKey.parse(end) if end is not None else first
+    except ValueError as e:
+        raise typer.BadParameter(str(e))
+    if last < first:
         typer.echo("Error: end must not be below start.", err=True)
         raise typer.Exit(1)
 
     store = _open_store(cfg)
-    ids = [
-        r["commit_id"]
-        for r in store.get_commits_in_range(engine, start - 1, end)
-        if store.is_done(engine, cfg.platform, r["commit_id"])
+    keys = [
+        key
+        for r in store.get_commits_in_range(engine, first.before(), last)
+        if store.is_done(engine, cfg.platform, key := CommitKey.from_commit(r))
     ]
-    if not ids:
-        typer.echo(f"Nothing done for {engine} in {start}..{end}.")
+    if not keys:
+        typer.echo(f"Nothing done for {engine} in {first}..{last}.")
         store.close()
         return
     if not yes:
         typer.confirm(
-            f"Clear {len(ids)} commits of {engine} ({ids[0]}..{ids[-1]})?", abort=True
+            f"Clear {len(keys)} commits of {engine} ({keys[0]}..{keys[-1]})?",
+            abort=True,
         )
 
     try:
-        with store.result_locks(engine, cfg.platform, ids):
-            store.clear_range(engine, cfg.platform, ids)
-            for cid in ids:
-                path = cfg.commit_results_dir(engine, cid)
+        with store.result_locks(engine, cfg.platform, keys):
+            store.clear_range(engine, cfg.platform, keys)
+            for key in keys:
+                path = cfg.commit_results_dir(engine, key)
                 if path.exists():
                     _shutil.rmtree(path)
-        typer.echo(f"Cleared {len(ids)} commits. They will be measured again.")
+        typer.echo(f"Cleared {len(keys)} commits. They will be measured again.")
     except (RuntimeError, OSError, ValueError) as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1)
@@ -664,8 +676,11 @@ def import_csv(
         if rows:
             # The commit timestamps are read after the bot checks: a refused
             # file must not have cost a query.
+            # The CSV is scalar, so only an embedder-0 row can be its commit.
             ts_lookup = {
-                r["commit_id"]: r["timestamp"] for r in store.get_all_commits(engine)
+                r["commit_id"]: r["timestamp"]
+                for r in store.get_all_commits(engine)
+                if r["embedder_id"] == 0
             }
             import_ids = sorted({r[0] for r in rows})
             with store.result_locks(engine, plat, import_ids):
@@ -739,7 +754,9 @@ def export_csv(
         typer.echo(f"{count} scores", err=True)
 
     if commit_infos:
-        commits = store.get_all_commits(engine)
+        # Scalar like the scores beside it: an embedded engine's commits have
+        # no place in a file keyed by commit id alone.
+        commits = [c for c in store.get_all_commits(engine) if c["embedder_id"] == 0]
         with open(commit_infos, "w", newline="") as f:
             w = _csv.writer(f)
             for c in commits:
@@ -832,12 +849,17 @@ def deliver(
         echo.close()
 
 
-def _parse_engine_id(value: str, flag: str) -> tuple[str, int]:
-    """Parse an ENGINE=ID argument."""
+def _parse_engine_key(value: str, flag: str) -> tuple[str, CommitKey]:
+    """Parse an ENGINE=KEY argument."""
     engine, _, raw = value.partition("=")
-    if not engine or not raw.isdigit():
-        raise typer.BadParameter(f"{flag} takes ENGINE=ID, e.g. v8=109680")
-    return engine, int(raw)
+    try:
+        if not engine:
+            raise ValueError(value)
+        return engine, CommitKey.parse(raw)
+    except ValueError:
+        raise typer.BadParameter(
+            f"{flag} takes ENGINE=KEY, e.g. v8=109680 or chrome=1534000-109680"
+        )
 
 
 @app.command()
@@ -851,7 +873,7 @@ def build(
     retry: Optional[str] = typer.Option(
         None,
         "--retry",
-        metavar="ENGINE=ID",
+        metavar="ENGINE=KEY",
         help="Allow one more attempt at a commit whose build failed",
     ),
     probe: bool = typer.Option(
@@ -902,18 +924,18 @@ def build(
         raise typer.Exit(1)
 
     if retry:
-        engine, commit_id = _parse_engine_id(retry, "--retry")
-        if not builder.store.request_build_retry(engine, commit_id):
+        engine, key = _parse_engine_key(retry, "--retry")
+        if not builder.store.request_build_retry(engine, key):
             typer.echo(
-                f"Error: {engine} {commit_id} has no recorded build failure.", err=True
+                f"Error: {engine} {key} has no recorded build failure.", err=True
             )
             raise typer.Exit(1)
-        typer.echo(f"{engine} {commit_id} will be attempted again.")
-        # A commit-id cursor cannot see anything at or below it, so a
-        # republished entry sits unread unless every consumer is reset.
+        typer.echo(f"{engine} {key} will be attempted again.")
+        # A key cursor cannot see anything at or below it, so a republished
+        # entry sits unread unless every consumer is reset.
         typer.echo(
             f"Each consumer needs: slipstream watch --reset-cursor "
-            f"{engine}={commit_id - 1}"
+            f"{engine}={key.before()}"
         )
         return
 

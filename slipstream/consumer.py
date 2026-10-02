@@ -3,8 +3,8 @@
 
 """Bench the artifacts another process built, instead of building them here.
 
-A consumer holds a cursor per (source, engine): the commit id of the last entry
-it finished with. Each cycle drains rather than handling one entry, since only
+A consumer holds a cursor per (source, engine): the key of the last entry it
+finished with. Each cycle drains rather than handling one entry, since only
 a real bench costs hours and the machine lock and the handoff delay apply per
 bench, not per entry. Without that, a cursor reset two hundred entries back
 would take two hundred cycles to walk back up through the already-done ones.
@@ -34,12 +34,14 @@ from .bus import (
     BusError,
     Entry,
     cursor_path,
+    parse_key_stem,
     read_cursor,
     sha256_file,
     write_cursor,
 )
 from .collector import BenchCollector, BenchOutcome, outcome_status
 from .config import BusSource, Config, EngineConfig
+from .models import CommitKey
 
 GB = 1_000_000_000
 
@@ -105,16 +107,16 @@ class LocalSource:
         self.name = source.name
         self.bus = Bus(source.local_root)
 
-    def ids_above(self, engine: str, cursor: int | None) -> list[int]:
-        return self.bus.ids_above(engine, cursor)
+    def keys_above(self, engine: str, cursor) -> list[CommitKey]:
+        return self.bus.keys_above(engine, cursor)
 
-    def read_entry(self, engine: str, commit_id: int) -> Entry | None:
-        return self.bus.read_entry(engine, commit_id)
+    def read_entry(self, engine: str, key) -> Entry | None:
+        return self.bus.read_entry(engine, key)
 
-    def payload(self, engine: str, commit_id: int, dest: Path) -> Path:
+    def payload(self, engine: str, key, dest: Path) -> Path:
         """Return a readable payload path. Local payloads are read in place."""
         del dest
-        return self.bus.blob_path(engine, commit_id)
+        return self.bus.blob_path(engine, key)
 
     def keep_payload(self) -> bool:
         return True
@@ -160,46 +162,46 @@ class BusConsumer:
     def cursor_file(self, source: BusSource, engine: str) -> Path:
         return cursor_path(self.cfg.out_dir, source.name, engine)
 
-    def cursor(self, source: BusSource, engine: str) -> int | None:
+    def cursor(self, source: BusSource, engine: str) -> CommitKey | None:
         path = self.cursor_file(source, engine)
         try:
             return read_cursor(path)
         except BusError as e:
-            # Start over rather than guess. max_done_commit_id looks like the
-            # answer but is a maximum, not a watermark: an ad-hoc bench range
-            # above the cursor would move it past entries that were never
-            # measured, and ids_above is strict. Restarting costs nothing --
-            # _skip_done walks past the done ones without fetching, which is
-            # what a missing cursor file already does.
+            # Start over rather than guess. max_done_key looks like the answer
+            # but is a maximum, not a watermark: an ad-hoc bench range above
+            # the cursor would move it past entries that were never measured,
+            # and keys_above is strict. Restarting costs nothing -- _skip_done
+            # walks past the done ones without fetching, which is what a
+            # missing cursor file already does.
             self.log(f"{engine}: {e}; resuming from the start of the topic")
             return None
 
-    def set_cursor(self, source: BusSource, engine: str, commit_id: int) -> None:
-        write_cursor(self.cursor_file(source, engine), commit_id)
+    def set_cursor(self, source: BusSource, engine: str, key) -> None:
+        write_cursor(self.cursor_file(source, engine), key)
 
     # --- one entry ---
 
-    def run_root(self, engine: str, commit_id: int) -> Path:
-        return self.bus.root / "roots" / engine / str(commit_id)
+    def run_root(self, engine: str, key) -> Path:
+        return self.bus.root / "roots" / engine / str(CommitKey.of(key))
 
     def provision(self, source, engine: EngineConfig, entry: Entry) -> Path:
         """Fetch, verify and unpack one entry into a run root."""
-        root = self.run_root(engine.name, entry.commit_id)
+        root = self.run_root(engine.name, entry.key)
         if root.exists():
             shutil.rmtree(root)
-        tmp_payload = self.bus.tmp_dir / f"{engine.name}-{entry.commit_id}.tar.zst"
+        tmp_payload = self.bus.tmp_dir / f"{engine.name}-{entry.key}.tar.zst"
         tmp_payload.parent.mkdir(parents=True, exist_ok=True)
-        payload = source.payload(engine.name, entry.commit_id, tmp_payload)
+        payload = source.payload(engine.name, entry.key, tmp_payload)
         if not payload.exists():
             raise ConsumerError(
-                f"{engine.name} {entry.commit_id}: entry is published but its "
+                f"{engine.name} {entry.key}: entry is published but its "
                 f"payload is missing"
             )
         try:
             digest = sha256_file(payload)
             if digest != entry.blob_sha256:
                 raise ShaMismatch(
-                    f"{engine.name} {entry.commit_id}: payload sha256 {digest} "
+                    f"{engine.name} {entry.key}: payload sha256 {digest} "
                     f"does not match the entry's {entry.blob_sha256}"
                 )
             tmp_root = root.with_name(root.name + ".unpacking")
@@ -217,29 +219,33 @@ class BusConsumer:
         else:
             if not source.keep_payload():
                 tmp_payload.unlink(missing_ok=True)
-        self._trim_run_roots(engine.name, keep=entry.commit_id)
+        self._trim_run_roots(engine.name, keep=entry.key)
         return root
 
-    def _trim_run_roots(self, engine: str, keep: int | None = None) -> None:
+    def _trim_run_roots(self, engine: str, keep=None) -> None:
         """Keep the newest run_roots roots, and never the one about to be used.
 
-        Roots are ranked by commit id, so a re-bench of an older commit unpacks
-        the lowest-numbered root of the set: without ``keep`` the trim deletes
-        it on the way out of provisioning, and every run of the commit the
-        operator asked to repair then fails.
+        Roots are ranked by key, so a re-bench of an older commit unpacks the
+        lowest-ranked root of the set: without ``keep`` the trim deletes it on
+        the way out of provisioning, and every run of the commit the operator
+        asked to repair then fails.
         """
+        keep = CommitKey.of(keep) if keep is not None else None
         limit = self.cfg.bench.run_roots
         parent = self.bus.root / "roots" / engine
         try:
             roots = sorted(
-                (p for p in parent.iterdir() if p.is_dir() and p.name.isdigit()),
-                key=lambda p: int(p.name),
+                (
+                    (key, p)
+                    for p in parent.iterdir()
+                    if p.is_dir() and (key := parse_key_stem(p.name)) is not None
+                ),
             )
         except FileNotFoundError:
             return
         doomed = roots[:-limit] if limit > 0 else roots
-        for old in doomed:
-            if keep is not None and int(old.name) == keep:
+        for key, old in doomed:
+            if keep is not None and key == keep:
                 continue
             shutil.rmtree(old, ignore_errors=True)
         # A kill between unpacking and the rename leaves a full-size directory
@@ -261,17 +267,16 @@ class BusConsumer:
         try:
             root = self.provision(source, engine, entry)
         except ShaMismatch:
-            fresh = source.read_entry(engine.name, entry.commit_id)
+            fresh = source.read_entry(engine.name, entry.key)
             if fresh is None or fresh == entry:
                 raise
-            self.log(
-                f"{engine.name} {entry.commit_id}: entry was republished, refetching"
-            )
+            self.log(f"{engine.name} {entry.key}: entry was republished, refetching")
             entry = fresh
             root = self.provision(source, engine, entry)
         commit = {
             "hash": entry.hash,
             "commit_id": entry.commit_id,
+            "embedder_id": entry.embedder_id,
             "date": entry.date,
             "timestamp": entry.timestamp,
             "title": entry.title,
@@ -395,7 +400,7 @@ class BusConsumer:
         consecutive_failures = limit - 1 if stalled else 0
         while not should_stop():
             try:
-                batch = handle.ids_above(engine_name, cursor)
+                batch = handle.keys_above(engine_name, cursor)
             except TRANSPORT_ERRORS as e:
                 # Listing failed, so there is nothing to skip past. Leave the
                 # cursor and try again next cycle.
@@ -412,20 +417,20 @@ class BusConsumer:
                     state.stalled_since = None
                     state.stall_retry_after = None
                 break
-            commit_id, cursor = self._skip_done(
+            key, cursor = self._skip_done(
                 source, engine_name, batch, cursor, should_stop
             )
-            if commit_id is None:
+            if key is None:
                 # The whole batch was already benched. Re-list rather than
                 # stopping: entries published while we skipped are still ours.
                 continue
             try:
-                entry = handle.read_entry(engine_name, commit_id)
+                entry = handle.read_entry(engine_name, key)
             except TRANSPORT_ERRORS as e:
                 # Only a source that says "not there" advances the cursor; a
                 # source that could not answer must not, or an outage would
                 # silently skip unbenched commits.
-                state.last_error = f"reading entry {commit_id}: {e}"
+                state.last_error = f"reading entry {key}: {e}"
                 self.log(f"{engine_name}: {state.last_error}")
                 break
             if entry is None:
@@ -435,11 +440,11 @@ class BusConsumer:
                 # cursor passes it, so nothing else would report this after the
                 # next successful bench.
                 self.log(
-                    f"{engine_name}: entry {commit_id} was dropped by retention "
+                    f"{engine_name}: entry {key} was dropped by retention "
                     f"before this machine benched it"
                 )
-                state.skipped_dropped = max(state.skipped_dropped or 0, commit_id)
-                cursor = commit_id
+                state.skipped_dropped = _max_key(state.skipped_dropped, key)
+                cursor = key
                 self.set_cursor(source, engine_name, cursor)
                 continue
             if self.free_gb() < self.cfg.bench.min_free_gb:
@@ -461,19 +466,20 @@ class BusConsumer:
                 # dropped the entry meanwhile. Without this the payload is
                 # simply missing, which the consumer is right to treat as a
                 # real error -- but here it is ordinary retention.
-                fresh = handle.read_entry(engine_name, commit_id)
+                fresh = handle.read_entry(engine_name, key)
                 if fresh is None:
                     self.log(
-                        f"{engine_name}: entry {commit_id} was dropped by "
+                        f"{engine_name}: entry {key} was dropped by "
                         f"retention while waiting for the machine"
                     )
-                    state.skipped_dropped = max(state.skipped_dropped or 0, commit_id)
-                    cursor = commit_id
+                    state.skipped_dropped = _max_key(state.skipped_dropped, key)
+                    cursor = key
                     self.set_cursor(source, engine_name, cursor)
                     continue
                 entry = fresh
                 state.in_flight = {
-                    "commit_id": commit_id,
+                    "commit_id": key.commit_id,
+                    "embedder_id": key.embedder_id,
                     "phase": "bench",
                     "started_at": time.time(),
                 }
@@ -487,10 +493,10 @@ class BusConsumer:
                 queued = (
                     len(batch)
                     if cursor is None
-                    else sum(1 for i in batch if i > cursor)
+                    else sum(1 for k in batch if k > cursor)
                 )
                 self.log(
-                    f"{engine_name}: benching {commit_id} ({entry.hash[:8]}), "
+                    f"{engine_name}: benching {key} ({entry.hash[:8]}), "
                     f"{queued} above the cursor"
                 )
                 outcome = self.bench_entry(handle, engine, entry, runs)
@@ -506,7 +512,7 @@ class BusConsumer:
             self._benched = benched
             # After the commit is recorded, so a crash between the two
             # re-benches one commit, which is_done absorbs.
-            cursor = commit_id
+            cursor = key
             self.set_cursor(source, engine_name, cursor)
 
             if outcome_status(outcome) == "failed":
@@ -553,15 +559,15 @@ class BusConsumer:
         """
         cursor = self.cursor(source, engine_name)
         try:
-            ids = handle.ids_above(engine_name, cursor)
+            keys = handle.keys_above(engine_name, cursor)
         except TRANSPORT_ERRORS as e:
             self.log(f"{engine_name}: listing {source.name}: {e}")
             return DrainResult(0, str(e))
         todo = [
-            i for i in ids if not self.store.is_done(engine_name, self.cfg.platform, i)
+            k for k in keys if not self.store.is_done(engine_name, self.cfg.platform, k)
         ]
         self.log(
-            f"{engine_name}: would bench {len(todo)} of {len(ids)} entries above "
+            f"{engine_name}: would bench {len(todo)} of {len(keys)} entries above "
             f"{cursor} from {source.name}"
             + (f" (first {todo[0]}, last {todo[-1]})" if todo else "")
         )
@@ -582,7 +588,7 @@ class BusConsumer:
             return  # the cycle will report the failure on its own
         if dropped is None or (cursor is not None and dropped <= cursor):
             return
-        if (state.skipped_dropped or 0) >= dropped:
+        if state.skipped_dropped is not None and state.skipped_dropped >= dropped:
             return
         state.skipped_dropped = dropped
         self.log(
@@ -592,7 +598,7 @@ class BusConsumer:
 
     def _skip_done(
         self, source, engine_name, batch, cursor, should_stop
-    ) -> tuple[int | None, int | None]:
+    ) -> tuple[CommitKey | None, CommitKey | None]:
         """Advance past entries this machine has already benched.
 
         One listing covers the whole batch rather than one per entry: after a
@@ -601,12 +607,12 @@ class BusConsumer:
         point -- pulling hundreds of MB to discard it is what makes a reset
         expensive.
         """
-        for commit_id in batch:
+        for key in batch:
             if should_stop():
                 return None, cursor
-            if not self.store.is_done(engine_name, self.cfg.platform, commit_id):
-                return commit_id, cursor
-            cursor = commit_id
+            if not self.store.is_done(engine_name, self.cfg.platform, key):
+                return key, cursor
+            cursor = key
             self.set_cursor(source, engine_name, cursor)
         return None, cursor
 
@@ -616,7 +622,7 @@ class BusConsumer:
         state.bot = self.cfg.bot_name
         state.cursor = cursor
         try:
-            state.lag = len(handle.ids_above(engine_name, cursor))
+            state.lag = len(handle.keys_above(engine_name, cursor))
         except TRANSPORT_ERRORS:
             # Writing the state file is the last thing a failing cycle does;
             # it must not raise for the same reason the cycle did.
@@ -641,6 +647,11 @@ class BusConsumer:
             env["since"] = state.env.get("since", time.time())
         state.env = env
         self.bus.write_bench_state(engine_name, state)
+
+
+def _max_key(current: CommitKey | None, key: CommitKey) -> CommitKey:
+    """The higher of a possibly unset high-water mark and a key."""
+    return key if current is None else max(current, key)
 
 
 def _unpack(payload: Path, dest: Path) -> None:

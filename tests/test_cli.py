@@ -8,6 +8,7 @@ import subprocess
 import pytest
 
 from slipstream.cli import _parse_interval
+from keys import K, K1
 
 
 class TestParseInterval:
@@ -427,7 +428,7 @@ class TestAnalyzeCsvBotGuard:
         )
         a = PerfAnalyzer()
         assert a.load_results(f) is True
-        assert a.data["js3[default] Air"]["Total-Score"][100] == [1.0]
+        assert a.data["js3[default] Air"]["Total-Score"][K1(100)] == [1.0]
 
 
 class TestClearScope:
@@ -621,7 +622,7 @@ class TestBuildProbe:
         self._invoke(["build", "--probe", "--config", str(p)])
         from slipstream.bus import Bus
 
-        assert Bus(tmp_path / "bus").commit_ids("v8") == []
+        assert Bus(tmp_path / "bus").keys("v8") == K()
 
 
 class TestFreshMachine:
@@ -837,4 +838,4 @@ class TestRaggedCsvRows:
         )
         a = PerfAnalyzer()
         assert a.load_results(f) is True
-        assert a.data["js3[default] Box2D"]["Score"][100] == [1.5]
+        assert a.data["js3[default] Box2D"]["Score"][K1(100)] == [1.5]

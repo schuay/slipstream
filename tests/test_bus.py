@@ -18,6 +18,7 @@ from slipstream.bus import (
     sha256_file,
     write_cursor,
 )
+from keys import K, K1
 
 
 def _entry(commit_id, engine="v8", **kw):
@@ -56,7 +57,7 @@ def bus(tmp_path):
 class TestPublish:
     def test_round_trip(self, bus):
         published = _publish(bus, 109680, b"payload")
-        assert bus.commit_ids("v8") == [109680]
+        assert bus.keys("v8") == K(109680)
         read = bus.read_entry("v8", 109680)
         assert read == published
         assert bus.blob_path("v8", 109680).read_bytes() == b"payload"
@@ -79,21 +80,21 @@ class TestPublish:
         _publish(bus, 100, b"first")
         _publish(bus, 100, b"second")
         assert bus.blob_path("v8", 100).read_bytes() == b"second"
-        assert bus.commit_ids("v8") == [100]
+        assert bus.keys("v8") == K(100)
 
     def test_tmp_files_are_not_listed_as_entries(self, bus):
         _publish(bus, 100)
         (bus.topic_dir("v8") / "101.json.tmp-9-ab").write_text("{}")
-        assert bus.commit_ids("v8") == [100]
+        assert bus.keys("v8") == K(100)
 
     def test_engines_are_separate(self, bus):
         _publish(bus, 100, engine="v8")
         _publish(bus, 500, engine="jsc")
-        assert bus.commit_ids("v8") == [100]
-        assert bus.commit_ids("jsc") == [500]
+        assert bus.keys("v8") == K(100)
+        assert bus.keys("jsc") == K(500)
 
     def test_an_empty_root_lists_nothing(self, bus):
-        assert bus.commit_ids("v8") == []
+        assert bus.keys("v8") == K()
         assert bus.read_entry("v8", 1) is None
 
 
@@ -127,17 +128,17 @@ class TestCursorSemantics:
     def test_ids_above_the_cursor(self, bus):
         for cid in (100, 200, 300):
             _publish(bus, cid)
-        assert bus.ids_above("v8", 100) == [200, 300]
-        assert bus.ids_above("v8", None) == [100, 200, 300]
-        assert bus.ids_above("v8", 300) == []
+        assert bus.keys_above("v8", 100) == K(200, 300)
+        assert bus.keys_above("v8", None) == K(100, 200, 300)
+        assert bus.keys_above("v8", 300) == K()
 
     def test_cursor_round_trip(self, tmp_path):
         p = cursor_path(tmp_path, "box2", "v8")
         assert read_cursor(p) is None
         write_cursor(p, 109680)
-        assert read_cursor(p) == 109680
+        assert read_cursor(p) == K1(109680)
         write_cursor(p, 109681)
-        assert read_cursor(p) == 109681
+        assert read_cursor(p) == K1(109681)
         assert [q.name for q in p.parent.iterdir()] == ["v8"]
 
     def test_a_torn_cursor_is_reported(self, tmp_path):
@@ -150,8 +151,8 @@ class TestCursorSemantics:
     def test_sources_have_separate_cursors(self, tmp_path):
         write_cursor(cursor_path(tmp_path, "local", "v8"), 1)
         write_cursor(cursor_path(tmp_path, "box2", "v8"), 2)
-        assert read_cursor(cursor_path(tmp_path, "local", "v8")) == 1
-        assert read_cursor(cursor_path(tmp_path, "box2", "v8")) == 2
+        assert read_cursor(cursor_path(tmp_path, "local", "v8")) == K1(1)
+        assert read_cursor(cursor_path(tmp_path, "box2", "v8")) == K1(2)
 
 
 class TestState:
@@ -160,13 +161,13 @@ class TestState:
         state.failed = [{"commit_id": 109655, "kind": "compile", "at": 1}]
         bus.write_builder_state("v8", state)
         read = bus.read_builder_state("v8")
-        assert read.frontier == 109680 and read.failed[0]["kind"] == "compile"
+        assert read.frontier == K1(109680) and read.failed[0]["kind"] == "compile"
         assert read.updated_at > 0
 
     def test_bench_state_round_trip(self, bus):
         bus.write_bench_state("v8", BenchState(bot="box2-m4", cursor=109679, lag=1))
         read = bus.read_bench_state("v8")
-        assert (read.bot, read.cursor, read.lag) == ("box2-m4", 109679, 1)
+        assert (read.bot, read.cursor, read.lag) == ("box2-m4", K1(109679), 1)
 
     def test_the_two_state_files_do_not_share_a_path(self, bus):
         """Separate processes write them; one file would clobber whichever wrote first."""
@@ -189,21 +190,21 @@ class TestRetention:
         for cid in (100, 200, 300, 400):
             _publish(bus, cid, b"x" * 100)
         dropped = bus.prune("v8", 250)
-        assert dropped == [100, 200]
-        assert bus.commit_ids("v8") == [300, 400]
+        assert dropped == K(100, 200)
+        assert bus.keys("v8") == K(300, 400)
         assert not bus.blob_path("v8", 100).exists()
-        assert bus.lowest_retained("v8") == 300
+        assert bus.lowest_retained("v8") == K1(300)
 
     def test_the_newest_entry_is_never_dropped(self, bus):
         """A budget smaller than one payload must not empty the topic."""
         _publish(bus, 100, b"x" * 1000)
-        assert bus.prune("v8", 10) == []
-        assert bus.commit_ids("v8") == [100]
+        assert bus.prune("v8", 10) == K()
+        assert bus.keys("v8") == K(100)
 
     def test_nothing_to_do_under_budget(self, bus):
         for cid in (100, 200):
             _publish(bus, cid, b"x" * 10)
-        assert bus.prune("v8", 10_000) == []
+        assert bus.prune("v8", 10_000) == K()
         assert bus.blob_bytes("v8") == 20
 
     def test_gc_reclaims_a_payload_with_no_entry(self, bus):
@@ -232,9 +233,9 @@ class TestRetentionLeavesNoHole:
         the budget, but it holds lowest_retained down and hides the hole."""
         for cid, size in ((100, 40), (200, 100), (300, 200)):
             _publish(bus, cid, b"x" * size)
-        assert bus.prune("v8", 250) == [100, 200]
-        assert bus.commit_ids("v8") == [300]
-        assert bus.lowest_retained("v8") == 300
+        assert bus.prune("v8", 250) == K(100, 200)
+        assert bus.keys("v8") == K(300)
+        assert bus.lowest_retained("v8") == K1(300)
 
     def test_the_entry_just_published_is_kept(self, bus):
         """build --retry republishes below the frontier, so its entry is the
@@ -243,22 +244,22 @@ class TestRetentionLeavesNoHole:
             _publish(bus, cid, b"x" * 100)
         bus.prune("v8", 250)
         _publish(bus, 50, b"x" * 100)
-        assert bus.prune("v8", 250, keep=50) == []
-        assert 50 in bus.commit_ids("v8")
+        assert bus.prune("v8", 250, keep=50) == K()
+        assert K1(50) in bus.keys("v8")
 
     def test_keep_does_not_protect_an_unrelated_entry(self, bus):
         for cid in (100, 200, 300):
             _publish(bus, cid, b"x" * 100)
-        assert bus.prune("v8", 250, keep=300) == [100]
+        assert bus.prune("v8", 250, keep=300) == K(100)
 
     def test_keep_lowers_the_floor_rather_than_punching_a_hole(self, bus):
         """Exempting one entry would leave a gap below lowest_retained, which
         is the signal a consumer uses to notice entries went missing."""
         for cid in (100, 200, 201, 202):
             _publish(bus, cid, b"x" * 100)
-        assert bus.prune("v8", 250, keep=100) == []
-        assert bus.commit_ids("v8") == [100, 200, 201, 202]
-        assert bus.lowest_retained("v8") == 100
+        assert bus.prune("v8", 250, keep=100) == K()
+        assert bus.keys("v8") == K(100, 200, 201, 202)
+        assert bus.lowest_retained("v8") == K1(100)
 
     def test_the_overshoot_lasts_one_cycle(self, bus):
         for cid in (100, 200, 201, 202):
@@ -266,8 +267,8 @@ class TestRetentionLeavesNoHole:
         bus.prune("v8", 250, keep=100)
         # The next publish prunes normally and drops it with its neighbours.
         _publish(bus, 203, b"x" * 100)
-        assert bus.prune("v8", 250, keep=203) == [100, 200, 201]
-        assert bus.commit_ids("v8") == [202, 203]
+        assert bus.prune("v8", 250, keep=203) == K(100, 200, 201)
+        assert bus.keys("v8") == K(202, 203)
 
 
 class TestEntryRequiredFields:
@@ -309,7 +310,7 @@ class TestEntryRequiredFields:
         leaked.write_text("{}")
         assert leaked in bus.gc(["v8"])
         assert not leaked.exists()
-        assert bus.commit_ids("v8") == [100]
+        assert bus.keys("v8") == K(100)
 
     @pytest.mark.parametrize("text", ["null", "[1, 2]", "42", '"a string"'])
     def test_json_that_is_not_an_object_is_a_bus_error(self, bus, text):
@@ -338,4 +339,91 @@ class TestEntryRequiredFields:
         leaked = bus.builder_state_path("v8").with_name("v8.json.tmp-9-abc")
         leaked.write_text("{}")
         assert leaked in bus.gc(["v8"])
-        assert bus.read_builder_state("v8").frontier == 1
+        assert bus.read_builder_state("v8").frontier == K1(1)
+
+
+class TestKeySpellingOnDisk:
+    """v8 and jsc keep writing exactly what they wrote before the key grew an
+    embedder coordinate; a composite key gets the ``e-c`` spelling in names
+    and the ``[e, c]`` pair in state, and both sort as one series."""
+
+    def test_a_scalar_key_leaves_every_file_as_it_was(self, bus, tmp_path):
+        _publish(bus, 109680)
+        assert bus.entry_path("v8", 109680).name == "109680.json"
+        assert bus.blob_path("v8", 109680).name == "109680.tar.zst"
+        assert (
+            json.loads(bus.entry_path("v8", 109680).read_text())["commit_id"] == 109680
+        )
+
+        p = cursor_path(tmp_path, "box2", "v8")
+        write_cursor(p, 109680)
+        assert p.read_text() == "109680\n"
+
+        bus.write_builder_state("v8", BuilderState(frontier=109680))
+        raw = json.loads(bus.builder_state_path("v8").read_text())
+        assert raw["frontier"] == 109680 and raw["lowest_retained"] is None
+
+    def test_an_entry_written_before_the_field_existed_reads_as_embedder_zero(
+        self, bus
+    ):
+        _publish(bus, 100)
+        path = bus.entry_path("v8", 100)
+        data = json.loads(path.read_text())
+        del data["embedder_id"]
+        path.write_text(json.dumps(data))
+        assert bus.read_entry("v8", 100).key == K1(100)
+
+    def test_a_composite_key_round_trips_through_names_and_state(self, bus, tmp_path):
+        from slipstream.models import CommitKey
+
+        key = CommitKey(1534000, 109680)
+        tmp = bus.tmp_blob("chrome", key)
+        tmp.write_bytes(b"x")
+        entry = _entry(key.commit_id, engine="chrome", embedder_id=key.embedder_id)
+        entry.blob_sha256 = sha256_file(tmp)
+        entry.blob_bytes = 1
+        bus.publish(entry, tmp)
+
+        assert bus.entry_path("chrome", key).name == "1534000-109680.json"
+        assert bus.keys("chrome") == [key]
+        assert bus.read_entry("chrome", key).key == key
+
+        p = cursor_path(tmp_path, "box2", "chrome")
+        write_cursor(p, key)
+        assert p.read_text() == "1534000-109680\n" and read_cursor(p) == key
+
+        bus.write_bench_state("chrome", BenchState(bot="b", cursor=key, lag=0))
+        raw = json.loads(bus.bench_state_path("chrome").read_text())
+        assert raw["cursor"] == [1534000, 109680]
+        assert bus.read_bench_state("chrome").cursor == key
+
+    def test_keys_sort_by_embedder_then_commit(self, bus):
+        from slipstream.models import CommitKey
+
+        for key in (CommitKey(2, 5), CommitKey(1, 900), CommitKey(1, 10)):
+            tmp = bus.tmp_blob("chrome", key)
+            tmp.write_bytes(b"x")
+            entry = _entry(key.commit_id, engine="chrome", embedder_id=key.embedder_id)
+            entry.blob_sha256 = sha256_file(tmp)
+            entry.blob_bytes = 1
+            bus.publish(entry, tmp)
+        assert bus.keys("chrome") == [
+            CommitKey(1, 10),
+            CommitKey(1, 900),
+            CommitKey(2, 5),
+        ]
+        assert bus.keys_above("chrome", CommitKey(1, 10)) == [
+            CommitKey(1, 900),
+            CommitKey(2, 5),
+        ]
+        # Retention walks the same order: the lowest key goes first.
+        assert bus.prune("chrome", 1) == [CommitKey(1, 10), CommitKey(1, 900)]
+
+    def test_a_state_file_with_a_bad_key_is_a_bus_error(self, bus):
+        bus.write_builder_state("v8", BuilderState(frontier=1))
+        path = bus.builder_state_path("v8")
+        data = json.loads(path.read_text())
+        data["frontier"] = "not-a-key"
+        path.write_text(json.dumps(data))
+        with pytest.raises(BusError):
+            bus.read_builder_state("v8")

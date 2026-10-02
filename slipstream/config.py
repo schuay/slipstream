@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 from importlib.resources import files as pkg_files
 
 from .host import PREFLIGHT_MODES
+from .models import CommitKey
 
 
 def parse_spanner_spec(spec: str) -> tuple[str, str, str]:
@@ -200,7 +201,7 @@ class BuildConfig:
     max_consecutive_burns: int = 3
     # Only consulted when an engine has neither published entries nor terminal
     # build failures, so a restart cannot rewind the frontier.
-    start_from: dict[str, int] = field(default_factory=dict)
+    start_from: dict[str, CommitKey] = field(default_factory=dict)
 
 
 @dataclass
@@ -335,7 +336,7 @@ class Config:
     def results_path(self) -> Path:
         return self.out_dir / self.results_dir
 
-    def commit_results_dir(self, engine: str, commit_id) -> Path:
+    def commit_results_dir(self, engine: str, key) -> Path:
         """Where one commit's stdout and stderr logs live.
 
         Under the engine, because the two engines' commit id spaces are
@@ -343,7 +344,7 @@ class Config:
         wherever the numbers happen to collide, and makes `clear` delete the
         other engine's along with its own.
         """
-        return self.results_path / engine / str(commit_id)
+        return self.results_path / engine / str(CommitKey.of(key))
 
     @property
     def logs_dir(self) -> Path:
@@ -718,7 +719,18 @@ def _parse_build(data: dict, engines: dict[str, EngineConfig]) -> BuildConfig:
     for name, value in data.get("from", {}).items():
         if name not in engines:
             raise ValueError(f"[build] from names unknown engine {name!r}")
-        start_from[name] = int(value)
+        # An int for an engine that is its own embedder; "<embedder>-<commit>"
+        # for one that is not. bool is an int subclass, and from = { v8 = true }
+        # would silently mean commit 1.
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            raise ValueError(
+                f"[build] from {name} must be a commit id or an "
+                f"embedder-commit pair, not {value!r}"
+            )
+        try:
+            start_from[name] = CommitKey.of(value)
+        except ValueError as e:
+            raise ValueError(f"[build] from {name}: {e}") from e
     return BuildConfig(
         engines=names,
         retain_gb=_positive(data, "retain_gb", 400.0, "[build]"),

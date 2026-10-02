@@ -135,7 +135,8 @@ suite = "js3"
 # min_free_gb = 100                  # stop publishing below this
 # max_infra_attempts = 5             # before a stuck sync is blamed on the commit
 # max_consecutive_burns = 3          # before the builder stalls instead
-# # from = { v8 = 109680 }           # only used when an engine has no state
+# # from = { v8 = 109680 }           # only used when an engine has no state;
+#                                    # an embedded engine's key is "EMBEDDER-COMMIT"
 #
 # [bench]
 # min_free_gb = 100                  # a payload plus its unpacked root at once

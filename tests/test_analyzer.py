@@ -7,6 +7,7 @@ import random
 
 
 from slipstream.analyzer import PerfAnalyzer, _stats
+from keys import K, K1
 
 
 class TestStats:
@@ -32,7 +33,7 @@ class TestPELTDetection:
 
         assert len(results) == 1
         cp = results[0]
-        assert cp.commit_id == 1015
+        assert cp.key == K1(1015)
         assert cp.direction == "improvement"
         assert cp.pct_change > 0.05
         assert cp.magnitude > 1.0
@@ -163,8 +164,8 @@ class TestPELTDetection:
         analyzer.load_from_db(store, "v8")
         results = analyzer.analyze()
         assert len(results) == 2
-        cids = sorted(cp.commit_id for cp in results)
-        assert cids == [1020, 1040]
+        cids = sorted(cp.key for cp in results)
+        assert cids == K(1020, 1040)
 
 
 class TestFilters:
@@ -209,8 +210,8 @@ class TestCSVLoading:
     def test_load_commit_infos(self, commit_infos_csv):
         analyzer = PerfAnalyzer()
         analyzer.load_commit_infos(str(commit_infos_csv))
-        assert 1000 in analyzer.commits
-        assert analyzer.commits[1000].hash == "hash1000"
+        assert K1(1000) in analyzer.commits
+        assert analyzer.commits[K1(1000)].hash == "hash1000"
 
     def test_csv_analysis_matches_db(self, populated_store, tmp_path, commit_infos_csv):
         """CSV and DB loading should produce the same change point."""
@@ -235,5 +236,5 @@ class TestCSVLoading:
         r_csv = a_csv.analyze()
 
         assert len(r_db) == len(r_csv)
-        assert r_db[0].commit_id == r_csv[0].commit_id
+        assert r_db[0].key == r_csv[0].key
         assert abs(r_db[0].pct_change - r_csv[0].pct_change) < 1e-10

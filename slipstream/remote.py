@@ -19,8 +19,16 @@ import shlex
 import subprocess
 from pathlib import Path
 
-from .bus import BLOB_SUFFIX, BenchState, BuilderState, Entry, state_from_json
+from .bus import (
+    BLOB_SUFFIX,
+    BenchState,
+    BuilderState,
+    Entry,
+    parse_key_stem,
+    state_from_json,
+)
 from .config import BusSource
+from .models import CommitKey
 
 
 # A consumer fetches while holding the machine lock, so a half-open connection
@@ -77,11 +85,11 @@ class SshSource:
     def _topic_dir(self, engine: str) -> str:
         return f"{self.root}/topics/builds/{engine}"
 
-    def _entry_path(self, engine: str, commit_id: int) -> str:
-        return f"{self._topic_dir(engine)}/{commit_id}.json"
+    def _entry_path(self, engine: str, key) -> str:
+        return f"{self._topic_dir(engine)}/{CommitKey.of(key)}.json"
 
-    def _blob_path(self, engine: str, commit_id: int) -> str:
-        return f"{self.root}/blobs/builds/{engine}/{commit_id}{BLOB_SUFFIX}"
+    def _blob_path(self, engine: str, key) -> str:
+        return f"{self.root}/blobs/builds/{engine}/{CommitKey.of(key)}{BLOB_SUFFIX}"
 
     def _ssh(self, command: str) -> subprocess.CompletedProcess:
         return _run(["ssh", *SSH_OPTIONS, self.host, command], timeout=SSH_TIMEOUT_SECS)
@@ -103,7 +111,7 @@ class SshSource:
         """
         return res.returncode == MISSING_EXIT
 
-    def ids_above(self, engine: str, cursor: int | None) -> list[int]:
+    def keys_above(self, engine: str, cursor) -> list[CommitKey]:
         topic = quote_remote(self._topic_dir(engine))
         res = self._ssh(f"[ -d {topic} ] || exit {MISSING_EXIT}; ls -1 {topic}")
         if res.returncode != 0:
@@ -114,16 +122,20 @@ class SshSource:
             raise subprocess.CalledProcessError(
                 res.returncode, f"ssh {self.host}", res.stdout, res.stderr
             )
-        ids = []
+        keys = []
         for name in res.stdout.split():
             stem, dot, ext = name.partition(".")
-            if dot and ext == "json" and stem.isdigit():
-                ids.append(int(stem))
-        ids.sort()
-        return ids if cursor is None else [i for i in ids if i > cursor]
+            key = parse_key_stem(stem) if dot and ext == "json" else None
+            if key is not None:
+                keys.append(key)
+        keys.sort()
+        if cursor is None:
+            return keys
+        cursor = CommitKey.of(cursor)
+        return [k for k in keys if k > cursor]
 
-    def read_entry(self, engine: str, commit_id: int) -> Entry | None:
-        path = quote_remote(self._entry_path(engine, commit_id))
+    def read_entry(self, engine: str, key) -> Entry | None:
+        path = quote_remote(self._entry_path(engine, key))
         res = self._ssh(f"[ -f {path} ] || exit {MISSING_EXIT}; cat {path}")
         if res.returncode != 0:
             if self._missing(res):
@@ -136,7 +148,7 @@ class SshSource:
             )
         return Entry.from_json(res.stdout, f"{self.host}:{path}")
 
-    def payload(self, engine: str, commit_id: int, dest: Path) -> Path:
+    def payload(self, engine: str, key, dest: Path) -> Path:
         """Stream the payload to ``dest``, resuming a previous attempt.
 
         rsync rather than scp: the rate limit units differ between them
@@ -153,7 +165,7 @@ class SshSource:
         ]
         if self.bwlimit:
             cmd.append(f"--bwlimit={self.bwlimit}")
-        remote = quote_remote(self._blob_path(engine, commit_id))
+        remote = quote_remote(self._blob_path(engine, key))
         cmd += [f"{self.host}:{remote}", str(dest)]
         res = _run(cmd)
         if res.returncode != 0:
