@@ -8,6 +8,7 @@ import json
 import sqlite3
 import time
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 
 from .models import CommitKey
@@ -64,6 +65,18 @@ SCHEMA_VERSION = "3"
 # deferred, because a daemon has no "next open".
 _MIGRATE_ATTEMPTS = 3
 _MIGRATE_RETRY_SECS = 5.0
+
+
+def _write(method):
+    """Roll back failed writes so an idle daemon cannot retain the writer lock."""
+
+    @wraps(method)
+    def write(self, *args, **kwargs):
+        with self.conn:
+            return method(self, *args, **kwargs)
+
+    return write
+
 
 # One definition per table, shared by the fresh-db path and the rebuild: the
 # migration recreates a table from this text, so there is no second copy to
@@ -492,6 +505,7 @@ class CommitStore:
     # hashes in the engine's own checkout: embedder 0 by construction. An
     # embedded engine's rows arrive through record_done with a full key.
 
+    @_write
     def insert_commits(self, engine: str, commits: list[dict]):
         """Insert (hash, title) rows; no-op if already present."""
         self.conn.executemany(
@@ -529,6 +543,7 @@ class CommitStore:
             (commit_id, date, timestamp, title, engine, hash),
         )
 
+    @_write
     def upsert_commit(
         self,
         engine: str,
@@ -656,6 +671,7 @@ class CommitStore:
         ).fetchone()
         return row is not None
 
+    @_write
     def mark_done(
         self,
         engine: str,
@@ -709,6 +725,7 @@ class CommitStore:
             },
         )
 
+    @_write
     def record_done(
         self,
         engine: str,
@@ -801,6 +818,7 @@ class CommitStore:
         ).fetchone()
         return json.loads(row[0]) if row else None
 
+    @_write
     def save_attempt(self, source, record):
         self.conn.execute(
             "INSERT INTO delivery_attempts VALUES (?, ?)",
@@ -808,6 +826,7 @@ class CommitStore:
         )
         self.conn.commit()
 
+    @_write
     def retire_attempt(self, source):
         self.conn.execute("DELETE FROM delivery_attempts WHERE source=?", (source,))
         self.conn.commit()
@@ -831,6 +850,7 @@ class CommitStore:
             self.check_pending(engine, platform, keys)
             self._clear_scores(engine, platform, keys)
 
+    @_write
     def _clear_scores(self, engine: str, platform: str, keys: list):
         """Delete only the scores of commits, leaving their state alone.
 
@@ -852,6 +872,7 @@ class CommitStore:
             self.check_pending(engine, platform, keys)
             self._clear_range(engine, platform, keys)
 
+    @_write
     def _clear_range(self, engine: str, platform: str, keys: list):
         """Delete scores, processing state, and push state for specific commits.
 
@@ -896,6 +917,7 @@ class CommitStore:
 
     # --- Scores ---
 
+    @_write
     def insert_scores(
         self,
         engine: str,
@@ -1013,6 +1035,7 @@ class CommitStore:
 
     # --- Provenance ---
 
+    @_write
     def record_run_env(self, engine: str, key, env: dict) -> None:
         """What produced one commit's numbers, for the bot that measured them.
 
@@ -1085,6 +1108,7 @@ class CommitStore:
     # terminal failure is what stops a commit that cannot be built from being
     # rebuilt every cycle forever, and what lets the frontier advance past it.
 
+    @_write
     def record_build_failure(
         self, engine: str, key, status: str, kind: str, log_path: str = ""
     ) -> int:
@@ -1110,6 +1134,7 @@ class CommitStore:
         self.conn.commit()
         return attempts
 
+    @_write
     def set_build_status(self, engine: str, key, status: str) -> None:
         """Reclassify an existing failure without counting another attempt."""
         self.conn.execute(
@@ -1119,6 +1144,7 @@ class CommitStore:
         )
         self.conn.commit()
 
+    @_write
     def request_build_retry(self, engine: str, key) -> bool:
         """Allow one more attempt at a commit the frontier has moved past.
 
@@ -1135,6 +1161,7 @@ class CommitStore:
         self.conn.commit()
         return cur.rowcount > 0
 
+    @_write
     def clear_build_state(self, engine: str, key) -> None:
         self.conn.execute(
             "DELETE FROM build_state WHERE engine=? AND embedder_id=? AND commit_id=?",
@@ -1212,6 +1239,7 @@ class CommitStore:
         ).fetchall()
         return [r[0] for r in rows]
 
+    @_write
     def mark_pushed(self, engine: str, platform: str, commit_ids: list[int]) -> None:
         """Mark commit_ids as successfully pushed to Spanner."""
         if not commit_ids:
@@ -1225,6 +1253,7 @@ class CommitStore:
         )
         self.conn.commit()
 
+    @_write
     def clear_push_state(self, engine: str, platform: str) -> None:
         """Forget every push, so the next push re-sends the full history."""
         self.conn.execute(

@@ -854,3 +854,38 @@ class TestBurnsAreCountedAgainstTheTopic:
         for cid in (10, 20, 30):
             builder.store.record_build_failure("v8", cid, "infra_burned", "sync")
         assert builder.consecutive_burns("v8") == 0
+
+
+class TestPublicationCleanup:
+    def test_contended_cleanup_preserves_publication_and_reconciles_retry(
+        self, builder, monkeypatch
+    ):
+        import sqlite3
+
+        builder.store.record_build_failure("v8", 101, "compile_failed", "compile")
+        builder.store.request_build_retry("v8", 101)
+        builder.store.conn.execute("PRAGMA busy_timeout=1")
+        writer = sqlite3.connect(builder.store.db_path, timeout=0)
+        publish = builder.bus.publish
+
+        def publish_then_contend(*args):
+            publish(*args)
+            writer.execute("BEGIN IMMEDIATE")
+
+        monkeypatch.setattr(builder.bus, "publish", publish_then_contend)
+        try:
+            result = builder.build_one("v8")
+            assert result.published
+            state = builder.bus.read_builder_state("v8")
+            assert state.frontier == K1(101)
+            assert state.in_flight is None
+            assert "cleanup deferred" in state.last_error
+            assert not builder.store.conn.in_transaction
+        finally:
+            writer.rollback()
+            writer.close()
+        monkeypatch.setattr(builder.bus, "publish", publish)
+        assert builder.build_one("v8").key == K1(102)
+        assert [h for h, _ in builder.built] == ["hash101", "hash102"]
+        assert builder.store.get_build_state("v8", 101) is None
+        assert builder.bus.read_builder_state("v8").last_error is None

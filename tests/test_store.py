@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from slipstream.models import CommitKey
 
 
@@ -806,3 +808,29 @@ class TestMigrationIsNotSilentlyDeferred:
         s.mark_done("v8", "arm64", 100)
         assert s.get_status("v8", "arm64", 100) == "ok"
         s.close()
+
+
+class TestWriteRollback:
+    def test_failed_record_done_releases_writer_and_discards_partial_metadata(
+        self, store, monkeypatch
+    ):
+        import sqlite3
+
+        def schema_error(*args, **kwargs):
+            # Metadata has already been written when processing-state fails.
+            store.conn.execute(
+                "INSERT INTO processing_state(no_such_column) VALUES (1)"
+            )
+
+        monkeypatch.setattr(store, "_mark_done", schema_error)
+        with pytest.raises(sqlite3.OperationalError):
+            store.record_done("v8", "arm64", {"hash": "abc", "commit_id": 101})
+        assert not store.conn.in_transaction
+        assert store.get_all_commits("v8") == []
+        # A different daemon can write immediately after the failed operation.
+        other = sqlite3.connect(store.db_path, timeout=0)
+        try:
+            other.execute("BEGIN IMMEDIATE")
+        finally:
+            other.rollback()
+            other.close()

@@ -231,6 +231,16 @@ class Builder:
         anyone retries, so the frontier rule would never pick it up again.
         """
         resolver = self.resolver(engine_name)
+        # Publication is durable before local cleanup. A failed cleanup must
+        # never turn a fulfilled retry into another checkout and compile.
+        published = set(self.bus.keys(engine_name))
+        recorded = {
+            CommitKey.from_commit(row) for row in self.store.build_failures(engine_name)
+        }
+        recorded.update(self.store.build_retries_requested(engine_name))
+        for key in recorded:
+            if key in published:
+                self.store.clear_build_state(engine_name, key)
         for key in self.store.build_retries_requested(engine_name):
             job = resolver.for_key(key)
             if job:
@@ -332,7 +342,13 @@ class Builder:
                 message=str(e),
             )
 
-        self.store.clear_build_state(engine_name, key)
+        cleanup_error = None
+        try:
+            self.store.clear_build_state(engine_name, key)
+        except sqlite3.Error as e:
+            self.store.conn.rollback()
+            cleanup_error = f"published {key}; database cleanup deferred: {e}"
+            self.log(f"{engine_name}: {cleanup_error}")
         state.stall_retry_after = None
         dropped = self.bus.prune(
             engine_name, self.cfg.build.retain_gb * GB, keep=entry.key
@@ -343,7 +359,7 @@ class Builder:
                 k for k in (state.highest_dropped, *dropped) if k is not None
             )
         state.stalled_since = None
-        state.last_error = None
+        state.last_error = cleanup_error
         state.in_flight = None
         self._publish_state(engine_name, state)
         self.log(
@@ -499,7 +515,17 @@ class Builder:
                 # cannot read; OSError is a full disk or a missing tar; and
                 # sqlite3.Error, which is not an OSError, is every build_state
                 # write. None of them may take the working engines down too.
+                self.store.conn.rollback()
                 self.log(f"{name}: {e}")
+                # The operation ended, even if its bookkeeping could not be
+                # committed. Clear stale in-flight state and expose the error.
+                try:
+                    state = self.bus.read_builder_state(name)
+                    state.in_flight = None
+                    state.last_error = str(e)
+                    self._publish_state(name, state)
+                except (BusError, OSError, sqlite3.Error):
+                    pass
                 continue
             finally:
                 self.lock.release()
