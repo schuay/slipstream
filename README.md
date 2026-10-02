@@ -36,6 +36,9 @@ For upgrades, stop all running `build`, `watch`, and `deliver` processes before
 its loaded code after reinstalling; leaving an old daemon running across a
 schema migration can cause incompatible writes and retained SQLite locks.
 
+See [background analysis on benchmark hosts](docs/benchmark-host.md) for disabling
+macOS media and photo analysis on a dedicated benchmark account.
+
 ## Measuring
 
 ```sh
