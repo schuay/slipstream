@@ -31,3 +31,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["slipstream"]
+
+# Resolve against PyPI regardless of what the machine's uv config says. A
+# system-wide index (a corporate proxy, say) would otherwise be baked into
+# uv.lock as the URL of every wheel, and the lock is public.
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true
