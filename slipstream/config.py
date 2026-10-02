@@ -144,6 +144,13 @@ class EngineConfig:
     pin: str | None = None  # gclient dep path of the inner engine, e.g. src/v8
     roll_file: str = "DEPS"  # relative to src_dir
     roll_regex: str | None = None  # group(1) is the inner commit hash
+    # Where gn_args go, relative to src_dir. d8 and jsc sit directly in it;
+    # a browser's binary is several directories down inside its bundle.
+    build_dir: str | None = None
+
+    def __post_init__(self):
+        if self.build_dir is None:
+            self.build_dir = str(Path(self.binary_path).parent)
 
     def require_src_dir(self) -> Path:
         if self.src_dir is None:
@@ -438,6 +445,7 @@ def load_config(user_config_path: Path | None = None) -> Config:
             pin=defaults.get("pin"),
             roll_file=defaults.get("roll_file", "DEPS"),
             roll_regex=defaults.get("roll_regex"),
+            build_dir=defaults.get("build_dir"),
         )
 
     benchmarks: dict[str, BenchmarkConfig] = {}

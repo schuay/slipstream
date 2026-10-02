@@ -321,3 +321,18 @@ class TestEmbedderResolver:
         cr.git("remote", "set-url", "origin", str(cr.path / "nowhere"))
         with pytest.raises(FetchError):
             embedder.fetch()
+
+
+class TestCommitIdLookup:
+    """The resolvers lean on the collector's id -> hash lookup for every
+    frontier, so it has to be exact, not a prefix match."""
+
+    def test_a_longer_id_with_the_same_prefix_is_not_the_commit(self, tmp_path, config):
+        repo = Repo(tmp_path / "r")
+        wanted = repo.commit(5003, "wanted", {"a": "1\n"})
+        repo.commit(50031, "a decoy that git --grep also matches", {"a": "2\n"})
+        repo.commit(500310, "and another", {"a": "3\n"})
+        resolver = _resolver(config, repo.path, repo.path)
+        collector, engine = resolver.collector, config.engines["v8"]
+        assert collector._commit_hash_from_id(engine, 5003) == wanted
+        assert collector._commit_hash_from_id(engine, 4242) == ""

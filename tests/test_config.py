@@ -725,3 +725,18 @@ class TestEmbeddedEngine:
         only runs chrome artifacts from the bus has no use for a V8 tree."""
         cfg = load_config(_write(tmp_path, '[engines.chrome]\nsrc_dir = "~/cr/src"\n'))
         assert set(cfg.engines) == {"chrome"}
+
+
+class TestBuildDir:
+    def test_defaults_to_the_binarys_directory(self, tmp_path):
+        cfg = load_config(_write(tmp_path, '[engines.v8]\nsrc_dir = "~/v8"\n'))
+        assert cfg.engines["v8"].build_dir == "out/release-lto"
+
+    def test_a_bundled_binary_can_sit_deeper_than_its_build_dir(self, tmp_path):
+        """Chromium's binary is inside an app bundle; gn gen must still
+        target the out directory, not Contents/MacOS."""
+        cfg = load_config(_write(tmp_path, '[engines.chrome]\nsrc_dir = "~/cr/src"\n'))
+        chrome = cfg.engines["chrome"]
+        assert chrome.build_dir == "out/release-lto"
+        assert chrome.binary_path.startswith(chrome.build_dir + "/")
+        assert f"-C {chrome.build_dir} " in chrome.build_cmd

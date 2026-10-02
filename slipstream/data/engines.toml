@@ -46,6 +46,7 @@ roll_file = "DEPS"
 roll_regex = "'v8_revision': '([0-9a-f]{40})'"
 build_cmd = "autoninja -C out/release-lto chrome"
 sync_cmd = "gclient sync -RD"
+build_dir = "out/release-lto"
 binary_path = "out/release-lto/Chromium.app/Contents/MacOS/Chromium"
 # The whole bundle: the framework, helpers and resources all live inside it
 # and the binary finds them relative to itself.

@@ -125,16 +125,26 @@ class BenchCollector:
 
     def _commit_hash_from_id(self, engine: EngineConfig, commit_id: int) -> str:
         src = engine.require_src_dir()
-        # Replace the capture group in the regex with the literal ID for grepping
-        grep_pattern = re.sub(r"\(\[0-9\][+?]\)", str(commit_id), engine.id_regex)
-        grep_pattern = re.sub(r"\(\[0-9\]\{6\}\)", str(commit_id), grep_pattern)
+        # The capture group becomes the literal id, closed by a non-digit or
+        # the end of the line: git's --grep is a substring match, so #5003
+        # alone would also find #50031 and, newest first, return it. ERE for
+        # the alternation; the bundled patterns read the same either way.
+        literal = f"{commit_id}([^0-9]|$)"
+        grep_pattern = re.sub(r"\(\[0-9\][+?]\)", literal, engine.id_regex)
+        grep_pattern = re.sub(r"\(\[0-9\]\{6\}\)", literal, grep_pattern)
         res = self._run(
-            f'git log origin/main --pretty=format:%H --grep="{grep_pattern}" -n 1',
+            f"git log origin/main --pretty=format:%H --extended-regexp"
+            f' --grep="{grep_pattern}" -n 5',
             cwd=src,
             capture=True,
             caffeinate=False,
         )
-        return res.stdout.strip()
+        # Bounded so git stops at the first hits rather than walking all of
+        # history, and verified so the pattern's precision is not the contract.
+        for candidate in res.stdout.split():
+            if self._commit_id_from_hash(engine, candidate) == str(commit_id):
+                return candidate
+        return ""
 
     def _commit_id_from_hash(
         self, engine: EngineConfig, commit_hash: str
@@ -341,8 +351,7 @@ class BenchCollector:
         if not engine.gn_args:
             return 0
         src = engine.require_src_dir()
-        # Extract build dir from binary_path (e.g. "out/release-lto/d8" -> "out/release-lto")
-        build_dir = str(Path(engine.binary_path).parent)
+        build_dir = engine.build_dir
         args_path = src / build_dir / "args.gn"
         desired = engine.gn_args.strip() + "\n"
         desired_norm = self._normalize_gn_args(desired)
@@ -425,10 +434,6 @@ class BenchCollector:
             self._log(f"  [red]patch step failed: {escape(str(exc))}[/red]")
             return BuildStepError("patch", 1)
 
-        rc = self._ensure_gn_args(engine, log)
-        if rc != 0:
-            return BuildStepError("gn", rc)
-
         for dep, rev in (pins or {}).items():
             cmd = f"gclient setdep --deps-file={engine.roll_file} -r {dep}@{rev}"
             rc = self._run(cmd + self._quiet(log), cwd=src, caffeinate=False).returncode
@@ -439,6 +444,12 @@ class BenchCollector:
             rc = self._run(engine.sync_cmd + self._quiet(log), cwd=src).returncode
             if rc != 0:
                 return BuildStepError("sync", rc)
+
+        # After sync: gn reads build/config and the toolchain, and sync is
+        # what puts those at the commit's revision.
+        rc = self._ensure_gn_args(engine, log)
+        if rc != 0:
+            return BuildStepError("gn", rc)
 
         rc = self._run(engine.build_cmd + self._quiet(log), cwd=src).returncode
         if rc != 0:

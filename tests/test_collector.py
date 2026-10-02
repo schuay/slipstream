@@ -627,6 +627,7 @@ class TestPinStep:
             embeds="v8",
             pin="src/v8",
             roll_regex="x",
+            gn_args="is_debug = false",
         )
         c = BenchCollector(config)
         runs = []
@@ -654,6 +655,7 @@ class TestPinStep:
             "git checkout roll",
             "gclient setdep --deps-file=DEPS -r src/v8@v8sha",
             "gclient sync",
+            "gn gen out",  # after sync, which is what moves build/ and the toolchain
             "autoninja chrome",
         ]
 
