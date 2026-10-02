@@ -150,53 +150,6 @@ class TestScores:
         rows = store.get_series("v8", "js3", "default", "regex", "Total-Score")
         assert len(rows) == 1
 
-    def test_bulk_insert_and_dedup(self, store):
-        rows = [
-            (1000, "js3", "default", "regex", "Total-Score", 1, 100.0, 1700000000),
-            (1000, "js3", "default", "regex", "Total-Score", 2, 101.0, 1700000000),
-        ]
-        store.bulk_insert_scores("v8", "arm64", rows)
-        store.bulk_insert_scores("v8", "arm64", rows)  # duplicate
-
-        result = store.get_series("v8", "js3", "default", "regex", "Total-Score")
-        assert len(result) == 2
-
-    def test_distinct_series_keys(self, store):
-        store.insert_scores(
-            "v8",
-            "arm64",
-            1000,
-            0,
-            [
-                {
-                    "suite": "js3",
-                    "flags": "default",
-                    "benchmark": "a",
-                    "metric": "Total-Score",
-                    "run": 1,
-                    "score": 1.0,
-                },
-                {
-                    "suite": "js3",
-                    "flags": "default",
-                    "benchmark": "b",
-                    "metric": "First",
-                    "run": 1,
-                    "score": 2.0,
-                },
-                {
-                    "suite": "js2",
-                    "flags": "default",
-                    "benchmark": "c",
-                    "metric": "Total-Score",
-                    "run": 1,
-                    "score": 3.0,
-                },
-            ],
-        )
-        keys = store.get_distinct_series_keys("v8")
-        assert len(keys) == 3
-
     def test_engine_isolation(self, store):
         scores = [
             {

@@ -327,30 +327,3 @@ def test_failed_aggregate_write_retries_on_idle_without_reupload(
     assert not c.errors and source.spool.fetched == [1]
     assert _agg(db)[("bench-a", "v8_default")][0] == 15.0
     assert db.query("SELECT value FROM meta WHERE key=%s", [spanner.WATERMARK_KEY])
-
-
-def test_commit_numbers_per_bot(db):
-    """compare-bots reads the pushed intersection from here."""
-    spanner.push_csv(
-        db,
-        "box1-m1",
-        _csv(
-            {"benchmark": "bench-a", "commit_id": "100"},
-            {"benchmark": "bench-a", "commit_id": "101"},
-        ),
-    )
-    spanner.push_csv(
-        db,
-        "box2-m4",
-        _csv(
-            {"benchmark": "bench-a", "commit_id": "101"},
-            {"benchmark": "bench-a", "commit_id": "102"},
-        ),
-    )
-    suite = spanner._BENCHMARK_ALIASES["js3"]
-    a = spanner.commit_numbers(db, "box1-m1", suite)
-    b = spanner.commit_numbers(db, "box2-m4", suite)
-    assert a == [100, 101]
-    assert b == [101, 102]
-    assert set(a) & set(b) == {101}
-    assert spanner.commit_numbers(db, "box1-m1", "nosuch") == []

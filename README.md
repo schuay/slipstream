@@ -74,9 +74,6 @@ for both its local DB and remote spools. The `relay` command is removed.
 See [delivery operations](docs/delivery.md) for configuration, crash recovery,
 explicit replay/rebuild, index prerequisites, and deployment/rollback preparation.
 
-Scores also move as CSV: `export` writes it and `import` reads it. One database
-holds one bot, and `import` refuses anything that is not its own machine's data.
-
 ## Development
 
 ```sh

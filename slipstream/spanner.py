@@ -382,26 +382,6 @@ def current_timestamp(db) -> datetime:
     return _to_utc(db.query("SELECT CURRENT_TIMESTAMP()")[0][0])
 
 
-def benchmark_name(suite: str) -> str:
-    """The name a suite is staged under, e.g. js3 -> jetstream3.slipstream."""
-    return _BENCHMARK_ALIASES.get(suite, suite)
-
-
-def commit_numbers(db, bot: str, benchmark: str) -> list[int]:
-    """Commit numbers this bot has staged for a benchmark, ascending.
-
-    slipstream_group_idx is on (bot, benchmark, commit_number), so this reads
-    the index rather than the table.
-    """
-    rows = db.query(
-        f"SELECT DISTINCT commit_number FROM {IMPORT_TABLE}"
-        " WHERE bot = %s AND benchmark = %s"
-        " ORDER BY commit_number",
-        [bot, benchmark],
-    )
-    return [r[0] for r in rows]
-
-
 def wipe_bot(db, bot: str) -> int:
     return db.partitioned_dml(
         f"DELETE FROM {IMPORT_TABLE} WHERE bot = @bot", {"bot": bot}

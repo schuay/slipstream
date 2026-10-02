@@ -10,8 +10,7 @@ out_dir = "~/jsc-js2"   # where results, logs, and metadata are stored
 # results_dir = "results" # subdirectory within out_dir (default: "results")
 
 # Names this machine wherever its numbers sit beside another machine's: in the
-# perf database, in the interchange CSV, and in the db itself. One db holds one
-# bot, so `import` refuses anything that is not this machine's own data.
+# perf database and in the db itself. One db holds one bot.
 # bot_name = "my-machine-local"
 
 # An engine is configured by the presence of its table. src_dir is the local

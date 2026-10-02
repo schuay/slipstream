@@ -190,13 +190,13 @@ class CommitStore:
     """SQLite-backed store for commit metadata and processing state.
 
     One db holds one bot: ``bot`` is an informational column on the row tables,
-    never a key and never filtered on, and the invariant is kept at the
-    ingress boundary (``import``) instead. See DECISIONS.md D014.
+    never a key and never filtered on; the only writer is this machine's own
+    bench session.
 
     Rows are keyed by ``CommitKey``. Every method that takes a key accepts
     the scalar spelling too (an int is embedder 0), because that is what the
-    CLI, the interchange CSV and the perf database all speak; what comes back
-    is always a ``CommitKey``.
+    CLI and the perf database speak; what comes back is always a
+    ``CommitKey``.
     """
 
     def __init__(
@@ -256,9 +256,9 @@ class CommitStore:
                 self._backup(self.conn, db_path)
             # A reporting command reads what is there rather than migrating a
             # live db on every run. A db that does not exist yet has nothing
-            # to read, so it is created either way: otherwise the first export
-            # on a fresh machine fails on a missing table instead
-            # of reporting nothing.
+            # to read, so it is created either way: otherwise the first
+            # readonly command on a fresh machine fails on a missing table
+            # instead of reporting nothing.
             if init_schema and (not readonly or not pre_existing):
                 self._init_schema()
             elif bot is not None:
@@ -930,20 +930,6 @@ class CommitStore:
         )
         self.conn.commit()
 
-    def bulk_insert_scores(self, engine: str, platform: str, rows: list[tuple]):
-        """Insert raw score tuples: (commit_id, suite, flags, benchmark, metric, run, score, timestamp).
-
-        The interchange CSV's shape, which is scalar: an imported row is
-        embedder 0.
-        """
-        self.conn.executemany(
-            "INSERT OR IGNORE INTO scores (engine, platform, embedder_id, commit_id,"
-            " suite, flags, benchmark, metric, run, score, timestamp, bot)"
-            " VALUES (?,?,0,?,?,?,?,?,?,?,?,?)",
-            [(engine, platform, *r, self._bot) for r in rows],
-        )
-        self.conn.commit()
-
     def get_series(
         self,
         engine: str,
@@ -1024,33 +1010,6 @@ class CommitStore:
         finally:
             if commit_filter:
                 self.conn.execute("DELETE FROM _export_commits")
-
-    def export_compat_rows(self, engine: str, valid_names: set[str]) -> list[tuple]:
-        """Score rows in the interchange CSV's column order, minus the bot.
-
-        Filtered to the configured benchmark names, so an engine's ad-hoc or
-        renamed benchmarks stay out of a file meant to be read elsewhere. The
-        CSV is scalar, so embedder 0 only.
-        """
-        if not valid_names:
-            return []
-        placeholders = ",".join("?" * len(valid_names))
-        rows = self.conn.execute(
-            "SELECT suite, flags, benchmark, metric, commit_id, score"
-            f" FROM scores WHERE engine=? AND embedder_id=0"
-            f" AND benchmark IN ({placeholders})"
-            " ORDER BY commit_id, suite, benchmark, metric, run",
-            (engine, *sorted(valid_names)),
-        ).fetchall()
-        return [tuple(r) for r in rows]
-
-    def get_distinct_series_keys(self, engine: str) -> list[sqlite3.Row]:
-        """Return distinct (suite, flags, benchmark, metric) tuples."""
-        return self.conn.execute(
-            "SELECT DISTINCT suite, flags, benchmark, metric FROM scores"
-            " WHERE engine=? ORDER BY suite, flags, benchmark, metric",
-            (engine,),
-        ).fetchall()
 
     # --- Provenance ---
 

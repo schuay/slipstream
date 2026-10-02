@@ -91,31 +91,3 @@ def populated_store(store):
         ]
         store.insert_scores("v8", "x86_64", cid, 1700000000, scores)
     return store
-
-
-@pytest.fixture
-def csv_new_format(tmp_path):
-    """CSV file in 6-column format with header."""
-    p = tmp_path / "raw_results-v8-arm64-1000-1002.csv"
-    p.write_text(
-        "b_type, flags, benchmark, score_type, commit_id, score\n"
-        "js3, default, test-bench, Total-Score, 1000, 100.5\n"
-        "js3, default, test-bench, Total-Score, 1000, 101.2\n"
-        "js3, default, test-bench, Total-Score, 1001, 99.8\n"
-        "js3, default, test-bench, Total-Score, 1001, 100.1\n"
-        "js3, default, test-bench, Total-Score, 1002, 110.5\n"
-        "js3, default, test-bench, Total-Score, 1002, 111.2\n"
-    )
-    return p
-
-
-@pytest.fixture
-def csv_old_format(tmp_path):
-    """CSV file in 4-column format with header."""
-    p = tmp_path / "old_results.csv"
-    p.write_text(
-        "benchmark, score_type, commit_id, score\n"
-        "test-bench, Total-Score, 1000, 100.5\n"
-        "test-bench, Total-Score, 1001, 99.8\n"
-    )
-    return p
