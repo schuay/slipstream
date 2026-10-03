@@ -31,6 +31,10 @@ from .server import BenchServer
 PAGE = "index.html"
 POLL_SECONDS = 0.5
 GRACE_SECONDS = 5.0
+# How long after the page's first request the early provenance check runs:
+# long enough for the browser to have started its content process and
+# loaded the engine, early enough that a wrong-engine run costs seconds.
+EARLY_CHECK_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -42,6 +46,16 @@ class Command:
     cwd: Path | None = None
 
 
+@dataclass(frozen=True)
+class Verdict:
+    """What a provenance check found. ``notes`` go to the stderr file
+    either way, so a passed check leaves the evidence too."""
+
+    ok: bool
+    notes: list[str] = field(default_factory=list)
+    problem: str = ""
+
+
 class BrowserRunner:
     def __init__(self, *, log: Log, progress: Progress):
         self._log = log
@@ -51,6 +65,17 @@ class BrowserRunner:
 
     def command(self, req: RunRequest, url: str) -> Command:
         raise NotImplementedError
+
+    def precondition(self, req: RunRequest) -> str | None:
+        """Why the browser must not be launched right now, or None."""
+        return None
+
+    def verify(self, req: RunRequest, proc: subprocess.Popen) -> Verdict:
+        """That what is running is what the run root holds. Called once
+        shortly after the page's first request and once when the report is
+        in; either failure fails the config. A browser whose binary is the
+        artifact has nothing to check."""
+        return Verdict(True)
 
     def cleanup(self, req: RunRequest) -> None:
         """After the browser is gone, whatever ``command`` set up."""
@@ -73,6 +98,11 @@ class BrowserRunner:
     def run(self, req: RunRequest) -> RunResult:
         label = f"{req.spec.suite} ({req.spec.variant})"
         stderr_file = req.artifact("stderr", "txt")
+        problem = self.precondition(req)
+        if problem:
+            self._fail(label, problem)
+            stderr_file.write_text(f"not launched: {problem}\n")
+            return RunResult(False, [])
         with BenchServer(req.bench.dir) as server, open(stderr_file, "w") as err_f:
             url = server.url(PAGE, report="true")
             cmd = self.command(req, url)
@@ -94,8 +124,10 @@ class BrowserRunner:
                 return RunResult(False, [])
             try:
                 body = self._await_report(
-                    server, proc, req.bench.timeout_seconds, label
+                    server, proc, req.bench.timeout_seconds, label, req, err_f
                 )
+                if body is not None and not self._verified(req, proc, label, err_f):
+                    body = None
             finally:
                 self.terminate(proc)
                 self.cleanup(req)
@@ -134,9 +166,17 @@ class BrowserRunner:
         return RunResult(True, scores)
 
     def _await_report(
-        self, server: BenchServer, proc: subprocess.Popen, timeout: float, label: str
+        self,
+        server: BenchServer,
+        proc: subprocess.Popen,
+        timeout: float,
+        label: str,
+        req: RunRequest,
+        err_f,
     ) -> bytes | None:
         deadline = time.monotonic() + timeout
+        first_request_at: float | None = None
+        checked_early = False
         while True:
             body = server.wait_for_report(POLL_SECONDS)
             if body is not None:
@@ -146,9 +186,29 @@ class BrowserRunner:
                     label, f"browser exited ({proc.returncode}) before reporting"
                 )
                 return None
-            if time.monotonic() > deadline:
+            now = time.monotonic()
+            if now > deadline:
                 self._fail(label, f"no report within {timeout:g}s")
                 return None
+            if first_request_at is None and server.requests:
+                first_request_at = now
+            if (
+                not checked_early
+                and first_request_at is not None
+                and now - first_request_at >= EARLY_CHECK_SECONDS
+            ):
+                checked_early = True
+                if not self._verified(req, proc, label, err_f):
+                    return None
+
+    def _verified(self, req: RunRequest, proc, label: str, err_f) -> bool:
+        verdict = self.verify(req, proc)
+        for note in verdict.notes:
+            err_f.write(f"provenance: {note}\n")
+        err_f.flush()
+        if not verdict.ok:
+            self._fail(label, f"provenance: {verdict.problem}")
+        return verdict.ok
 
     def _fail(self, label: str, what: str) -> None:
         self._log(f"\n    [red]Error [{label}]: {escape(what)}[/red]")

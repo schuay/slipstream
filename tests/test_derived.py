@@ -48,7 +48,9 @@ class Numbers:
 @pytest.fixture
 def world(tmp_path):
     bus = Bus(tmp_path / "bus")
-    jsc = EngineConfig("jsc", None, "make", "WebKitBuild/Release/jsc", "", run_set=RUNTIME)
+    jsc = EngineConfig(
+        "jsc", None, "make", "WebKitBuild/Release/jsc", "", run_set=RUNTIME
+    )
     safari = EngineConfig(
         "safari",
         tmp_path / "Applications",
@@ -144,7 +146,12 @@ class TestDerivedResolver:
                 f,
             )
         safari = EngineConfig(
-            "safari", apps, "", "/x", "", run_set=["Safari Technology Preview.app"],
+            "safari",
+            apps,
+            "",
+            "/x",
+            "",
+            run_set=["Safari Technology Preview.app"],
             derives="jsc",
         )
         jsc = EngineConfig("jsc", None, "make", "jsc", "", run_set=RUNTIME)
@@ -154,7 +161,12 @@ class TestDerivedResolver:
 
     def test_no_src_dir_says_what_to_set(self, tmp_path):
         safari = EngineConfig(
-            "safari", None, "", "/x", "", run_set=["Safari Technology Preview.app"],
+            "safari",
+            None,
+            "",
+            "/x",
+            "",
+            run_set=["Safari Technology Preview.app"],
             derives="jsc",
         )
         jsc = EngineConfig("jsc", None, "make", "jsc", "", run_set=RUNTIME)

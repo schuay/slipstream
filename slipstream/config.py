@@ -179,9 +179,7 @@ class EngineConfig:
         if isinstance(self.dyld_lib_path, str):
             self.dyld_lib_path = [self.dyld_lib_path]
         if self.derives and self.embeds:
-            raise ValueError(
-                f"engine {self.name}: derives and embeds are exclusive"
-            )
+            raise ValueError(f"engine {self.name}: derives and embeds are exclusive")
 
     def dyld_search_path(self, run_root: Path) -> str | None:
         """``DYLD_*_PATH`` for a run root, or None if the engine sets none."""

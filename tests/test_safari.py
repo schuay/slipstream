@@ -1,0 +1,321 @@
+# Copyright 2026 The slipstream developers
+# SPDX-License-Identifier: MIT
+
+"""The Safari runner: launch through the host's development launcher, and
+accept a run only on evidence that the processes ran the run root's engine
+inside the run root's STP."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from slipstream.config import BenchmarkConfig, EngineConfig, RunSpec
+from slipstream.runners import Command, RunRequest
+from slipstream.runners import safari as safari_mod
+from slipstream.runners.safari import SafariRunner
+from test_browser import FAKE_BROWSER, _js2_report
+
+LAUNCHER = "/Applications/Safari.app/Contents/MacOS/SafariForWebKitDevelopment"
+
+
+def _safari_engine():
+    return EngineConfig(
+        name="safari",
+        src_dir=None,
+        build_cmd="",
+        binary_path=LAUNCHER,
+        id_regex="",
+        dyld_lib_path=[
+            "WebKitBuild/Release",
+            "Safari Technology Preview.app/Contents/Frameworks",
+        ],
+        run_set=["Safari Technology Preview.app"],
+        runtime="safari",
+        derives="jsc",
+    )
+
+
+@pytest.fixture
+def req(tmp_path, monkeypatch):
+    import slipstream.runners.browser as browser
+
+    monkeypatch.setattr(browser, "POLL_SECONDS", 0.02)
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "index.html").write_text("<html>")
+    bench = BenchmarkConfig(
+        name="js2",
+        dir=suite,
+        cli="cli.js",
+        names=["Air", "Box2D", "Overall"],
+        score_regex="",
+        timeout="0.5s",
+    )
+    res = tmp_path / "res"
+    res.mkdir()
+    return RunRequest(
+        engine=_safari_engine(),
+        run_root=tmp_path / "root",
+        bench=bench,
+        spec=RunSpec(engine="safari", suite="js2", variant="default"),
+        run=1,
+        res_dir=res,
+    )
+
+
+class _Host:
+    """What the machine looks like: a process table and each process's
+    mapped images. ``root`` is the run root the images should come from."""
+
+    def __init__(self, root: Path, launcher_pid: int, live: bool = True):
+        self.root = root
+        # A host that is not live yet shows an empty process table, as the
+        # machine must before a launch; ``_Runner.command`` makes it live.
+        self.live = live
+        self.procs: list[tuple[int, str]] = [(launcher_pid, LAUNCHER)]
+        self.images: dict[int, list[str]] = {
+            launcher_pid: [
+                f"{root}/Safari Technology Preview.app/Contents/Frameworks/"
+                "Safari.framework/Versions/A/Safari"
+            ]
+        }
+
+    def content(self, pid: int, jsc_dir: str | None = None) -> None:
+        self.procs.append(
+            (
+                pid,
+                f"{jsc_dir or self.root}/WebKitBuild/Release/"
+                "com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
+            )
+        )
+        base = jsc_dir or f"{self.root}/WebKitBuild/Release"
+        self.images[pid] = [
+            f"{base}/JavaScriptCore.framework/Versions/A/JavaScriptCore"
+        ]
+
+
+class _Runner(SafariRunner):
+    """The real runner over a scripted host; the browser is the fake."""
+
+    def __init__(self, host: _Host | None = None, report=None, mode="report"):
+        super().__init__(log=lambda m: self.logged.append(m), progress=lambda: None)
+        self.logged: list[str] = []
+        self.host = host
+        self.report = report
+        self.mode = mode
+        self.real_command = False
+
+    def command(self, req, url):
+        if self.host:
+            self.host.live = True
+        if self.real_command:
+            return super().command(req, url)
+        env = dict(os.environ, FAKE_BROWSER=self.mode)
+        if self.report is not None:
+            env["FAKE_REPORT"] = json.dumps(self.report)
+        return Command([sys.executable, str(FAKE_BROWSER), url], env=env)
+
+    def processes(self):
+        return list(self.host.procs) if self.host and self.host.live else []
+
+    def loaded_images(self, pid):
+        return list(self.host.images.get(pid, [])) if self.host else []
+
+
+class _Proc:
+    def __init__(self, pid):
+        self.pid = pid
+
+
+class TestCommand:
+    def test_on_macos_the_env_rides_on_arch(self, req, monkeypatch):
+        monkeypatch.setattr(safari_mod, "_is_macos", lambda: True)
+        runner = _Runner()
+        runner.real_command = True
+        cmd = runner.command(req, "http://127.0.0.1:1/index.html?report=true")
+        root = req.run_root
+        search = f"{root}/WebKitBuild/Release:{root}/Safari Technology Preview.app/Contents/Frameworks"
+        assert cmd.argv[:2] == ["/usr/bin/arch", "-arm64e"]
+        pairs = cmd.argv[2:10]
+        assert pairs[0::2] == ["-e"] * 4
+        assert pairs[1::2] == [
+            f"DYLD_FRAMEWORK_PATH={search}",
+            f"DYLD_LIBRARY_PATH={search}",
+            f"__XPC_DYLD_FRAMEWORK_PATH={search}",
+            f"__XPC_DYLD_LIBRARY_PATH={search}",
+        ]
+        assert cmd.argv[10:13] == [
+            LAUNCHER,
+            "-HomePage",
+            "http://127.0.0.1:1/index.html?report=true",
+        ]
+        assert cmd.argv[13:] == list(safari_mod.LAUNCH_ARGS)
+        assert "DYLD_FRAMEWORK_PATH" not in cmd.env  # SIP would drop it anyway
+
+    def test_elsewhere_the_env_is_the_env(self, req, monkeypatch):
+        monkeypatch.setattr(safari_mod, "_is_macos", lambda: False)
+        runner = _Runner()
+        runner.real_command = True
+        cmd = runner.command(req, "u")
+        assert cmd.argv[0] == LAUNCHER
+        assert cmd.env["__XPC_DYLD_LIBRARY_PATH"].startswith(str(req.run_root))
+
+
+class TestPrecondition:
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "/System/Cryptexes/App/System/Applications/Safari.app/Contents/MacOS/Safari",
+            LAUNCHER,
+            "/Applications/Safari Technology Preview.app/Contents/MacOS/Safari Technology Preview",
+            "/x/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
+        ],
+    )
+    def test_anything_of_safaris_blocks_the_launch(self, req, name):
+        host = _Host(req.run_root, 1)
+        host.procs = [(4242, name)]
+        runner = _Runner(host)
+        problem = runner.precondition(req)
+        assert problem and "(4242)" in problem and "quit it" in problem
+        result = runner.run(req)
+        assert not result.ok
+        assert req.artifact("stderr", "txt").read_text().startswith("not launched:")
+
+    def test_a_quiet_machine_passes(self, req):
+        host = _Host(req.run_root, 1)
+        host.procs = [(1, "/sbin/launchd"), (77, "/usr/bin/ssh-agent")]
+        assert _Runner(host).precondition(req) is None
+
+
+class TestVerify:
+    def test_passes_when_both_layers_come_from_the_root(self, req):
+        host = _Host(req.run_root, 100)
+        host.content(200)
+        host.content(201)
+        verdict = _Runner(host).verify(req, _Proc(100))
+        assert verdict.ok
+        assert verdict.notes[0].startswith("launcher 100: Safari.framework from")
+        assert [n.split(":")[0] for n in verdict.notes[1:]] == [
+            "WebContent 200",
+            "WebContent 201",
+        ]
+
+    def test_the_launcher_on_another_safari_framework_fails(self, req):
+        host = _Host(req.run_root, 100)
+        host.images[100] = [
+            "/Applications/Safari Technology Preview.app/Contents/Frameworks/"
+            "Safari.framework/Versions/A/Safari"
+        ]
+        host.content(200)
+        verdict = _Runner(host).verify(req, _Proc(100))
+        assert not verdict.ok and "not the run root's" in verdict.problem
+
+    def test_no_content_process_with_an_engine_fails(self, req):
+        host = _Host(req.run_root, 100)
+        verdict = _Runner(host).verify(req, _Proc(100))
+        assert not verdict.ok and "no WebContent process" in verdict.problem
+
+    def test_one_content_process_on_the_system_engine_fails_all(self, req):
+        host = _Host(req.run_root, 100)
+        host.content(200)
+        host.content(201, jsc_dir="/System/Library/Frameworks")
+        verdict = _Runner(host).verify(req, _Proc(100))
+        assert not verdict.ok
+        assert "201: /System/Library/Frameworks" in verdict.problem
+
+    def test_tmp_and_private_tmp_are_the_same_root(self, req, tmp_path):
+        """lsof reports realpaths; the run root may be spelled through a
+        symlink (macOS /tmp -> /private/tmp)."""
+        link = tmp_path / "link"
+        link.symlink_to(req.run_root)
+        host = _Host(req.run_root, 100)  # images under the real path
+        host.content(200)
+        from dataclasses import replace
+
+        verdict = _Runner(host).verify(replace(req, run_root=link), _Proc(100))
+        assert verdict.ok
+
+
+class TestRun:
+    def test_a_verified_run_is_scores_with_the_evidence_on_file(self, req):
+        host = _Host(req.run_root, 0, live=False)
+        runner = _Runner(host, report=_js2_report(Air=4.0, Box2D=9.0))
+        # The launcher pid is only known once launched; the host learns it.
+        real_verify = runner.verify
+
+        def verify(req_, proc):
+            host.procs[0] = (proc.pid, LAUNCHER)
+            host.images[proc.pid] = host.images.pop(0, host.images.get(proc.pid, []))
+            if not any(p for p, _ in host.procs if p == 555):
+                host.content(555)
+            return real_verify(req_, proc)
+
+        runner.verify = verify
+        result = runner.run(req)
+        assert result.ok, runner.logged
+        stderr = req.artifact("stderr", "txt").read_text()
+        assert "provenance: launcher" in stderr
+        assert "provenance: WebContent 555: JavaScriptCore from" in stderr
+
+    def test_a_failed_check_at_report_time_fails_the_config(self, req):
+        host = _Host(
+            req.run_root, 0, live=False
+        )  # launcher images under pid 0: never match
+        runner = _Runner(host, report=_js2_report(Air=4.0, Box2D=9.0))
+        result = runner.run(req)
+        assert not result.ok and result.scores == []
+        assert any(
+            "provenance: the launcher runs no Safari.framework" in m
+            for m in runner.logged
+        )
+        assert not req.artifact("report", "json").exists()
+
+    def test_the_early_check_fails_fast(self, req, monkeypatch):
+        import slipstream.runners.browser as browser
+
+        monkeypatch.setattr(browser, "EARLY_CHECK_SECONDS", 0.0)
+        from dataclasses import replace
+
+        long_req = replace(req, bench=replace(req.bench, timeout="10s"))
+        runner = _Runner(_Host(req.run_root, 0, live=False), mode="hang")
+        t0 = time.monotonic()
+        result = runner.run(long_req)
+        assert not result.ok
+        assert time.monotonic() - t0 < 5
+        assert any("provenance:" in m for m in runner.logged)
+
+    def test_terminate_takes_the_identified_content_processes_too(
+        self, req, monkeypatch
+    ):
+        import slipstream.runners.browser as browser
+
+        monkeypatch.setattr(browser, "GRACE_SECONDS", 0.5)
+        monkeypatch.setattr(safari_mod, "GRACE_SECONDS", 0.5)
+        monkeypatch.setattr(safari_mod, "_is_macos", lambda: False)
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            start_new_session=True,
+        )
+        launcher = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            start_new_session=True,
+        )
+        host = _Host(req.run_root, launcher.pid)
+        host.content(sleeper.pid)
+        runner = _Runner(host)
+        assert runner.verify(req, launcher).ok
+        runner.terminate(launcher)
+        assert launcher.poll() is not None
+        try:
+            sleeper.wait(2)
+        except subprocess.TimeoutExpired:
+            sleeper.kill()
+            pytest.fail("the content process outlived terminate()")
+        assert runner._content_pids == []

@@ -29,8 +29,10 @@ class HostApp(NamedTuple):
 
     @property
     def title(self) -> str:
-        return f"{self.name} {self.version} ({self.short})" if self.short else (
-            f"{self.name} {self.version}"
+        return (
+            f"{self.name} {self.version} ({self.short})"
+            if self.short
+            else (f"{self.name} {self.version}")
         )
 
 

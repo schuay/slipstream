@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 from .base import Log, Progress, RunRequest, RunResult, Runner, geomean_overall
-from .browser import BrowserRunner, Command
+from .browser import BrowserRunner, Command, Verdict
 from .chromium import ChromiumRunner
+from .safari import SafariRunner
 from .server import BenchServer
 from .shell import ShellRunner
 
@@ -19,7 +20,9 @@ __all__ = [
     "RunRequest",
     "RunResult",
     "Runner",
+    "SafariRunner",
     "ShellRunner",
+    "Verdict",
     "geomean_overall",
     "runner_for",
 ]
@@ -37,4 +40,6 @@ def runner_for(runtime: str, *, log: Log, progress: Progress) -> Runner:
         return ShellRunner(log=log, progress=progress)
     if runtime == "chromium":
         return ChromiumRunner(log=log, progress=progress)
+    if runtime == "safari":
+        return SafariRunner(log=log, progress=progress)
     raise ValueError(f"no runner for runtime {runtime!r}")

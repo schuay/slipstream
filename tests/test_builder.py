@@ -1033,8 +1033,9 @@ class TestDerivedEngine:
         a = builder.bus.read_entry("safari", CommitKey(1, 101)).blobs[-1]
         b = builder.bus.read_entry("safari", CommitKey(1, 102)).blobs[-1]
         assert a.id == b.id
-        assert builder.bus.read_entry("safari", CommitKey(1, 102)).blobs[0] == (
-            builder.bus.read_entry("v8", K1(102)).blobs[0]
+        assert (
+            builder.bus.read_entry("safari", CommitKey(1, 102)).blobs[0]
+            == (builder.bus.read_entry("v8", K1(102)).blobs[0])
         )
 
     def test_numbers_come_from_the_store_and_survive_a_fresh_builder(self, derived):
@@ -1048,7 +1049,10 @@ class TestDerivedEngine:
         # The updater lands a new build.
         with open(bundle / "Info.plist", "wb") as f:
             plistlib.dump(
-                {"CFBundleName": "Safari Technology Preview", "CFBundleVersion": "22627.1"},
+                {
+                    "CFBundleName": "Safari Technology Preview",
+                    "CFBundleVersion": "22627.1",
+                },
                 f,
             )
         result = builder.build_one("safari")

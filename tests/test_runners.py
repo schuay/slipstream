@@ -46,16 +46,17 @@ class TestRuntime:
         with pytest.raises(ValueError, match="runtime must be one of"):
             _engine(runtime="wasmtime")
 
-    def test_a_known_runtime_without_a_runner_is_refused_at_bench_time(self):
-        """Known to the config, not yet driven: the config loads, the bench
-        says so when asked to use it."""
-        with pytest.raises(ValueError, match="no runner for runtime 'safari'"):
-            runner_for("safari", log=lambda m: None, progress=lambda: None)
+    def test_an_unknown_runtime_is_refused_at_bench_time(self):
+        with pytest.raises(ValueError, match="no runner for runtime 'servo'"):
+            runner_for("servo", log=lambda m: None, progress=lambda: None)
 
     def test_each_runtime_gets_its_runner(self):
+        from slipstream.runners import SafariRunner
+
         kw = dict(log=lambda m: None, progress=lambda: None)
         assert isinstance(runner_for("shell", **kw), ShellRunner)
         assert isinstance(runner_for("chromium", **kw), ChromiumRunner)
+        assert isinstance(runner_for("safari", **kw), SafariRunner)
 
 
 class TestRunRequest:
