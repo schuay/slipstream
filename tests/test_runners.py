@@ -9,6 +9,7 @@ from slipstream.collector import BenchCollector
 from slipstream.config import EngineConfig, RunSpec, load_config
 from slipstream.models import Score
 from slipstream.runners import (
+    ChromiumRunner,
     RunRequest,
     RunResult,
     ShellRunner,
@@ -48,12 +49,13 @@ class TestRuntime:
     def test_a_known_runtime_without_a_runner_is_refused_at_bench_time(self):
         """Known to the config, not yet driven: the config loads, the bench
         says so when asked to use it."""
-        with pytest.raises(ValueError, match="no runner for runtime 'chromium'"):
-            runner_for("chromium", log=lambda m: None, progress=lambda: None)
+        with pytest.raises(ValueError, match="no runner for runtime 'safari'"):
+            runner_for("safari", log=lambda m: None, progress=lambda: None)
 
-    def test_shell_engines_get_the_shell_runner(self):
-        runner = runner_for("shell", log=lambda m: None, progress=lambda: None)
-        assert isinstance(runner, ShellRunner)
+    def test_each_runtime_gets_its_runner(self):
+        kw = dict(log=lambda m: None, progress=lambda: None)
+        assert isinstance(runner_for("shell", **kw), ShellRunner)
+        assert isinstance(runner_for("chromium", **kw), ChromiumRunner)
 
 
 class TestRunRequest:

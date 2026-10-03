@@ -290,3 +290,65 @@ class TestConfig:
     def test_a_bad_duration_is_rejected(self):
         with pytest.raises(ValueError, match="not a duration"):
             parse_duration("soon")
+
+
+class TestChromiumRunner:
+    def _runner(self):
+        from slipstream.runners import ChromiumRunner
+
+        return ChromiumRunner(log=lambda m: None, progress=lambda: None)
+
+    def test_the_command_is_the_built_bundle_with_a_fresh_profile(self, req):
+        from slipstream.runners.chromium import CHROMIUM_FLAGS
+
+        spec = RunSpec(
+            engine="chrome", suite="js2", flags=("--js-flags=--maglev",), variant="mg"
+        )
+        req = RunRequest(**{**req.__dict__, "spec": spec})
+        runner = self._runner()
+        cmd = runner.command(req, "http://127.0.0.1:1/index.html?report=true")
+
+        assert cmd.argv[0] == str(req.run_root / "out/d8")
+        profile = cmd.argv[1].removeprefix("--user-data-dir=")
+        assert Path(profile).is_dir() and not os.listdir(profile)
+        assert cmd.argv[2 : 2 + len(CHROMIUM_FLAGS)] == list(CHROMIUM_FLAGS)
+        assert cmd.argv[-2:] == [
+            "--js-flags=--maglev",
+            "http://127.0.0.1:1/index.html?report=true",
+        ]
+
+        runner.cleanup(req)
+        assert not Path(profile).exists()
+
+    def test_field_trials_are_off_and_benchmarking_mode_on(self):
+        """A non-branded build applies fieldtrial_testing_config.json unless
+        told not to, and that file moves with the tree."""
+        from slipstream.runners.chromium import CHROMIUM_FLAGS
+
+        assert "--disable-field-trial-config" in CHROMIUM_FLAGS
+        assert "--enable-benchmarking" in CHROMIUM_FLAGS
+
+    def test_cleanup_without_a_command_is_fine(self, req):
+        self._runner().cleanup(req)
+
+    def test_a_real_run_through_the_fake_browser(self, req, monkeypatch):
+        """The whole path with ChromiumRunner's command: the fake stands in
+        for the binary at binary_path."""
+        from slipstream.runners import ChromiumRunner
+
+        out = req.run_root / "out"
+        out.mkdir()
+        binary = out / "d8"
+        binary.write_text(f'#!/bin/sh\nexec {sys.executable} {FAKE_BROWSER} "$@"\n')
+        binary.chmod(0o755)
+        monkeypatch.setenv("FAKE_REPORT", json.dumps(_js2_report(Air=4.0, Box2D=9.0)))
+
+        runner = ChromiumRunner(log=lambda m: None, progress=lambda: None)
+        result = runner.run(req)
+        assert result.ok
+        assert ("Overall", "Total-Score", 6.0) in {
+            (s.benchmark, s.metric, s.score) for s in result.scores
+        }
+        stderr = req.artifact("stderr", "txt").read_text()
+        assert "--disable-field-trial-config" in stderr
+        assert runner._profile is None

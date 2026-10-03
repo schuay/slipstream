@@ -5,12 +5,14 @@ from __future__ import annotations
 
 from .base import Log, Progress, RunRequest, RunResult, Runner, geomean_overall
 from .browser import BrowserRunner, Command
+from .chromium import ChromiumRunner
 from .server import BenchServer
 from .shell import ShellRunner
 
 __all__ = [
     "BenchServer",
     "BrowserRunner",
+    "ChromiumRunner",
     "Command",
     "Log",
     "Progress",
@@ -33,4 +35,6 @@ def runner_for(runtime: str, *, log: Log, progress: Progress) -> Runner:
     """
     if runtime == "shell":
         return ShellRunner(log=log, progress=progress)
+    if runtime == "chromium":
+        return ChromiumRunner(log=log, progress=progress)
     raise ValueError(f"no runner for runtime {runtime!r}")
