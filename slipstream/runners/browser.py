@@ -147,7 +147,7 @@ class BrowserRunner:
                 )
                 return None
             if time.monotonic() > deadline:
-                self._fail(label, f"no report within {int(timeout)}s")
+                self._fail(label, f"no report within {timeout:g}s")
                 return None
 
     def _fail(self, label: str, what: str) -> None:

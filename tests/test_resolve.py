@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -117,7 +118,8 @@ class Repo:
         if clone_of is None:
             path.mkdir(parents=True)
             self.git("init", "-q", "-b", "main")
-            self.git("remote", "add", "origin", str(path))
+            # Relative, so a copy of the repo is its own origin too.
+            self.git("remote", "add", "origin", ".")
         else:
             subprocess.run(
                 ["git", "clone", "-q", str(clone_of), str(path)],
@@ -125,6 +127,15 @@ class Repo:
                 check=True,
                 capture_output=True,
             )
+
+    def copy_to(self, dest: Path) -> Repo:
+        """An independent copy, for a test to mutate."""
+        shutil.copytree(self.path, dest)
+        clone = Repo.__new__(Repo)
+        clone.path = dest
+        clone.env = {**self.env, "HOME": str(dest)}
+        clone.by_pos = dict(self.by_pos)
+        return clone
 
     def git(self, *args: str) -> str:
         return subprocess.run(
@@ -178,18 +189,22 @@ def _deps(v8_sha: str, extra: str = "") -> str:
     return f"deps = {{\n  'v8_revision': '{v8_sha}',\n{extra}}}\n"
 
 
-@pytest.fixture
-def repos(tmp_path):
+# The histories take a few dozen git invocations to write, so each is built
+# once per session and every test gets a copy: a copytree of a repo this
+# size is milliseconds, and a test may still add commits to its own.
+
+
+def _build_plain(base: Path):
     """V8 1001..1008 (1007 touches nothing under src/); chromium rolls it
     1001->1003, then 1003->1005, reverts, re-rolls 1003->1006, then
     1006->1008, with non-roll DEPS churn and unrelated commits between."""
-    v8 = Repo(tmp_path / "v8")
+    v8 = Repo(base / "v8")
     for pos in range(1001, 1009):
         rel = "README" if pos == 1007 else f"src/f{pos}.cc"
         v8.commit(pos, f"v8 change {pos}", {rel: f"{pos}\n"})
     V = v8.by_pos
 
-    cr = Repo(tmp_path / "chromium")
+    cr = Repo(base / "chromium")
     cr.commit(5001, "Initial", {"DEPS": _deps(V[1001]), "foo.txt": "a\n"})
     cr.commit(5002, "Unrelated", {"foo.txt": "b\n"})
     cr.commit(5003, "Roll V8 1001..1003", {"DEPS": _deps(V[1003])})
@@ -201,6 +216,44 @@ def repos(tmp_path):
     )
     cr.commit(5008, "Roll V8 1006..1008", {"DEPS": _deps(V[1008], "  'skia': 'x',\n")})
     return v8, cr
+
+
+def _build_branched(base: Path):
+    """The same history as ``_build_plain`` -- same V8 commits, same rolls --
+    but chromium pins what it really pins: a release-branch head cut from
+    each main commit, not the main commit itself."""
+    v8 = Repo(base / "v8")
+    for pos in range(1001, 1009):
+        rel = "README" if pos == 1007 else f"src/f{pos}.cc"
+        v8.commit(pos, f"v8 change {pos}", {rel: f"{pos}\n"})
+    H = {
+        pos: v8.cut(pos, f"15.0.{pos - 1000}") for pos in (1001, 1003, 1005, 1006, 1008)
+    }
+
+    cr = Repo(base / "chromium")
+    cr.commit(5001, "Initial", {"DEPS": _deps(H[1001]), "foo.txt": "a\n"})
+    cr.commit(5002, "Unrelated", {"foo.txt": "b\n"})
+    cr.commit(5003, "Roll V8 1001..1003", {"DEPS": _deps(H[1003])})
+    cr.commit(5004, "Roll skia", {"DEPS": _deps(H[1003], "  'skia': 'x',\n")})
+    cr.commit(5005, "Roll V8 1003..1005", {"DEPS": _deps(H[1005], "  'skia': 'x',\n")})
+    cr.commit(5006, "Revert Roll V8", {"DEPS": _deps(H[1003], "  'skia': 'x',\n")})
+    cr.commit(
+        5007, "Reland Roll V8 1003..1006", {"DEPS": _deps(H[1006], "  'skia': 'x',\n")}
+    )
+    cr.commit(5008, "Roll V8 1006..1008", {"DEPS": _deps(H[1008], "  'skia': 'x',\n")})
+    return v8, cr, H
+
+
+@pytest.fixture(scope="session")
+def _histories(tmp_path_factory):
+    base = tmp_path_factory.mktemp("histories")
+    return _build_plain(base / "plain"), _build_branched(base / "branched")
+
+
+@pytest.fixture
+def repos(_histories, tmp_path):
+    v8, cr = _histories[0]
+    return v8.copy_to(tmp_path / "v8"), cr.copy_to(tmp_path / "chromium")
 
 
 def _resolver(config, v8_path: Path, cr_path: Path) -> EmbedderResolver:
@@ -238,29 +291,9 @@ def embedder(repos, config):
 
 
 @pytest.fixture
-def branched(tmp_path, config):
-    """The same history as ``repos`` -- same V8 commits, same rolls -- but
-    chromium pins what it really pins: a release-branch head cut from each
-    main commit, not the main commit itself."""
-    v8 = Repo(tmp_path / "v8")
-    for pos in range(1001, 1009):
-        rel = "README" if pos == 1007 else f"src/f{pos}.cc"
-        v8.commit(pos, f"v8 change {pos}", {rel: f"{pos}\n"})
-    H = {
-        pos: v8.cut(pos, f"15.0.{pos - 1000}") for pos in (1001, 1003, 1005, 1006, 1008)
-    }
-
-    cr = Repo(tmp_path / "chromium")
-    cr.commit(5001, "Initial", {"DEPS": _deps(H[1001]), "foo.txt": "a\n"})
-    cr.commit(5002, "Unrelated", {"foo.txt": "b\n"})
-    cr.commit(5003, "Roll V8 1001..1003", {"DEPS": _deps(H[1003])})
-    cr.commit(5004, "Roll skia", {"DEPS": _deps(H[1003], "  'skia': 'x',\n")})
-    cr.commit(5005, "Roll V8 1003..1005", {"DEPS": _deps(H[1005], "  'skia': 'x',\n")})
-    cr.commit(5006, "Revert Roll V8", {"DEPS": _deps(H[1003], "  'skia': 'x',\n")})
-    cr.commit(
-        5007, "Reland Roll V8 1003..1006", {"DEPS": _deps(H[1006], "  'skia': 'x',\n")}
-    )
-    cr.commit(5008, "Roll V8 1006..1008", {"DEPS": _deps(H[1008], "  'skia': 'x',\n")})
+def branched(_histories, tmp_path, config):
+    v8, cr, H = _histories[1]
+    v8, cr = v8.copy_to(tmp_path / "v8"), cr.copy_to(tmp_path / "chromium")
     return v8, cr, H, _resolver(config, v8.path, cr.path)
 
 
@@ -411,16 +444,14 @@ class TestBranchHeadEndpoints:
 
     def test_every_key_pins_the_main_commit_the_endpoints_included(self, branched):
         v8, cr, H, resolver = branched
+        pinned = set()
         for key in _walk(resolver, CommitKey(5001, 0)):
             job = resolver.for_key(key)
             assert job.pins == {"src/v8": v8.by_pos[key.commit_id]}, key
             assert job.commit["hash"] == v8.by_pos[key.commit_id]
             assert job.commit["title"] == f"v8 change {key.commit_id}"
+            pinned.add(job.pins["src/v8"])
         # Never the branch head itself.
-        pinned = {
-            resolver.for_key(k).pins["src/v8"]
-            for k in _walk(resolver, CommitKey(5001, 0))
-        }
         assert pinned.isdisjoint(H.values())
 
     def test_cold_starts_and_for_key(self, branched):

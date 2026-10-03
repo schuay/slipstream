@@ -107,7 +107,7 @@ explicit replay/rebuild, index prerequisites, and deployment/rollback preparatio
 
 ```sh
 uv sync
-uv run pytest tests/
+uv run pytest            # parallel by default; -n0 for a single process
 uv run ruff check slipstream tests && uv run ruff format slipstream tests
 scripts/install-hooks
 ```

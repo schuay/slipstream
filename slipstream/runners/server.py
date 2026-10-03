@@ -68,7 +68,12 @@ class BenchServer(ThreadingHTTPServer):
         self.requests: list[str] = []
         self._report: bytes | None = None
         self._reported = threading.Event()
-        self._thread = threading.Thread(target=self.serve_forever, daemon=True)
+        # shutdown() returns only when serve_forever's select loop wakes, so
+        # its poll interval is the teardown latency: the default 0.5s is
+        # paid at the end of every run and, more visibly, every test.
+        self._thread = threading.Thread(
+            target=self.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
+        )
 
     def __enter__(self) -> BenchServer:
         self._thread.start()

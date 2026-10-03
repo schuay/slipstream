@@ -168,6 +168,10 @@ class EmbedderResolver:
         self.pin = pin
         self.roll_file = roll_file
         self.roll_regex = re.compile(roll_regex)
+        # What a sha stands for never changes, and consecutive steps ask
+        # about the same roll and the same two endpoints: remember them.
+        self._points: dict[str, _Point] = {}
+        self._outer_commits: dict[str, dict] = {}
 
     # --- Resolver ---
 
@@ -262,11 +266,16 @@ class EmbedderResolver:
                 yield sha.strip(), bounds
 
     def _outer_commit(self, sha: str) -> dict | None:
+        if sha in self._outer_commits:
+            return self._outer_commits[sha]
         raw = self._git(
             self.outer,
             f'log -1 --pretty=format:"{self.collector._METADATA_FORMAT}" {sha}',
         )
-        return self.collector._parse_commit_metadata(self.outer, raw)
+        commit = self.collector._parse_commit_metadata(self.outer, raw)
+        if commit:
+            self._outer_commits[sha] = commit
+        return commit
 
     # --- the inner side ---
 
@@ -288,6 +297,8 @@ class EmbedderResolver:
         where it was cut. The id is read off that main commit with the inner
         engine's own id_regex, so the resolver keeps no second notion of it.
         """
+        if sha in self._points:
+            return self._points[sha]
         self._ensure_fetched(sha)
         if self._on_main(sha):
             base = sha
@@ -301,7 +312,10 @@ class EmbedderResolver:
                 return None
             base = m.group(1)
         found = self.collector._commit_id_from_hash(self.inner, base)
-        return _Point(base, int(found)) if found else None
+        if not found:
+            return None
+        point = self._points[sha] = _Point(base, int(found))
+        return point
 
     def _on_main(self, sha: str) -> bool:
         res = self.collector._run(

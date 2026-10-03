@@ -20,7 +20,15 @@ dependencies = [
 dev = [
     "ruff>=0.9",
     "pytest>=8",
+    "pytest-xdist>=3",
 ]
+
+# The suite is a few hundred small tests plus a handful that drive real git
+# repos and real processes; spread over the cores it runs in a fraction of
+# the serial time. Pass -n0 to run it in one process (for pdb, say).
+[tool.pytest.ini_options]
+addopts = "-n auto"
+testpaths = ["tests"]
 
 [project.scripts]
 slipstream = "slipstream.cli:app"

@@ -141,7 +141,13 @@ class _FakeBrowser(BrowserRunner):
 
 
 @pytest.fixture
-def req(tmp_path):
+def req(tmp_path, monkeypatch):
+    """A run request against the fake browser. The poll interval is the
+    granularity of every wait in the runner, so it is shortened to keep
+    these tests fast rather than half a second each."""
+    import slipstream.runners.browser as browser
+
+    monkeypatch.setattr(browser, "POLL_SECONDS", 0.02)
     suite = tmp_path / "suite"
     suite.mkdir()
     (suite / "index.html").write_text("<html>")
@@ -151,7 +157,7 @@ def req(tmp_path):
         cli="cli.js",
         names=["Air", "Box2D", "Overall"],
         score_regex="",
-        timeout="2s",
+        timeout="0.3s",
         report_metrics={"First": "Startup-Score"},
     )
     res = tmp_path / "res"
@@ -211,7 +217,7 @@ class TestBrowserRunner:
         runner = _FakeBrowser(mode="hang")
         result = runner.run(req)
         assert not result.ok
-        assert any("no report within 2s" in m for m in runner.logged)
+        assert any("no report within 0.3s" in m for m in runner.logged)
         assert _gone(runner.pid)
 
     def test_a_report_missing_a_benchmark_is_not_a_clean_run(self, req):
