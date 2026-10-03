@@ -249,6 +249,16 @@ class BenchProcessConfig:
 
 @dataclass
 class BenchmarkConfig:
+    """A suite: where it is, how its shell cli is invoked and read, and how
+    its browser report maps onto the shell's metric names.
+
+    A browser run reports JSON with a ``Score`` per benchmark and named
+    sub-scores; the shell prints ``Total-Score`` and ``<name>-Score``. That
+    rule is applied by the runner; ``report_metrics`` lists only the
+    sub-scores a suite prints under a different name, so the browser and
+    shell series of one suite share metric names.
+    """
+
     name: str
     dir: Path
     cli: str
@@ -257,6 +267,23 @@ class BenchmarkConfig:
     timeout: str = "10m"
     run_mode: str = "suite"
     suite_score_regex: str | None = None
+    report_metrics: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def timeout_seconds(self) -> float:
+        return parse_duration(self.timeout)
+
+
+_DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smh]?)\s*$")
+
+
+def parse_duration(text: str) -> float:
+    """``timeout``'s spelling, which is coreutils ``timeout``'s: a number
+    with an optional s/m/h suffix, seconds when bare."""
+    m = _DURATION_RE.match(text)
+    if not m:
+        raise ValueError(f"not a duration: {text!r}")
+    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)]
 
 
 # A variant name keys the flags column in the store, the variant column in the
@@ -482,6 +509,7 @@ def load_config(user_config_path: Path | None = None) -> Config:
             timeout=defaults.get("timeout", "10m"),
             run_mode=defaults.get("run_mode", "suite"),
             suite_score_regex=defaults.get("suite_score_regex"),
+            report_metrics=dict(defaults.get("report_metrics", {})),
         )
 
     runs = _parse_runs(user.get("run", []), engines, benchmarks, path)

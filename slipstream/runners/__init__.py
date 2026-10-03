@@ -4,9 +4,14 @@
 from __future__ import annotations
 
 from .base import Log, Progress, RunRequest, RunResult, Runner, geomean_overall
+from .browser import BrowserRunner, Command
+from .server import BenchServer
 from .shell import ShellRunner
 
 __all__ = [
+    "BenchServer",
+    "BrowserRunner",
+    "Command",
     "Log",
     "Progress",
     "RunRequest",

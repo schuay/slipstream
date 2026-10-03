@@ -8,6 +8,15 @@ names_file = "js2_names.txt"
 timeout = "15m"
 score_regex = '^([A-Za-z0-9.-]+) (Stdlib-Score|Tests-Score|Total-Score|Startup-Score|Average-Score|Worst-Case-Score|Run-Time-Score): ([0-9.]+)$'
 suite_score_regex = '^\s+([A-Za-z]+-Score):\s+([0-9.]+)$'
+# JetStreamDriver.js names the sub-scores First/Worst/Average (default
+# benchmarks), Stdlib/MainRun (WSL) and Startup/Runtime (wasm) in its report,
+# and prints four of them under other names in the shell. JetStream 3 prints
+# them as reported, so it has no table.
+[js2.report_metrics]
+First = "Startup-Score"
+Worst = "Worst-Case-Score"
+MainRun = "Tests-Score"
+Runtime = "Run-Time-Score"
 
 [js3]
 cli = "cli.js"
