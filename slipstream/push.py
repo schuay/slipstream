@@ -13,7 +13,9 @@ pushed only after every target has accepted them. A failed target leaves
 
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -83,6 +85,38 @@ def parse_seq(name: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _init_fresh_spool(spool_dir: Path) -> None:
+    """Give a spool nobody has written to its allocator, at zero.
+
+    Done before the writer lock exists, because the lock file is created by
+    whoever opens it first: a writer that merely lost the first race to a
+    sibling would otherwise find a lock and no allocator -- exactly what an
+    empty legacy spool looks like -- and refuse. ``link`` publishes the
+    allocator only if none exists, so a late sibling cannot reset one that
+    the winner has already advanced.
+    """
+    from .durability import fsync_dir
+
+    allocation = spool_dir / ".sequence"
+    if (spool_dir / ".lock").exists() or allocation.exists():
+        return
+    if any(parse_seq(p.name) for p in spool_dir.iterdir()):
+        return  # a legacy log; the writer adopts its highest number
+    fd, name = tempfile.mkstemp(prefix=".sequence-", dir=spool_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write("0\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(name, allocation)
+        except FileExistsError:
+            return
+        fsync_dir(spool_dir)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
 def spool_append(
     spool_dir: Path,
     csv_data: str,
@@ -103,7 +137,7 @@ def spool_append(
     from .durability import FileLock, atomic_write, durable_mkdir
 
     durable_mkdir(spool_dir)
-    legacy_lock_existed = (spool_dir / ".lock").exists()
+    _init_fresh_spool(spool_dir)
     with FileLock(
         spool_dir / ".lock", timeout=timeout, should_stop=should_stop, log=log
     ):
@@ -122,11 +156,13 @@ def spool_append(
             if last < max(seqs, default=0) or last < 0:
                 raise ValueError("spool allocator is behind published entries")
         except FileNotFoundError:
-            if not seqs and legacy_lock_existed:
+            # A fresh spool got its allocator above; one without it was
+            # written by a version that had none.
+            if not seqs:
                 raise ValueError(
                     "empty legacy spool has no allocator; recover its last sequence explicitly"
                 )
-            last = max(seqs, default=0)  # adopt legacy log without resetting it
+            last = max(seqs)  # adopt legacy log without resetting it
         seq = last + 1
         # Reserve durably before publication: a crash can leave a visible gap,
         # but never reuses a number after retention or an interrupted append.

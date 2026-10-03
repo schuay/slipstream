@@ -234,6 +234,23 @@ class TestSpoolTarget:
             f"row {i}\n" for i in range(8)
         )
 
+    def test_a_siblings_lock_file_is_not_a_legacy_spool(self, tmp_path):
+        # The lock file exists as soon as any writer opens it, before the
+        # winner has allocated anything. A fresh spool therefore gets its
+        # allocator first, so the loser does not find "a lock and no
+        # allocator" -- the empty-legacy shape -- and refuse.
+        from slipstream.push import _init_fresh_spool
+
+        spool = tmp_path / "outbox"
+        spool.mkdir()
+        _init_fresh_spool(spool)
+        assert (spool / ".sequence").read_text() == "0\n"
+        (spool / ".lock").touch()  # a sibling opened the lock
+        assert spool_append(spool, "x", 90) == 1
+        # And a late sibling cannot reset an allocator that has moved on.
+        _init_fresh_spool(spool)
+        assert spool_append(spool, "x", 90) == 2
+
     def test_prune_drops_entries_past_retention(self, tmp_path):
         spool = tmp_path / "outbox"
         for _ in range(3):
