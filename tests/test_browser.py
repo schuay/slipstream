@@ -287,6 +287,17 @@ class TestConfig:
         assert config.benchmarks["js3"].report_metrics == {}
         assert config.benchmarks["js3"].timeout_seconds == 900
 
+    def test_js3_names_include_the_worker_only_benchmarks(self, tmp_path):
+        # The shell never runs them, but a browser report must have them and
+        # the delivery filter must let them through, and both read this list.
+        (tmp_path / "js3").mkdir()
+        cfg = tmp_path / "config.toml"
+        cfg.write_text(
+            f'out_dir = "{tmp_path}"\n[benchmarks.js3]\ndir = "{tmp_path}/js3"\n'
+        )
+        names = set(load_config(cfg).benchmarks["js3"].names)
+        assert {"bomb-workers", "segmentation"} <= names
+
     @pytest.mark.parametrize(
         "text,seconds", [("15m", 900), ("90", 90), ("2s", 2), ("1.5h", 5400)]
     )

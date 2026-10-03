@@ -15,6 +15,7 @@ stanford-crypto-aes
 sqlite3-wasm
 splay
 source-map-wtb
+segmentation
 richards-wasm
 richards
 regexp-octane
@@ -59,6 +60,7 @@ crypto
 chai-wtb
 cdjs
 Box2D
+bomb-workers
 bigint-noble-ed25519
 Basic
 babylonjs-startup-es6
