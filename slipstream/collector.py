@@ -494,6 +494,10 @@ class BenchCollector:
         for run in range(1, runs + 1):
             self._log(f"  Run [bold]{run}/{runs}[/bold]:")
             for rc in run_configs:
+                # Before the config's progress line, so the wait's log lines
+                # stand on their own and the elapsed time is the measurement's.
+                if not self.dry_run:
+                    self.cool_down(self._log)
                 console.print(f"    {rc.suite} ({rc.variant}): ", end="")
                 t0 = time.time()
                 configs_total += 1
@@ -501,7 +505,6 @@ class BenchCollector:
                     console.print("." * 5, end="")
                     result = RunResult(True, [])
                 else:
-                    self.cool_down(self._log)
                     result = runner.run(
                         RunRequest(
                             engine=engine,
