@@ -47,6 +47,20 @@ src_dir = "~/src/WebKit"
 # [engines.chrome]
 # src_dir = "~/src/chromium/src"
 
+# safari is Safari Technology Preview around jsc's WebKit build: nothing is
+# compiled, each entry is a jsc entry's blobs plus the installed app, keyed
+# "<STP number>-<WebKit position>" with the number assigned by the builder per
+# distinct installed STP (auto-update stays on; a new build string is a new
+# number). The building box needs STP installed and src_dir pointing at the
+# directory holding "Safari Technology Preview.app", plus [engines.jsc]
+# publishing the full runtime; only such jsc entries are taken. A benching box
+# needs an empty table, system Safari (its development launcher is the
+# process), and no Safari of any kind running: a run is refused beside one,
+# and accepted only once the launcher and its WebContent processes are seen
+# to have loaded the run root's frameworks.
+# [engines.safari]
+# src_dir = "/Applications"
+
 [benchmarks.js2]
 dir = "~/JetStream2"
 
