@@ -335,12 +335,15 @@ class TestBusCommands:
         from slipstream.bus import Bus
 
         bus = Bus(tmp_path / "bus")
-        orphan = bus.tmp_blob("v8", 100)
+        orphan = bus.tmp_blob("abc")
         orphan.write_bytes(b"partial")
+        unreferenced = bus.blob_path("def")
+        unreferenced.parent.mkdir(parents=True)
+        unreferenced.write_bytes(b"no manifest names me")
         res = self._invoke(["bus", "gc", "--config", str(self._cfg(tmp_path))])
         assert res.exit_code == 0, res.output
-        assert "1 unreferenced payloads removed" in res.output
-        assert not orphan.exists()
+        assert "2 unreferenced files removed" in res.output
+        assert not orphan.exists() and not unreferenced.exists()
 
     def test_pause_and_resume(self, tmp_path):
         from slipstream import lock as lock_mod

@@ -4,9 +4,9 @@
 """A bus root on another machine, reached over ssh.
 
 Listing and reading entries mirror the relay's RemoteSpool: small text over
-`ssh host cat`. Fetching a payload does not. RemoteSpool runs ssh with
+`ssh host cat`. Fetching a blob does not. RemoteSpool runs ssh with
 capture_output and text=True, which would decode a .tar.zst as UTF-8 and buffer
-hundreds of MB in the memory of a machine that is benchmarking. Payloads go
+hundreds of MB in the memory of a machine that is benchmarking. Blobs go
 through rsync instead, which streams to a file and takes a rate limit.
 
 Connectivity is one-directional by design: box1 reaches box2, box2 initiates
@@ -22,12 +22,15 @@ from pathlib import Path
 from .bus import (
     BLOB_SUFFIX,
     BenchState,
+    Blob,
+    Bus,
     BuilderState,
     Entry,
     parse_key_stem,
     state_from_json,
 )
 from .config import BusSource
+from .consumer import ShaMismatch, verify_blob
 from .models import CommitKey
 
 
@@ -51,8 +54,8 @@ SSH_TIMEOUT_SECS = 120
 # to collide with neither ssh's own 255 nor the 1 and 2 that ls and cat use for
 # their other failures.
 MISSING_EXIT = 3
-# rsync's own I/O inactivity timeout, not a wall clock: a payload is hundreds
-# of MB and may legitimately take a long time over a slow link.
+# rsync's own I/O inactivity timeout, not a wall clock: a blob is hundreds of
+# MB and may legitimately take a long time over a slow link.
 RSYNC_IO_TIMEOUT_SECS = 300
 
 
@@ -87,9 +90,6 @@ class SshSource:
 
     def _entry_path(self, engine: str, key) -> str:
         return f"{self._topic_dir(engine)}/{CommitKey.of(key)}.json"
-
-    def _blob_path(self, engine: str, key) -> str:
-        return f"{self.root}/blobs/builds/{engine}/{CommitKey.of(key)}{BLOB_SUFFIX}"
 
     def _ssh(self, command: str) -> subprocess.CompletedProcess:
         return _run(["ssh", *SSH_OPTIONS, self.host, command], timeout=SSH_TIMEOUT_SECS)
@@ -148,13 +148,49 @@ class SshSource:
             )
         return Entry.from_json(res.stdout, f"{self.host}:{path}")
 
-    def payload(self, engine: str, key, dest: Path) -> Path:
-        """Stream the payload to ``dest``, resuming a previous attempt.
+    def fetch(self, entry: Entry, into: Bus) -> list[Path]:
+        """Make the entry's blobs readable here; returns their paths in order.
+
+        Only blobs ``into`` does not already hold cross the link: one rsync
+        per blob, resuming a previous attempt, verified in tmp and then
+        renamed into the store under its id. A single-blob entry therefore
+        costs what a payload did; a multi-blob one costs what the commit
+        changed.
 
         rsync rather than scp: the rate limit units differ between them
         (rsync KB/s, scp Kbit/s), so the tool is pinned to keep the config
         value meaningful.
         """
+        label = f"{entry.engine} {entry.key}"
+        paths = []
+        for blob in entry.blobs:
+            dest = into.blob_path(blob.id)
+            if not dest.exists():
+                # A stable name, not a unique one: --partial --inplace resume
+                # from whatever the last attempt left under it.
+                tmp = into.tmp_dir / f"{blob.id}{BLOB_SUFFIX}"
+                tmp.parent.mkdir(parents=True, exist_ok=True)
+                self._rsync(self._remote_blob_path(entry, blob), tmp)
+                try:
+                    verify_blob(tmp, blob, label)
+                except ShaMismatch:
+                    # Not an interrupted transfer, so there is nothing to
+                    # resume from: the bytes on disk are the wrong ones.
+                    tmp.unlink(missing_ok=True)
+                    raise
+                into.store_blob(tmp, blob.id)
+            paths.append(dest)
+        return paths
+
+    def _remote_blob_path(self, entry: Entry, blob: Blob) -> str:
+        if entry.version == 1:
+            return (
+                f"{self.root}/blobs/builds/{entry.engine}/"
+                f"{CommitKey.of(entry.key)}{BLOB_SUFFIX}"
+            )
+        return f"{self.root}/blobs/{blob.id}{BLOB_SUFFIX}"
+
+    def _rsync(self, remote_path: str, dest: Path) -> None:
         cmd = [
             "rsync",
             "--partial",
@@ -165,24 +201,17 @@ class SshSource:
         ]
         if self.bwlimit:
             cmd.append(f"--bwlimit={self.bwlimit}")
-        remote = quote_remote(self._blob_path(engine, key))
-        cmd += [f"{self.host}:{remote}", str(dest)]
+        cmd += [f"{self.host}:{quote_remote(remote_path)}", str(dest)]
         res = _run(cmd)
         if res.returncode != 0:
             # The partial file stays, which is what --partial --inplace are
-            # for: a payload is hundreds of MB over a link slow enough to want
-            # a bwlimit, and deleting it here would restart from zero every
+            # for: a blob is hundreds of MB over a link slow enough to want a
+            # bwlimit, and deleting it here would restart from zero every
             # time the connection dropped. bus gc reclaims one that never
             # completes.
             raise subprocess.CalledProcessError(
                 res.returncode, cmd, res.stdout, res.stderr
             )
-        return dest
-
-    def keep_payload(self) -> bool:
-        # A remote payload is this machine's own copy; it goes as soon as the
-        # unpack is verified.
-        return False
 
     def builder_state(self, engine: str) -> BuilderState:
         """What the far builder knows: frontier, retention, failures, stalls.

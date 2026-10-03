@@ -615,6 +615,7 @@ def build(
     _host_preflight(cfg)
     should_stop = _shutdown_flag("current build")
     typer.echo(f"Building {', '.join(engine_names)} (interval={interval})")
+    builder.migrate(should_stop)
 
     while not should_stop():
         t0 = time.monotonic()
@@ -702,16 +703,13 @@ def bus_status(
 
 @bus_app.command("gc")
 def bus_gc(
-    engines: Annotated[
-        Optional[list[str]], typer.Argument(help="Engines (default: all configured)")
-    ] = None,
     config: Optional[Path] = typer.Option(None, help="User config path"),
 ):
-    """Delete payloads with no entry, left by a crash mid-publish or mid-prune.
+    """Delete blobs nothing names, left by a crash mid-publish or mid-prune.
 
-    Takes the machine lock: an unreferenced payload is also what a build in
+    Takes the machine lock: an unreferenced blob is also what a build in
     progress looks like from outside, both while zstd is writing its tmp file
-    and in the window between the payload landing and its entry being written.
+    and in the window between the blobs landing and their entry being written.
     """
     from .bus import Bus
     from .lock import EXIT_BUSY, LockBusy, MachineLock
@@ -730,12 +728,12 @@ def bus_gc(
         )
         raise typer.Exit(EXIT_BUSY)
     try:
-        removed = Bus(cfg.bus.root).gc(engines or list(cfg.engines))
+        removed = Bus(cfg.bus.root).gc()
     finally:
         lock.release()
     for path in removed:
         typer.echo(f"  removed {path}")
-    typer.echo(f"{len(removed)} unreferenced payloads removed.")
+    typer.echo(f"{len(removed)} unreferenced files removed.")
 
 
 @bus_app.command("pause")

@@ -3,17 +3,20 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import subprocess
 
 import pytest
 
-from slipstream.bus import Bus, BuilderState, Entry, sha256_file
+from slipstream.bus import Blob, Bus, BuilderState, Entry
 from slipstream.config import BusSource
+from slipstream.consumer import ShaMismatch
 from slipstream.remote import SshSource, quote_remote
 from keys import K, K1
 
 
-def _entry(commit_id):
+def _entry(commit_id, blobs=None):
     return Entry(
         engine="v8",
         commit_id=commit_id,
@@ -22,9 +25,16 @@ def _entry(commit_id):
         timestamp=1757116800,
         title=f"commit {commit_id}",
         build_cfg_hash="sha256:cfg",
-        blob_sha256="sha",
-        blob_bytes=3,
+        blobs=blobs or [Blob("out", f"id{commit_id}", "sha", 3)],
     )
+
+
+def _store(bus, payload, path="out"):
+    blob_id = hashlib.sha256(payload).hexdigest()[:16]
+    tmp = bus.tmp_blob(blob_id)
+    tmp.write_bytes(payload)
+    bus.store_blob(tmp, blob_id)
+    return Blob(path, blob_id, hashlib.sha256(payload).hexdigest(), len(payload))
 
 
 @pytest.fixture
@@ -61,13 +71,13 @@ def remote(tmp_path, monkeypatch):
     return type("R", (), {"far": far, "source": source, "calls": calls})
 
 
-def _publish(far, commit_id, payload=b"abc"):
-    tmp = far.tmp_blob("v8", commit_id)
-    tmp.write_bytes(payload)
-    entry = _entry(commit_id)
-    entry.blob_sha256 = sha256_file(tmp)
-    entry.blob_bytes = len(payload)
-    far.publish(entry, tmp)
+def _publish(far, commit_id, payload=None, blobs=None):
+    if blobs is None:
+        if payload is None:
+            payload = f"payload {commit_id}".encode()
+        blobs = [_store(far, payload)]
+    entry = _entry(commit_id, blobs)
+    far.publish(entry)
     return entry
 
 
@@ -104,57 +114,112 @@ class TestEntries:
         assert remote.source.read_entry("v8", 100) is None
 
 
-class TestPayload:
-    def test_streams_to_a_file_with_the_rate_limit(self, remote, tmp_path):
-        _publish(remote.far, 100, b"payload bytes")
-        dest = tmp_path / "fetched.tar.zst"
-        assert remote.source.payload("v8", 100, dest) == dest
-        assert dest.read_bytes() == b"payload bytes"
+class TestFetch:
+    @pytest.fixture
+    def local(self, tmp_path):
+        return Bus(tmp_path / "local")
+
+    def test_streams_to_the_store_with_the_rate_limit(self, remote, local):
+        entry = _publish(remote.far, 100, b"payload bytes")
+        paths = remote.source.fetch(entry, local)
+        assert paths == [local.blob_path(entry.blobs[0].id)]
+        assert paths[0].read_bytes() == b"payload bytes"
         (rsync,) = [c for c in remote.calls if c[0] == "rsync"]
         assert "--bwlimit=20000" in rsync
-        # Not ssh cat: that decodes the payload as text and buffers it whole.
+        # Not ssh cat: that decodes the blob as text and buffers it whole.
         assert not any(c[0] == "ssh" and "cat" in c[2] for c in remote.calls)
+        # Nothing is left in tmp once the blob is stored.
+        assert not list(local.tmp_dir.glob("*"))
 
-    def test_no_rate_limit_when_unset(self, tmp_path, monkeypatch):
+    def test_only_blobs_the_store_lacks_cross_the_link(self, remote, local):
+        """The ICU file is the same for every commit; it is fetched once."""
+        icu = _store(remote.far, b"icu" * 10, path="icudtl.dat")
+        first = _publish(remote.far, 100, blobs=[_store(remote.far, b"d8 100"), icu])
+        second = _publish(remote.far, 101, blobs=[_store(remote.far, b"d8 101"), icu])
+        remote.source.fetch(first, local)
+        remote.calls.clear()
+        paths = remote.source.fetch(second, local)
+        assert [p.name for p in paths] == [f"{b.id}.tar.zst" for b in second.blobs]
+        rsyncs = [c for c in remote.calls if c[0] == "rsync"]
+        assert len(rsyncs) == 1 and second.blobs[0].id in rsyncs[0][-2]
+
+    def test_no_rate_limit_when_unset(self, local, monkeypatch):
         source = SshSource(BusSource(name="box2", root="/bus", ssh_host="box2"))
-        monkeypatch.setattr(
-            "slipstream.remote._run",
-            lambda cmd, timeout=None: subprocess.CompletedProcess(cmd, 0, "", ""),
-        )
-        source.payload("v8", 100, tmp_path / "x")
-        # No exception and no bwlimit flag is the whole assertion.
+        calls = []
 
-    def test_a_failed_fetch_keeps_the_partial_for_the_next_attempt(
-        self, remote, tmp_path
-    ):
-        """--partial --inplace are there because a payload is hundreds of MB
-        over a link slow enough to want a bwlimit."""
-        dest = tmp_path / "fetched.tar.zst"
-        dest.write_bytes(b"half a payload")
+        def fake(cmd, timeout=None):
+            calls.append(cmd)
+            # Produce the file rsync would have, with the right content.
+            local.tmp_dir.mkdir(parents=True, exist_ok=True)
+            (local.tmp_dir / "abc.tar.zst").write_bytes(b"x")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr("slipstream.remote._run", fake)
+        blob = Blob("out", "abc", hashlib.sha256(b"x").hexdigest(), 1)
+        source.fetch(_entry(100, [blob]), local)
+        assert not any(c.startswith("--bwlimit") for c in calls[0])
+
+    def test_a_failed_fetch_keeps_the_partial_for_the_next_attempt(self, remote, local):
+        """--partial --inplace are there because a blob is hundreds of MB
+        over a link slow enough to want a bwlimit. The partial has a stable
+        name, so the next attempt finds it."""
+        entry = _entry(999, [Blob("out", "missing", "sha", 3)])
+        local.tmp_dir.mkdir(parents=True)
+        partial = local.tmp_dir / "missing.tar.zst"
+        partial.write_bytes(b"half a blob")
         with pytest.raises(subprocess.CalledProcessError):
-            remote.source.payload("v8", 999, dest)
-        assert dest.read_bytes() == b"half a payload"
+            remote.source.fetch(entry, local)
+        assert partial.read_bytes() == b"half a blob"
 
-    def test_a_remote_payload_is_not_kept(self, remote):
-        assert remote.source.keep_payload() is False
+    def test_a_blob_that_does_not_match_is_deleted_not_resumed(self, remote, local):
+        """Nothing to resume from: the bytes on disk are the wrong ones."""
+        entry = _publish(remote.far, 100, b"good")
+        remote.far.blob_path(entry.blobs[0].id).write_bytes(b"bad!")
+        with pytest.raises(ShaMismatch):
+            remote.source.fetch(entry, local)
+        assert not list(local.tmp_dir.glob("*"))
+        assert not local.has_blob(entry.blobs[0].id)
 
-    def test_the_remote_path_is_quoted_like_every_other_one(
-        self, tmp_path, monkeypatch
-    ):
+    def test_the_remote_path_is_quoted_like_every_other_one(self, local, monkeypatch):
         """Listing and entry reads would work and only the fetch would fail,
         with an rsync error pointing at nothing."""
         calls = []
-        monkeypatch.setattr(
-            "slipstream.remote._run",
-            lambda cmd, timeout=None: (
-                calls.append(cmd),
-                subprocess.CompletedProcess(cmd, 0, "", ""),
-            )[1],
-        )
+
+        def fake(cmd, timeout=None):
+            calls.append(cmd)
+            local.tmp_dir.mkdir(parents=True, exist_ok=True)
+            (local.tmp_dir / "abc.tar.zst").write_bytes(b"x")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr("slipstream.remote._run", fake)
         source = SshSource(BusSource(name="box2", root="~/a dir/bus", ssh_host="box2"))
-        source.payload("v8", 100, tmp_path / "out")
+        blob = Blob("out", "abc", hashlib.sha256(b"x").hexdigest(), 1)
+        source.fetch(_entry(100, [blob]), local)
         (remote_arg,) = [c for c in calls[0] if c.startswith("box2:")]
-        assert remote_arg == "box2:~/'a dir/bus/blobs/builds/v8/100.tar.zst'"
+        assert remote_arg == "box2:~/'a dir/bus/blobs/abc.tar.zst'"
+
+    def test_a_version_one_entry_is_fetched_from_its_old_path(self, remote, local):
+        """A builder not yet restarted since the upgrade still serves these."""
+        payload = b"old payload"
+        legacy = remote.far.legacy_blob_path("v8", 100)
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes(payload)
+        data = json.loads(_entry(100).to_json())
+        del data["blobs"]
+        data.update(
+            version=1,
+            blob_sha256=hashlib.sha256(payload).hexdigest(),
+            blob_bytes=len(payload),
+        )
+        remote.far.entry_path("v8", 100).parent.mkdir(parents=True)
+        remote.far.entry_path("v8", 100).write_text(json.dumps(data))
+
+        entry = remote.source.read_entry("v8", 100)
+        assert entry.version == 1
+        (path,) = remote.source.fetch(entry, local)
+        assert path.read_bytes() == payload
+        (rsync,) = [c for c in remote.calls if c[0] == "rsync"]
+        assert rsync[-2].endswith("/blobs/builds/v8/100.tar.zst")
 
 
 class TestBuilderState:
@@ -182,7 +247,7 @@ class TestQuoting:
 
 def test_a_remote_source_drives_the_consumer(config, tmp_path, monkeypatch, remote):
     """The consumer does not know which kind of source it has."""
-    from slipstream.builder import package
+    from slipstream.builder import store_run_set
     from slipstream.collector import BenchCollector, BenchOutcome
     from slipstream.config import BusConfig, EngineConfig
     from slipstream.consumer import BusConsumer
@@ -190,12 +255,9 @@ def test_a_remote_source_drives_the_consumer(config, tmp_path, monkeypatch, remo
     src = tmp_path / "build"
     (src / "out").mkdir(parents=True)
     (src / "out" / "d8").write_bytes(b"binary")
-    blob = remote.far.tmp_blob("v8", 100)
-    package(src, ["out"], blob, caffeinate=False)
-    entry = _entry(100)
-    entry.blob_sha256 = sha256_file(blob)
-    entry.blob_bytes = blob.stat().st_size
-    remote.far.publish(entry, blob)
+    blobs = store_run_set(remote.far, src, ["out"], caffeinate=False)
+    entry = _entry(100, blobs)
+    remote.far.publish(entry)
 
     bus_source = BusSource(
         name="box2", root=str(remote.far.root), ssh_host="box2", engines=["v8"]
@@ -231,8 +293,12 @@ def test_a_remote_source_drives_the_consumer(config, tmp_path, monkeypatch, remo
     assert result.benched == 1 and result.error is None
     assert (roots[0] / "out" / "d8").read_bytes() == b"binary"
     assert collector.store.is_done("v8", config.platform, 100)
-    # The fetched payload is this machine's own copy and goes after unpacking.
-    assert not list((config.bus.root / "tmp").glob("*.tar.zst"))
+    # The fetched blob is in this machine's store, named by the bench state
+    # and so kept for the next entry to share; tmp is clean.
+    local = Bus(config.bus.root)
+    assert local.has_blob(entry.blobs[0].id)
+    assert local.read_bench_state("v8").blobs == [entry.blobs[0].id]
+    assert not list(local.tmp_dir.glob("*"))
 
 
 class TestUnreachableIsNotMissing:
@@ -282,8 +348,8 @@ class TestTransportHardening:
     def test_rsync_carries_an_io_timeout_and_the_same_ssh_options(
         self, remote, tmp_path
     ):
-        _publish(remote.far, 100, b"payload")
-        remote.source.payload("v8", 100, tmp_path / "out.tar.zst")
+        entry = _publish(remote.far, 100, b"payload")
+        remote.source.fetch(entry, Bus(tmp_path / "local"))
         (rsync,) = [c for c in remote.calls if c[0] == "rsync"]
         assert any(c.startswith("--timeout=") for c in rsync)
         assert any("BatchMode=yes" in c for c in rsync)

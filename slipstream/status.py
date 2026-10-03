@@ -208,7 +208,7 @@ def _fill_bus_status(cfg, bus, store, source, name, st, mine):
         st.env_divergence = compare_env(mine, theirs)
         st.env_since = theirs.get("since")
 
-    st.blob_gb = _dir_bytes(bus.blob_dir(name)) / GB
+    st.blob_gb = bus.footprint(name) / GB
     st.roots_gb = _dir_bytes(bus.root / "roots" / name) / GB
 
 

@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from slipstream.builder import package
-from slipstream.bus import Bus, Entry, sha256_file
+from slipstream.builder import store_run_set
+from slipstream.bus import Bus, Entry
 from slipstream.collector import BenchCollector, BenchOutcome
 from slipstream.config import BusConfig, BusSource, EngineConfig
 from slipstream.consumer import BusConsumer, ConsumerError, ShaMismatch
@@ -54,12 +54,16 @@ def setup(config, tmp_path, monkeypatch):
 
     bus = Bus(bus_root)
 
-    def publish(commit_id, binary=b"#!/bin/sh\nexit 0\n", **entry_fields):
+    def publish(commit_id, binary=None, run_set=("out",), **entry_fields):
+        """A built commit. The binary differs per commit unless given, so
+        entries do not share a blob by accident."""
+        if binary is None:
+            binary = f"#!/bin/sh\n# {commit_id}\nexit 0\n".encode()
         src = tmp_path / "build" / str(commit_id)
         (src / "out").mkdir(parents=True, exist_ok=True)
         (src / "out" / "d8").write_bytes(binary)
-        blob = bus.tmp_blob("v8", commit_id)
-        package(src, ["out"], blob, caffeinate=False)
+        (src / "icudtl.dat").write_bytes(b"icu data, the same for every commit")
+        blobs = store_run_set(bus, src, list(run_set), caffeinate=False)
         commit = _commit(commit_id)
         entry = Entry(
             engine="v8",
@@ -69,15 +73,17 @@ def setup(config, tmp_path, monkeypatch):
             timestamp=commit["timestamp"],
             title=commit["title"],
             build_cfg_hash="sha256:cfg",
-            blob_sha256=sha256_file(blob),
-            blob_bytes=blob.stat().st_size,
+            blobs=blobs,
             builder={"bot": "box2-m4", "toolchain": "clang-21"},
             built_at=1757116999,
             build_secs=1183,
             **entry_fields,
         )
-        bus.publish(entry, blob)
+        bus.publish(entry)
         return entry
+
+    def blob_path(commit_id, index=0):
+        return bus.blob_path(bus.read_entry("v8", commit_id).blobs[index].id)
 
     return type(
         "Setup",
@@ -89,6 +95,7 @@ def setup(config, tmp_path, monkeypatch):
             "collector": collector,
             "source": config.bus.sources[0],
             "publish": staticmethod(publish),
+            "blob_path": staticmethod(blob_path),
             "tmp_path": tmp_path,
         },
     )
@@ -241,49 +248,52 @@ class TestProvisioning:
         (_, root) = scored[0]
         assert (root / "out" / "d8").read_bytes() == b"the real d8"
 
-    def test_a_corrupt_payload_is_refused(self, setup, scored):
+    def test_a_multi_blob_entry_unpacks_as_a_union(self, setup, scored):
+        """Each run set entry is one blob; the run root is all of them."""
+        entries = [
+            setup.publish(cid, run_set=("out", "icudtl.dat")) for cid in (100, 101)
+        ]
+        # The binary differs, the ICU file does not: one blob is shared.
+        assert entries[0].blobs[0].id != entries[1].blobs[0].id
+        assert entries[0].blobs[1] == entries[1].blobs[1]
+        assert _drain(setup) == 2
+        for _, root in scored:
+            assert (root / "out" / "d8").exists()
+            assert (root / "icudtl.dat").read_bytes().startswith(b"icu data")
+
+    def test_a_corrupt_blob_is_refused(self, setup, scored):
         setup.publish(100)
-        setup.bus.blob_path("v8", 100).write_bytes(b"not the payload")
+        setup.blob_path(100).write_bytes(b"not the blob")
         assert _drain(setup) == 0
         assert scored == []
         assert "sha256" in setup.bus.read_bench_state("v8").last_error
 
-    def test_a_republished_entry_is_refetched_before_corruption_is_claimed(
-        self, setup, scored
-    ):
-        """Payload names are reusable, so a republish looks exactly like
-        corruption to a consumer holding the old entry."""
-        setup.publish(100)
-        stale = setup.bus.read_entry("v8", 100)
-        setup.publish(100, binary=b"rebuilt")
-        # Bench the stale entry directly: that is what a consumer that listed
-        # before the republish is holding.
-        from slipstream.consumer import LocalSource
-
-        source = LocalSource(setup.source)
-        setup.consumer.bench_entry(source, setup.cfg.engines["v8"], stale, 1)
-        assert scored and (scored[0][1] / "out" / "d8").read_bytes() == b"rebuilt"
-
-    def test_a_genuinely_corrupt_payload_still_raises(self, setup):
+    def test_a_corrupt_blob_raises_sha_mismatch(self, setup):
         from slipstream.consumer import LocalSource
 
         entry = setup.publish(100)
-        setup.bus.blob_path("v8", 100).write_bytes(b"corrupt")
+        setup.blob_path(100).write_bytes(b"corrupt")
         with pytest.raises(ShaMismatch):
             setup.consumer.bench_entry(
                 LocalSource(setup.source), setup.cfg.engines["v8"], entry, 1
             )
 
-    def test_a_missing_payload_is_a_real_error(self, setup, scored):
+    def test_a_missing_blob_is_a_real_error(self, setup, scored):
         setup.publish(100)
-        setup.bus.blob_path("v8", 100).unlink()
+        setup.blob_path(100).unlink()
         assert _drain(setup) == 0
-        assert "payload is missing" in setup.bus.read_bench_state("v8").last_error
+        assert "blob is missing" in setup.bus.read_bench_state("v8").last_error
 
-    def test_a_local_source_keeps_the_builders_payload(self, setup, scored):
+    def test_a_local_source_keeps_the_builders_blob(self, setup, scored):
         setup.publish(100)
         _drain(setup)
-        assert setup.bus.blob_path("v8", 100).exists()
+        assert setup.blob_path(100).exists()
+
+    def test_the_bench_state_names_the_blobs_in_use(self, setup, scored):
+        """What the sweep protects on a box that has no topic of its own."""
+        entry = setup.publish(100)
+        _drain(setup)
+        assert setup.bus.read_bench_state("v8").blobs == [b.id for b in entry.blobs]
 
     def test_only_run_roots_is_kept(self, setup, scored):
         setup.cfg.bench.run_roots = 2
@@ -1086,7 +1096,7 @@ class TestReclaimIsReachableUnderTheFloor:
         keep = roots / "100"
         keep.mkdir()
 
-        removed = setup.bus.gc(["v8"])
+        removed = setup.bus.gc()
         assert abandoned in removed and not abandoned.exists()
         assert keep.exists(), "a retained run root was reclaimed"
 
@@ -1249,17 +1259,18 @@ class TestStoreErrorsAreSurvivable:
 
 
 class TestEntryIsRevalidatedUnderTheLock:
-    def test_retention_during_the_wait_is_not_a_missing_payload(
+    def test_retention_during_the_wait_is_not_a_missing_blob(
         self, setup, scored, monkeypatch
     ):
         """take_lock can block for hours behind a builder on a box that does
         both; a drop in that window is ordinary retention, not an error."""
         setup.publish(100)
         setup.publish(101)
+        blob_100 = setup.blob_path(100)
 
         def drop_100_while_waiting():
             setup.bus.entry_path("v8", 100).unlink(missing_ok=True)
-            setup.bus.blob_path("v8", 100).unlink(missing_ok=True)
+            blob_100.unlink(missing_ok=True)
             return setup.collector.lock.try_acquire()
 
         result = setup.consumer.drain(

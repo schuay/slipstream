@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import host
-from .bus import Bus, BuilderState, BusError, Entry, sha256_file
+from .bus import Blob, Bus, BuilderState, BusError, Entry, sha256_file, tree_hash
 from .collector import BenchCollector, BuildStepError, FetchError
 from .config import Config, EngineConfig
 from .lock import MachineLock
@@ -133,6 +133,31 @@ def package(
     if tar_rc != 0 or zstd_rc != 0:
         dest.unlink(missing_ok=True)
         raise BuildError(f"packaging failed (tar {tar_rc}, zstd {zstd_rc})")
+
+
+def store_run_set(
+    bus: Bus, src_dir: Path, run_set: list[str], *, caffeinate: bool = True
+) -> list[Blob]:
+    """Archive each run set entry into the blob store, once per distinct tree.
+
+    The tree hash is computed first and the entry packaged only if the store
+    has no blob of that name: the ICU data file, the browser bundle, the
+    runtime a commit did not touch are then hashed per publish but archived
+    once. The returned blobs are what the manifest names, in run set order.
+    """
+    missing = [entry for entry in run_set if not (src_dir / entry).exists()]
+    if missing:
+        raise BuildError(f"run_set entries missing from the build: {missing}")
+    blobs = []
+    for entry in run_set:
+        blob_id = tree_hash(src_dir, entry)
+        dest = bus.blob_path(blob_id)
+        if not dest.exists():
+            tmp = bus.tmp_blob(blob_id)
+            package(src_dir, [entry], tmp, caffeinate=caffeinate)
+            bus.store_blob(tmp, blob_id)
+        blobs.append(Blob(entry, blob_id, sha256_file(dest), dest.stat().st_size))
+    return blobs
 
 
 class Builder:
@@ -361,6 +386,10 @@ class Builder:
             state.highest_dropped = max(
                 k for k in (state.highest_dropped, *dropped) if k is not None
             )
+        # After the prune of every publish, not only ones that dropped
+        # something: a retry republishes under new blob ids and leaves the
+        # old ones with no manifest.
+        self.bus.sweep_blobs()
         state.stalled_since = None
         state.last_error = cleanup_error
         state.in_flight = None
@@ -394,8 +423,9 @@ class Builder:
     ) -> Entry:
         key = job.key
         commit = job.commit
-        blob = self.bus.tmp_blob(engine.name, key)
-        package(engine.require_src_dir(), engine.require_run_set(), blob)
+        blobs = store_run_set(
+            self.bus, engine.require_src_dir(), engine.require_run_set()
+        )
         entry = Entry(
             engine=engine.name,
             commit_id=key.commit_id,
@@ -407,14 +437,29 @@ class Builder:
             timestamp=int(commit.get("timestamp", 0)),
             title=commit.get("title", ""),
             build_cfg_hash=build_cfg_hash(engine),
-            blob_sha256=sha256_file(blob),
-            blob_bytes=blob.stat().st_size,
+            blobs=blobs,
             builder=dict(self.identity),
             built_at=int(time.time()),
             build_secs=build_secs,
         )
-        self.bus.publish(entry, blob)
+        self.bus.publish(entry)
         return entry
+
+    def migrate(self, should_stop=lambda: False) -> None:
+        """Bring the root's entries to the current format, once at startup.
+
+        Under the machine lock like every other write to the root. The
+        builder does it rather than the consumer because a bench-only box has
+        no topic of its own and so nothing to migrate.
+        """
+        if not self.lock.acquire(should_stop, wait=True, log=self.log):
+            return
+        try:
+            migrated = self.bus.migrate()
+        finally:
+            self.lock.release()
+        if migrated:
+            self.log(f"migrated {len(migrated)} entries to the blob store")
 
     def _record_failure(
         self,

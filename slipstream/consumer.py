@@ -30,6 +30,7 @@ from pathlib import Path
 from . import __version__, host
 from .bus import (
     BenchState,
+    Blob,
     Bus,
     BusError,
     Entry,
@@ -87,20 +88,31 @@ TRANSPORT_ERRORS = (
 
 
 class ShaMismatch(ConsumerError):
-    """The payload does not hash to what its entry says.
+    """A blob does not hash to what its entry says.
 
-    Payload names are reusable, so a republish under a consumer that already
-    read the old entry looks exactly like corruption; the entry is re-read once
-    before this is reported.
+    Blobs are named by content, so this is never a republish seen through a
+    stale entry: the bytes on disk are the wrong ones, and a copy this
+    machine made is deleted rather than resumed from.
     """
+
+
+def verify_blob(path: Path, blob: Blob, label: str) -> None:
+    """Raise unless ``path`` is the archive the entry describes."""
+    if not path.exists():
+        raise ConsumerError(f"{label}: entry is published but its blob is missing")
+    digest = sha256_file(path)
+    if digest != blob.sha256:
+        raise ShaMismatch(
+            f"{label}: blob sha256 {digest} does not match the entry's {blob.sha256}"
+        )
 
 
 class LocalSource:
     """A bus root on this machine.
 
-    It deletes nothing: the payload it would delete is the builder's own
-    published one, whose entry is still present, which is the state a consumer
-    is supposed to treat as a real error.
+    Blobs are read in place and nothing is deleted: the blob it would delete
+    is the builder's own stored one, whose entry is still present, which is
+    the state a consumer is supposed to treat as a real error.
     """
 
     def __init__(self, source: BusSource):
@@ -113,13 +125,15 @@ class LocalSource:
     def read_entry(self, engine: str, key) -> Entry | None:
         return self.bus.read_entry(engine, key)
 
-    def payload(self, engine: str, key, dest: Path) -> Path:
-        """Return a readable payload path. Local payloads are read in place."""
-        del dest
-        return self.bus.blob_path(engine, key)
-
-    def keep_payload(self) -> bool:
-        return True
+    def fetch(self, entry: Entry, into: Bus) -> list[Path]:
+        """Readable, verified paths to the entry's blobs, in run set order."""
+        del into
+        paths = []
+        for blob in entry.blobs:
+            path = self.bus.entry_blob_path(entry, blob)
+            verify_blob(path, blob, f"{entry.engine} {entry.key}")
+            paths.append(path)
+        return paths
 
     def builder_state(self, engine: str):
         return self.bus.read_builder_state(engine)
@@ -185,41 +199,28 @@ class BusConsumer:
         return self.bus.root / "roots" / engine / str(CommitKey.of(key))
 
     def provision(self, source, engine: EngineConfig, entry: Entry) -> Path:
-        """Fetch, verify and unpack one entry into a run root."""
+        """Fetch, verify and unpack one entry into a run root.
+
+        The blobs unpack into one directory in run set order. Each archives
+        a different run set entry, so the union is the run root and nothing
+        in it is written twice.
+        """
         root = self.run_root(engine.name, entry.key)
         if root.exists():
             shutil.rmtree(root)
-        tmp_payload = self.bus.tmp_dir / f"{engine.name}-{entry.key}.tar.zst"
-        tmp_payload.parent.mkdir(parents=True, exist_ok=True)
-        payload = source.payload(engine.name, entry.key, tmp_payload)
-        if not payload.exists():
-            raise ConsumerError(
-                f"{engine.name} {entry.key}: entry is published but its "
-                f"payload is missing"
-            )
-        try:
-            digest = sha256_file(payload)
-            if digest != entry.blob_sha256:
-                raise ShaMismatch(
-                    f"{engine.name} {entry.key}: payload sha256 {digest} "
-                    f"does not match the entry's {entry.blob_sha256}"
-                )
-            tmp_root = root.with_name(root.name + ".unpacking")
-            if tmp_root.exists():
-                shutil.rmtree(tmp_root)
-            tmp_root.mkdir(parents=True)
-            _unpack(payload, tmp_root)
-            tmp_root.rename(root)
-        except ShaMismatch:
-            # Not an interrupted transfer, so there is nothing to resume from:
-            # the bytes on disk are the wrong ones.
-            if not source.keep_payload():
-                tmp_payload.unlink(missing_ok=True)
-            raise
-        else:
-            if not source.keep_payload():
-                tmp_payload.unlink(missing_ok=True)
+        paths = source.fetch(entry, self.bus)
+        tmp_root = root.with_name(root.name + ".unpacking")
+        if tmp_root.exists():
+            shutil.rmtree(tmp_root)
+        tmp_root.mkdir(parents=True)
+        for path in paths:
+            _unpack(path, tmp_root)
+        tmp_root.rename(root)
         self._trim_run_roots(engine.name, keep=entry.key)
+        # The blobs this entry needed are in the bench state by now, so the
+        # sweep keeps them for the next entry to share and reclaims the
+        # previous entry's.
+        self.bus.sweep_blobs()
         return root
 
     def _trim_run_roots(self, engine: str, keep=None) -> None:
@@ -264,15 +265,7 @@ class BusConsumer:
         self, source, engine: EngineConfig, entry: Entry, runs: int
     ) -> BenchOutcome:
         """Provision, bench and record one entry. The machine lock is held."""
-        try:
-            root = self.provision(source, engine, entry)
-        except ShaMismatch:
-            fresh = source.read_entry(engine.name, entry.key)
-            if fresh is None or fresh == entry:
-                raise
-            self.log(f"{engine.name} {entry.key}: entry was republished, refetching")
-            entry = fresh
-            root = self.provision(source, engine, entry)
+        root = self.provision(source, engine, entry)
         commit = {
             "hash": entry.hash,
             "commit_id": entry.commit_id,
@@ -484,6 +477,9 @@ class BusConsumer:
                     "phase": "bench",
                     "started_at": time.time(),
                 }
+                # Written before provisioning, so the sweep inside it counts
+                # these as held and reclaims the previous entry's instead.
+                state.blobs = [b.id for b in entry.blobs]
                 # Inside the try: it writes to the filesystem this path is
                 # about running out of, and escaping here would leave the
                 # machine lock held and kill the daemon.

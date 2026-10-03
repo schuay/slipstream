@@ -99,7 +99,7 @@ class TestPublishing:
         assert builder.bus.keys("v8") == K(101)
         entry = builder.bus.read_entry("v8", 101)
         assert entry.hash == "hash101" and entry.title == "commit 101"
-        assert entry.blob_sha256 and entry.blob_bytes > 0
+        assert entry.blobs[0].sha256 and entry.blob_bytes > 0
         assert entry.build_cfg_hash.startswith("sha256:")
 
     def test_walks_upward_one_commit_per_cycle(self, builder):
@@ -122,6 +122,79 @@ class TestPublishing:
         config.engines["v8"].run_set = []
         with pytest.raises(ValueError, match="no run_set"):
             builder.build_one("v8")
+
+
+class TestBlobStore:
+    """Each run set entry is one blob named by its tree; a commit that did
+    not change an entry is published without archiving it again."""
+
+    def test_an_unchanged_entry_is_archived_once(self, builder, monkeypatch):
+        packaged = []
+        monkeypatch.setattr(
+            "slipstream.builder.package",
+            lambda src, rs, dest, **kw: (
+                packaged.append(list(rs)),
+                _fake_package(src, rs, dest),
+            )[1],
+        )
+        builder.build_one("v8")
+        builder.build_one("v8")
+        first, second = (builder.bus.read_entry("v8", k) for k in (101, 102))
+        assert first.blobs == second.blobs
+        assert packaged == [["out/d8"]]
+        assert len(list(builder.bus.blobs_dir.glob("*.tar.zst"))) == 1
+
+    def test_a_changed_entry_is_a_new_blob(self, builder, tmp_path):
+        builder.build_one("v8")
+        (tmp_path / "src" / "out" / "d8").write_bytes(b"binary, rebuilt")
+        builder.build_one("v8")
+        first, second = (builder.bus.read_entry("v8", k) for k in (101, 102))
+        assert first.blobs[0].id != second.blobs[0].id
+        assert first.blobs[0].path == second.blobs[0].path == "out/d8"
+        assert builder.bus.has_blob(first.blobs[0].id)
+        assert builder.bus.has_blob(second.blobs[0].id)
+
+    def test_the_run_set_order_is_the_manifest_order(self, builder, config, tmp_path):
+        (tmp_path / "src" / "icudtl.dat").write_bytes(b"icu")
+        config.engines["v8"].run_set = ["out/d8", "icudtl.dat"]
+        builder.build_one("v8")
+        entry = builder.bus.read_entry("v8", 101)
+        assert [b.path for b in entry.blobs] == ["out/d8", "icudtl.dat"]
+
+    def test_retention_sweeps_the_blobs_it_orphaned(self, builder, config, tmp_path):
+        config.build.retain_gb = 20 / 1e9  # bytes, effectively
+        builder.build_one("v8")
+        old = builder.bus.read_entry("v8", 101).blobs[0]
+        (tmp_path / "src" / "out" / "d8").write_bytes(b"binary, rebuilt")
+        builder.build_one("v8")
+        assert builder.bus.keys("v8") == K(102)
+        assert not builder.bus.has_blob(old.id)
+
+    def test_migrate_rewrites_version_one_entries_under_the_lock(self, builder):
+        import hashlib
+        import json
+
+        bus = builder.bus
+        legacy = bus.legacy_blob_path("v8", 100)
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes(b"old payload")
+        data = {
+            **_commit(100),
+            "engine": "v8",
+            "build_cfg_hash": "sha256:cfg",
+            "version": 1,
+            "blob_sha256": hashlib.sha256(b"old payload").hexdigest(),
+            "blob_bytes": 11,
+        }
+        bus.entry_path("v8", 100).parent.mkdir(parents=True)
+        bus.entry_path("v8", 100).write_text(json.dumps(data))
+
+        builder.migrate()
+        assert bus.read_entry("v8", 100).version == 2
+        assert not legacy.exists()
+        assert any("migrated 1 entries" in m for m in builder.logs)
+        assert builder.lock.try_acquire(), "migrate left the machine lock held"
+        builder.lock.release()
 
 
 class TestFrontier:
@@ -609,11 +682,14 @@ class TestStatePublishing:
         assert after.in_flight is None
         assert after.stalled_since is not None
 
-    def test_retention_records_what_it_dropped(self, builder):
+    def test_retention_records_what_it_dropped(self, builder, tmp_path):
         """The provable dropped-unread signal: commit ids are not contiguous,
         so lowest_retained against a cursor proves nothing."""
         builder.cfg.build.retain_gb = 30 / 1_000_000_000
-        for _ in range(3):
+        for i in range(3):
+            # Distinct trees: identical builds share one blob and cost
+            # nothing to retain, so retention would drop none of them.
+            (tmp_path / "src" / "out" / "d8").write_bytes(f"binary {i}".encode())
             builder.build_one("v8")
         state = builder.bus.read_builder_state("v8")
         assert state.highest_dropped is not None

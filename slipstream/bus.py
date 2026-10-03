@@ -5,10 +5,12 @@
 
 Layout, one root per machine::
 
-    bus/topics/builds/<engine>/<key>.json    entries
-    bus/blobs/builds/<engine>/<key>.tar.zst  payloads
+    bus/topics/builds/<engine>/<key>.json    entries: manifests naming blobs
+    bus/blobs/<id>.tar.zst                   blobs, flat, shared by every engine
     bus/state/builds/<engine>.json           builder state, published
     bus/state/bench/<engine>.json            local bencher state
+    bus/roots/<engine>/<key>/                unpacked union of an entry's blobs
+    bus/tmp/                                 in-flight packaging and fetches
 
 Entries are keyed by commit key, not by a sequence number: the payload already
 carries a monotone, machine-independent key. A cursor is therefore a key and a
@@ -22,12 +24,19 @@ A key is ``str(CommitKey)``: the bare commit id for an engine that is its
 own embedder, ``<embedder_id>-<commit_id>`` otherwise. Files written before
 keys had two parts are therefore already named correctly.
 
-Payloads are named by their entry's key rather than by content hash. Every
-payload has exactly one referencing entry by construction, so content
-addressing would buy only a refcount scan, an orphan sweep and a lock to make
-that sweep safe. With entry-keyed names a crashed publish self-heals: the
-builder retries the commit and the rebuild writes the same name. The sha256 is
-in the entry either way, so transfer verification is unchanged.
+An entry is a manifest. Each entry of the engine's ``run_set`` is one blob,
+named by the hash of its tree, so a run set entry a commit did not change --
+ICU for every V8 commit, most of the WebKit runtime for a JSC-only commit, a
+browser's host application until it is updated -- is archived once and
+named by every manifest that needs it. Dedupe on publish, the consumer's
+fetch cache and retention are then the same thing: reference counting over
+manifests. Nothing declares what is shared; the run set already says where
+the boundaries are, and it is already what ``build_cfg_hash`` covers.
+
+Entries written as version 1 named one payload per entry under
+``blobs/builds/<engine>/<key>.tar.zst``. They read back as a manifest with a
+single blob whose id is its sha256, found at the old path until the builder
+has migrated it (``Bus.migrate``), which is a hardlink and a rewrite.
 """
 
 from __future__ import annotations
@@ -36,13 +45,18 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import time
 from dataclasses import MISSING, asdict, dataclass, field
 from pathlib import Path
 
 from .models import CommitKey
 
+# State files and cursors. Their schema has not changed.
 VERSION = 1
+# Entries. Version 1 is read, version 2 is written.
+ENTRY_VERSION = 2
+READABLE_ENTRY_VERSIONS = (1, 2)
 
 BLOB_SUFFIX = ".tar.zst"
 
@@ -84,9 +98,71 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def tree_hash(src_dir: Path, relpath: str) -> str:
+    """The identity of one run set entry: what unpacking its blob produces.
+
+    A sha256 over the entry's path and, for every file beneath it in sorted
+    order, its own path, kind, executable bit, symlink target and bytes. The
+    path is in because the blob unpacks to it: the same bytes at another
+    place are a different result. Mtimes and ownership are out because tar
+    records them and they differ between two builds of identical output,
+    which is exactly the case this exists to recognise. Symlinks are hashed
+    as links, not followed, which is also how tar archives them.
+    """
+    h = hashlib.sha256()
+
+    def record(rel: str) -> None:
+        full = src_dir / rel
+        st = os.lstat(full)
+        mode = st.st_mode
+        if stat.S_ISLNK(mode):
+            h.update(f"l {rel}\0{os.readlink(full)}\0".encode())
+        elif stat.S_ISDIR(mode):
+            h.update(f"d {rel}\0".encode())
+            for name in sorted(os.listdir(full)):
+                record(f"{rel}/{name}")
+        else:
+            x = "x" if mode & stat.S_IXUSR else "-"
+            h.update(f"f {rel}\0{x}\0{st.st_size}\0".encode())
+            with open(full, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+
+    record(relpath.rstrip("/"))
+    return h.hexdigest()
+
+
+@dataclass(frozen=True)
+class Blob:
+    """One archived run set entry.
+
+    ``path`` is the run set entry the archive unpacks to and ``id`` the tree
+    hash that names the file; ``sha256`` and ``bytes`` describe the archive
+    itself, which is what a fetch verifies and retention counts. A version 1
+    entry reads back as one blob with an empty path and the archive's sha256
+    for an id, since that is the only name it ever had.
+    """
+
+    path: str
+    id: str
+    sha256: str
+    bytes: int
+
+
+def _parse_blobs(raw, where: str) -> list[Blob]:
+    if not isinstance(raw, list) or not raw:
+        raise BusError(f"bus entry {where} names no blobs")
+    blobs = []
+    for item in raw:
+        if not isinstance(item, dict) or set(item) != set(Blob.__dataclass_fields__):
+            raise BusError(f"bus entry {where} has a malformed blob: {item!r}")
+        blobs.append(Blob(**item))
+    return blobs
+
+
 @dataclass
 class Entry:
-    """One built commit, ready to bench.
+    """One built commit, ready to bench: a manifest over blobs.
 
     Key names match the store's columns, so a consumer can write the commits
     row straight from this. ``embedder_id`` defaults to 0 so an entry written
@@ -98,6 +174,9 @@ class Entry:
     what was pinned beneath it (``{"src/v8": hash}``); both are empty for an
     engine built from its own checkout, and absent from the entries such an
     engine wrote before the fields existed.
+
+    ``blobs`` is in run set order, one per entry. Unpacking them all into one
+    directory is the run root.
     """
 
     engine: str
@@ -107,15 +186,14 @@ class Entry:
     timestamp: int
     title: str
     build_cfg_hash: str
-    blob_sha256: str
-    blob_bytes: int
+    blobs: list[Blob]
     embedder_id: int = 0
     embedder: dict = field(default_factory=dict)
     pins: dict = field(default_factory=dict)
     builder: dict = field(default_factory=dict)
     built_at: int = 0
     build_secs: int = 0
-    version: int = VERSION
+    version: int = ENTRY_VERSION
 
     @property
     def key(self) -> CommitKey:
@@ -124,6 +202,10 @@ class Entry:
     @property
     def embedder_hash(self) -> str:
         return str(self.embedder.get("hash", "")) if self.embedder else ""
+
+    @property
+    def blob_bytes(self) -> int:
+        return sum(b.bytes for b in self.blobs)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=1, sort_keys=True)
@@ -140,11 +222,21 @@ class Entry:
         if not isinstance(data, dict):
             raise BusError(f"bus entry {where} is not an object")
         version = data.get("version")
-        if version != VERSION:
+        if version not in READABLE_ENTRY_VERSIONS:
             raise BusError(
                 f"bus entry {where} is version {version}, this slipstream reads "
-                f"version {VERSION}; upgrade the consumer"
+                f"versions {list(READABLE_ENTRY_VERSIONS)}; upgrade the consumer"
             )
+        data = dict(data)
+        if version == 1:
+            # One payload, named by its key and identified by its sha256. It
+            # keeps version 1 so paths resolve to where that payload is until
+            # the builder migrates it.
+            if "blob_sha256" in data and "blob_bytes" in data:
+                sha = data["blob_sha256"]
+                data["blobs"] = [Blob("", sha, sha, data["blob_bytes"])]
+        elif "blobs" in data:
+            data["blobs"] = _parse_blobs(data["blobs"], where)
         known = {f for f in cls.__dataclass_fields__}
         # Every field the constructor requires, not just the interesting ones:
         # a missing one would otherwise raise TypeError, which a consumer does
@@ -229,6 +321,11 @@ class BenchState:
     skipped_dropped: CommitKey | None = None
     benching_paused_by_floor: bool = False
     in_flight: dict | None = None
+    # The blob ids of the entry this machine last provisioned. On a box with
+    # no topic of its own nothing else references a fetched blob, and the
+    # sweep would reclaim it before the next entry could reuse it; this keeps
+    # exactly one entry's worth per engine, which is the whole cache.
+    blobs: list[str] = field(default_factory=list)
     env: dict = field(default_factory=dict)
     updated_at: float = 0.0
     version: int = VERSION
@@ -253,14 +350,34 @@ class Bus:
     def topic_dir(self, engine: str) -> Path:
         return self.root / "topics" / "builds" / engine
 
-    def blob_dir(self, engine: str) -> Path:
-        return self.root / "blobs" / "builds" / engine
-
     def entry_path(self, engine: str, key) -> Path:
         return self.topic_dir(engine) / f"{CommitKey.of(key)}.json"
 
-    def blob_path(self, engine: str, key) -> Path:
-        return self.blob_dir(engine) / f"{CommitKey.of(key)}{BLOB_SUFFIX}"
+    @property
+    def blobs_dir(self) -> Path:
+        return self.root / "blobs"
+
+    def blob_path(self, blob_id: str) -> Path:
+        return self.blobs_dir / f"{blob_id}{BLOB_SUFFIX}"
+
+    def has_blob(self, blob_id: str) -> bool:
+        return self.blob_path(blob_id).exists()
+
+    def legacy_blob_path(self, engine: str, key) -> Path:
+        """Where a version 1 entry's payload is until migrated."""
+        return (
+            self.root
+            / "blobs"
+            / "builds"
+            / engine
+            / f"{CommitKey.of(key)}{BLOB_SUFFIX}"
+        )
+
+    def entry_blob_path(self, entry: Entry, blob: Blob) -> Path:
+        """Where one of an entry's blobs is in this root."""
+        if entry.version == 1 and not self.has_blob(blob.id):
+            return self.legacy_blob_path(entry.engine, entry.key)
+        return self.blob_path(blob.id)
 
     def builder_state_path(self, engine: str) -> Path:
         return self.root / "state" / "builds" / f"{engine}.json"
@@ -271,6 +388,18 @@ class Bus:
     @property
     def tmp_dir(self) -> Path:
         return self.root / "tmp"
+
+    def engines(self) -> list[str]:
+        """Every engine with a topic in this root, configured or not.
+
+        Blobs are shared across engines, so anything that counts references
+        must see every topic that exists, not only the ones this process was
+        told about.
+        """
+        try:
+            return sorted(os.listdir(self.root / "topics" / "builds"))
+        except FileNotFoundError:
+            return []
 
     # --- entries ---
 
@@ -304,25 +433,42 @@ class Bus:
             return None
         return Entry.from_json(text, str(path))
 
-    def publish(self, entry: Entry, blob: Path) -> None:
-        """Move a packaged payload and its entry into the topic.
+    def entries(self, engine: str) -> list[Entry]:
+        """Every readable entry of the engine, ascending by key."""
+        found = []
+        for key in self.keys(engine):
+            entry = self.read_entry(engine, key)
+            if entry is not None:
+                found.append(entry)
+        return found
 
-        Payload first, always: the reverse lets a consumer read an entry whose
-        payload does not exist. A crash between the two leaves an unreferenced
-        payload, which is the harmless direction -- ``gc`` reclaims it, and the
-        builder's retry of that commit overwrites it under the same name.
+    def publish(self, entry: Entry) -> None:
+        """Write the manifest. Its blobs must already be stored.
+
+        Blobs first, always: the reverse lets a consumer read an entry whose
+        blobs do not exist. A crash between the two leaves unreferenced blobs,
+        which is the harmless direction -- the sweep reclaims them, and the
+        builder's retry of that commit finds them already stored.
         """
-        dest = self.blob_path(entry.engine, entry.key)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(blob, dest)
         _atomic_write(self.entry_path(entry.engine, entry.key), entry.to_json())
 
-    def tmp_blob(self, engine: str, key) -> Path:
-        """Where a packager writes before publish renames it into place."""
-        self.blob_dir(engine).mkdir(parents=True, exist_ok=True)
-        return self.blob_dir(engine) / (
-            f"{CommitKey.of(key)}{BLOB_SUFFIX}.tmp-{os.getpid()}-{time.time_ns():x}"
+    def tmp_blob(self, blob_id: str) -> Path:
+        """Where a packager writes before ``store_blob`` renames it into place.
+
+        Under tmp/ on the same filesystem, uniquely named: a crash leaves it
+        for gc, and two processes packaging the same tree cannot collide.
+        """
+        self.tmp_dir.mkdir(parents=True, exist_ok=True)
+        return self.tmp_dir / (
+            f"{blob_id}{BLOB_SUFFIX}.tmp-{os.getpid()}-{time.time_ns():x}"
         )
+
+    def store_blob(self, tmp: Path, blob_id: str) -> Path:
+        """Rename a complete, verified archive into the blob store."""
+        dest = self.blob_path(blob_id)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(tmp, dest)
+        return dest
 
     # --- state files ---
 
@@ -343,13 +489,17 @@ class Bus:
     # --- retention ---
 
     def prune(self, engine: str, retain_bytes: float, keep=None) -> list[CommitKey]:
-        """Drop the oldest entries until the payloads fit the budget.
+        """Drop the oldest entries until the engine's blobs fit the budget.
 
-        A byte budget rather than a count: payload size per commit is what
-        matters. Deletes the entry and then its payload, so a crash between the
-        two leaves a payload with no entry, which gc reclaims; the reverse
-        would leave an entry pointing at nothing, which a consumer must treat
-        as a real error.
+        A byte budget rather than a count: artifact size per commit is what
+        matters. The footprint is the distinct blobs the retained entries
+        name, so an entry whose blobs are all shared with a newer one costs
+        nothing to keep and dropping it frees nothing. Only manifests are
+        deleted here; ``sweep_blobs`` then reclaims whatever no manifest in
+        the root names, across every engine, since blobs are shared between
+        them. Deleting a manifest before its blobs is the safe order: a crash
+        between the two leaves blobs with no entry, which the next sweep
+        reclaims, where the reverse would leave an entry pointing at nothing.
 
         What is retained is always a contiguous run ending at the newest entry.
         Keeping a smaller older entry below a dropped one would fit more in the
@@ -372,40 +522,67 @@ class Bus:
         """
         keep = CommitKey.of(keep) if keep is not None else None
         dropped = []
+        retained: set[str] = set()
         used = 0.0
         over_budget = False
-        for key in reversed(self.keys(engine)):
-            blob = self.blob_path(engine, key)
-            try:
-                size = blob.stat().st_size
-            except FileNotFoundError:
-                size = 0
+        for entry in reversed(self.entries(engine)):
+            size = sum(b.bytes for b in entry.blobs if b.id not in retained)
             if not over_budget and used and used + size > retain_bytes:
                 over_budget = True
-            if not over_budget or (keep is not None and key >= keep):
+            if not over_budget or (keep is not None and entry.key >= keep):
+                retained.update(b.id for b in entry.blobs)
                 used += size
                 continue
-            self.entry_path(engine, key).unlink(missing_ok=True)
-            blob.unlink(missing_ok=True)
-            dropped.append(key)
+            self.entry_path(engine, entry.key).unlink(missing_ok=True)
+            dropped.append(entry.key)
         return sorted(dropped)
 
     def lowest_retained(self, engine: str) -> CommitKey | None:
         keys = self.keys(engine)
         return keys[0] if keys else None
 
-    def blob_bytes(self, engine: str) -> int:
-        total = 0
-        for key in self.keys(engine):
-            try:
-                total += self.blob_path(engine, key).stat().st_size
-            except FileNotFoundError:
-                pass
-        return total
+    def footprint(self, engine: str) -> int:
+        """Bytes of the distinct blobs the engine's entries name."""
+        seen: dict[str, int] = {}
+        for entry in self.entries(engine):
+            for b in entry.blobs:
+                seen.setdefault(b.id, b.bytes)
+        return sum(seen.values())
 
-    def gc(self, engines: list[str]) -> list[Path]:
-        """Delete what no entry names: payloads left by a crash mid-publish or
-        mid-prune, half-fetched payloads, and abandoned unpack directories.
+    def referenced_blobs(self) -> set[str]:
+        """Every blob id something in this root still needs.
+
+        Every manifest of every topic, plus what each bencher's state file
+        says it holds: on a box with no topic that list is the only reference
+        a fetched blob has.
+        """
+        refs: set[str] = set()
+        for engine in self.engines():
+            for entry in self.entries(engine):
+                refs.update(b.id for b in entry.blobs)
+        bench_dir = self.root / "state" / "bench"
+        for path in sorted(bench_dir.glob("*.json")) if bench_dir.exists() else []:
+            refs.update(self.read_bench_state(path.stem).blobs)
+        return refs
+
+    def sweep_blobs(self) -> list[Path]:
+        """Delete every stored blob nothing references. Returns what went.
+
+        The caller holds the machine lock: a blob between being stored and
+        its manifest being written, or between being fetched and unpacked,
+        is unreferenced too, and only the lock says nobody is in that window.
+        """
+        refs = self.referenced_blobs()
+        removed = []
+        for path in sorted(self.blobs_dir.glob(f"*{BLOB_SUFFIX}")):
+            if path.is_file() and path.name[: -len(BLOB_SUFFIX)] not in refs:
+                path.unlink(missing_ok=True)
+                removed.append(path)
+        return removed
+
+    def gc(self) -> list[Path]:
+        """Delete what nothing names: blobs left by a crash mid-publish or
+        mid-prune, half-fetched archives, and abandoned unpack directories.
         Returns what it removed. The caller holds the machine lock, so nothing
         here can be in use.
         """
@@ -417,43 +594,92 @@ class Bus:
             for partial in sorted(d.glob("*.tmp-*")) if d.exists() else []:
                 partial.unlink(missing_ok=True)
                 removed.append(partial)
-        for engine in engines:
-            # A kill mid-unpack leaves a full-size directory that no commit id
-            # names. The consumer sweeps these too, but only on a cycle that
-            # gets past its free-space floor -- which is the cycle this is
-            # standing in for.
-            roots = self.root / "roots" / engine
-            for partial in sorted(roots.glob("*.unpacking")) if roots.exists() else []:
-                shutil.rmtree(partial, ignore_errors=True)
-                removed.append(partial)
-        # An interrupted fetch leaves hundreds of MB here that no entry names.
+        # A kill mid-unpack leaves a full-size directory that no commit id
+        # names. The consumer sweeps these too, but only on a cycle that gets
+        # past its free-space floor -- which is the cycle this is standing in
+        # for.
+        roots = self.root / "roots"
+        for partial in sorted(roots.glob("*/*.unpacking")) if roots.exists() else []:
+            shutil.rmtree(partial, ignore_errors=True)
+            removed.append(partial)
+        # An interrupted fetch or packaging leaves hundreds of MB here.
         for partial in sorted(self.tmp_dir.glob("*")) if self.tmp_dir.exists() else []:
             if partial.is_file():
                 partial.unlink(missing_ok=True)
                 removed.append(partial)
-        for engine in engines:
+        for engine in self.engines():
             # A crash between writing an entry's tmp file and renaming it leaks
             # one per crash into the topic, which keys() ignores and nothing
             # else looked at.
-            for partial in self.topic_dir(engine).glob("*.tmp-*"):
+            for partial in sorted(self.topic_dir(engine).glob("*.tmp-*")):
                 partial.unlink(missing_ok=True)
                 removed.append(partial)
-            published = set(self.keys(engine))
-            try:
-                names = os.listdir(self.blob_dir(engine))
-            except FileNotFoundError:
-                continue
-            for name in names:
-                path = self.blob_dir(engine) / name
-                if name.endswith(BLOB_SUFFIX):
-                    key = parse_key_stem(name[: -len(BLOB_SUFFIX)])
-                    if key is not None and key in published:
-                        continue
-                elif ".tmp-" not in name:
-                    continue
-                path.unlink(missing_ok=True)
-                removed.append(path)
+        removed.extend(self.sweep_blobs())
+        # Version 1 payloads whose entry retention dropped before the builder
+        # migrated them, and the per-engine directories once they are empty.
+        legacy = self.root / "blobs" / "builds"
+        for engine_dir in sorted(legacy.iterdir()) if legacy.exists() else []:
+            published = set(self.keys(engine_dir.name))
+            for path in sorted(engine_dir.iterdir()):
+                key = (
+                    parse_key_stem(path.name[: -len(BLOB_SUFFIX)])
+                    if path.name.endswith(BLOB_SUFFIX)
+                    else None
+                )
+                if key is None or key not in published:
+                    path.unlink(missing_ok=True)
+                    removed.append(path)
+            _rmdir_if_empty(engine_dir)
+        _rmdir_if_empty(legacy)
         return removed
+
+    # --- migration ---
+
+    def migrate(self) -> list[CommitKey]:
+        """Rewrite version 1 entries as manifests over the blob store.
+
+        The payload is hardlinked under its sha256 -- its id, since the
+        archive is the only thing there is to name it by -- the entry is
+        rewritten naming it, and the old path is removed. Each step is
+        idempotent and a crash anywhere leaves a readable root: an entry still
+        at version 1 resolves to the old path while it exists and to the store
+        once it does not. A payload already missing is left alone; the entry
+        reports it exactly as it did before. The caller holds the machine
+        lock. Returns the keys rewritten.
+        """
+        migrated = []
+        legacy_root = self.root / "blobs" / "builds"
+        for engine in self.engines():
+            for entry in self.entries(engine):
+                if entry.version != 1:
+                    continue
+                (blob,) = entry.blobs
+                legacy = self.legacy_blob_path(engine, entry.key)
+                dest = self.blob_path(blob.id)
+                if not dest.exists():
+                    if not legacy.exists():
+                        continue
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        os.link(legacy, dest)
+                    except OSError:
+                        tmp = self.tmp_blob(blob.id)
+                        shutil.copyfile(legacy, tmp)
+                        os.replace(tmp, dest)
+                entry.version = ENTRY_VERSION
+                self.publish(entry)
+                legacy.unlink(missing_ok=True)
+                migrated.append(entry.key)
+            _rmdir_if_empty(legacy_root / engine)
+        _rmdir_if_empty(legacy_root)
+        return migrated
+
+
+def _rmdir_if_empty(path: Path) -> None:
+    try:
+        path.rmdir()
+    except OSError:
+        pass
 
 
 def state_from_json(text: str, cls, where: str = ""):

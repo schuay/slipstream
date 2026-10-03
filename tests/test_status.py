@@ -9,6 +9,7 @@ import pytest
 
 from slipstream.bus import (
     BenchState,
+    Blob,
     Bus,
     BuilderState,
     Entry,
@@ -22,7 +23,7 @@ from slipstream.status import collect_status, compare_env, render
 from keys import K1
 
 
-def _entry(commit_id):
+def _entry(commit_id, blobs):
     return Entry(
         engine="v8",
         commit_id=commit_id,
@@ -31,8 +32,7 @@ def _entry(commit_id):
         timestamp=1757116800,
         title=f"commit {commit_id}",
         build_cfg_hash="sha256:cfg",
-        blob_sha256="sha",
-        blob_bytes=4,
+        blobs=blobs,
     )
 
 
@@ -61,9 +61,11 @@ def env(config, tmp_path, monkeypatch):
     bus = Bus(bus_root)
 
     def publish(commit_id, payload=b"blob"):
-        tmp = bus.tmp_blob("v8", commit_id)
+        blob_id = f"id{commit_id}"
+        tmp = bus.tmp_blob(blob_id)
         tmp.write_bytes(payload)
-        bus.publish(_entry(commit_id), tmp)
+        bus.store_blob(tmp, blob_id)
+        bus.publish(_entry(commit_id, [Blob("out", blob_id, "sha", len(payload))]))
 
     return type(
         "Env",
