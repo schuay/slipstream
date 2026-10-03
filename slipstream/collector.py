@@ -4,13 +4,11 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 import shlex
 import shutil
 import platform
-import signal
 import subprocess
 import time
 from collections import namedtuple
@@ -24,6 +22,7 @@ from rich.markup import escape
 from .config import Config, EngineConfig, RunSpec
 from .lock import MachineLock
 from .models import CommitKey
+from .runners import RunRequest, RunResult, Runner, runner_for
 from .store import CommitIdCollision, CommitStore
 
 console = Console()
@@ -463,128 +462,14 @@ class BenchCollector:
             return BuildStepError("compile", rc)
         return None
 
-    # --- Score parsing ---
-
-    def _parse_stdout(
-        self,
-        stdout_file: Path,
-        suite: str,
-        flags: str,
-        run: int,
-        patterns: dict[str, re.Pattern],
-        suite_patterns: dict[str, re.Pattern],
-    ) -> list[dict]:
-        """Parse a stdout file into score dicts for DB insertion."""
-        pattern = patterns.get(suite)
-        if not pattern:
-            return []
-        suite_pattern = suite_patterns.get(suite)
-        results = []
-        for line in stdout_file.read_text().splitlines():
-            m = pattern.match(line.strip())
-            if m:
-                bench, metric, score = m.groups()
-                if suite == "js3" and metric == "Score":
-                    metric = "Total-Score"
-                results.append(
-                    {
-                        "suite": suite,
-                        "flags": flags,
-                        "benchmark": bench,
-                        "metric": metric,
-                        "run": run,
-                        "score": float(score),
-                    }
-                )
-            elif suite_pattern:
-                m2 = suite_pattern.match(line)
-                if m2:
-                    metric, score = m2.groups()
-                    results.append(
-                        {
-                            "suite": suite,
-                            "flags": flags,
-                            "benchmark": "Overall",
-                            "metric": metric,
-                            "run": run,
-                            "score": float(score),
-                        }
-                    )
-        return results
-
-    @staticmethod
-    def _compute_geomean_overall(scores: list[dict], run: int) -> list[dict]:
-        """Compute geometric mean of Total-Score across all benchmarks.
-
-        Per-line-item runs don't produce Overall scores from the harness,
-        so we synthesize one by geomeaning the Total-Score of each benchmark.
-        """
-        total_scores: list[float] = []
-        suite = None
-        flags = None
-        for s in scores:
-            if s["benchmark"] == "Overall":
-                continue
-            if s["metric"] != "Total-Score":
-                continue
-            suite = s["suite"]
-            flags = s["flags"]
-            total_scores.append(s["score"])
-
-        positive = [v for v in total_scores if v > 0]
-        if not positive:
-            return []
-        geomean = math.exp(sum(math.log(v) for v in positive) / len(positive))
-        return [
-            {
-                "suite": suite,
-                "flags": flags,
-                "benchmark": "Overall",
-                "metric": "Total-Score",
-                "run": run,
-                "score": geomean,
-            }
-        ]
-
     # --- Benchmark runs ---
 
-    def _run_bench_cmd(
-        self,
-        argv: list[str],
-        cwd: Path,
-        env: dict,
-        out_f,
-        err_f,
-        stderr_file: Path,
-        label: str,
-    ) -> bool:
-        """Run a single benchmark subprocess. Returns True on success.
-
-        argv, not a shell string: the run root is a generated path on a bus
-        consumer, and it is interpolated into every one of these.
-        """
-        cmd = shlex.join(argv)
-        try:
-            result = subprocess.run(argv, cwd=cwd, env=env, stdout=out_f, stderr=err_f)
-        except Exception as exc:
-            self._log(f"\n    [red]Exception [{label}]: {escape(str(exc))}[/red]")
-            self._log(f"    [dim]$ cd {cwd} && {escape(cmd)}[/dim]")
-            err_f.write(f"\n$ cd {cwd} && {cmd}\n")
-            return False
-        if result.returncode in (-signal.SIGINT, -signal.SIGTERM, 130, 143):
-            raise KeyboardInterrupt
-        if result.returncode != 0:
-            err_f.flush()
-            err_f.write(f"\n$ cd {cwd} && {cmd}\n")
-            err_f.flush()
-            stderr_tail = stderr_file.read_text()[-300:].strip()
-            self._log(
-                f"\n    [red]Error (exit {result.returncode}) [{label}]: "
-                f"{escape(stderr_tail or '(no stderr)')}[/red]"
-            )
-            self._log(f"    [dim]$ cd {cwd} && {escape(cmd)}[/dim]")
-            return False
-        return True
+    def _runner(self, engine: EngineConfig) -> Runner:
+        return runner_for(
+            engine.runtime,
+            log=self._log,
+            progress=lambda: console.print(".", end="", highlight=False),
+        )
 
     def _run_benchmarks(
         self, engine: EngineConfig, key: CommitKey, runs: int, run_root: Path
@@ -597,36 +482,8 @@ class BenchCollector:
         res_dir = self.cfg.commit_results_dir(engine.name, key)
         res_dir.mkdir(parents=True, exist_ok=True)
 
-        patterns = {
-            b_type: re.compile(cfg.score_regex)
-            for b_type, cfg in self.cfg.benchmarks.items()
-        }
-        suite_patterns = {
-            b_type: re.compile(cfg.suite_score_regex)
-            for b_type, cfg in self.cfg.benchmarks.items()
-            if cfg.suite_score_regex
-        }
-
-        binary = run_root / engine.binary_path
-        env = os.environ.copy()
-        env_prefix: list[str] = []
-        if engine.dyld_lib_path:
-            dyld_path = str(run_root / engine.dyld_lib_path)
-            env["DYLD_LIBRARY_PATH"] = dyld_path
-            env["DYLD_FRAMEWORK_PATH"] = dyld_path
-            # macOS SIP strips DYLD_ vars from protected processes (caffeinate/gtimeout),
-            # so we pass them explicitly via `env`.
-            env_prefix = [
-                "env",
-                f"DYLD_FRAMEWORK_PATH={dyld_path}",
-                f"DYLD_LIBRARY_PATH={dyld_path}",
-            ]
-
+        runner = self._runner(engine)
         run_configs = self.run_configs(engine)
-
-        is_macos = platform.system() == "Darwin"
-        prefix = ["caffeinate", "-im"] if is_macos else []
-        prefix += ["gtimeout" if is_macos else "timeout"]
 
         configs_ok = 0
         configs_total = 0
@@ -634,75 +491,35 @@ class BenchCollector:
         for run in range(1, runs + 1):
             self._log(f"  Run [bold]{run}/{runs}[/bold]:")
             for rc in run_configs:
-                bench_cfg = self.cfg.benchmarks[rc.suite]
-                run_mode = rc.run_mode or bench_cfg.run_mode
-                stdout_file = res_dir / f"stdout.{run}.{rc.suite}.{rc.variant}.txt"
-                stderr_file = res_dir / f"stderr.{run}.{rc.suite}.{rc.variant}.txt"
-
                 console.print(f"    {rc.suite} ({rc.variant}): ", end="")
                 t0 = time.time()
                 configs_total += 1
-                run_ok = True
-                if not self.dry_run:
-                    with (
-                        open(stdout_file, "w") as out_f,
-                        open(stderr_file, "w") as err_f,
-                    ):
-                        base = [
-                            *prefix,
-                            bench_cfg.timeout,
-                            *env_prefix,
-                            str(binary),
-                            *rc.flags,
-                            f"{bench_cfg.dir}/{bench_cfg.cli}",
-                        ]
-                        if run_mode == "suite":
-                            console.print(".", end="", highlight=False)
-                            if not self._run_bench_cmd(
-                                base,
-                                bench_cfg.dir,
-                                env,
-                                out_f,
-                                err_f,
-                                stderr_file,
-                                rc.suite,
-                            ):
-                                run_ok = False
-                        else:
-                            for i, bench in enumerate(
-                                b for b in bench_cfg.names if b != "Overall"
-                            ):
-                                if i % 5 == 0:
-                                    console.print(".", end="", highlight=False)
-                                if not self._run_bench_cmd(
-                                    [*base, "--", bench],
-                                    bench_cfg.dir,
-                                    env,
-                                    out_f,
-                                    err_f,
-                                    stderr_file,
-                                    f"{rc.suite}/{bench}",
-                                ):
-                                    run_ok = False
-                else:
+                if self.dry_run:
                     console.print("." * 5, end="")
-                elapsed = int(time.time() - t0)
-                if run_ok and not self.dry_run:
-                    scores = self._parse_stdout(
-                        stdout_file, rc.suite, rc.variant, run, patterns, suite_patterns
-                    )
-                    if run_mode == "per_benchmark":
-                        scores.extend(self._compute_geomean_overall(scores, run))
-                    if scores:
-                        self.store.insert_scores(
-                            engine.name,
-                            self.cfg.platform,
-                            key,
-                            int(time.time()),
-                            scores,
+                    result = RunResult(True, [])
+                else:
+                    result = runner.run(
+                        RunRequest(
+                            engine=engine,
+                            run_root=run_root,
+                            bench=self.cfg.benchmarks[rc.suite],
+                            spec=rc,
+                            run=run,
+                            res_dir=res_dir,
                         )
-                    score_total += len(scores)
-                if run_ok:
+                    )
+                elapsed = int(time.time() - t0)
+                scores = result.scores if result.ok else []
+                if scores:
+                    self.store.insert_scores(
+                        engine.name,
+                        self.cfg.platform,
+                        key,
+                        int(time.time()),
+                        [s._asdict() for s in scores],
+                    )
+                score_total += len(scores)
+                if result.ok:
                     configs_ok += 1
                     console.print(f" [green]OK ({elapsed}s)[/green]")
                 else:

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 [v8]
+runtime = "shell"
 # sync_cmd runs before build_cmd, not instead of it: collapsing the two into
 # one shell command gives one exit code for two steps, and a DEPS fetch failing
 # is infrastructure while a compile failing is the commit's fault.
@@ -40,6 +41,7 @@ v8_enable_google_benchmark = true
 # each of them in turn. The keys are (chromium position, V8 position); nothing
 # is built for chromium commits outside a roll.
 [chrome]
+runtime = "chromium"
 embeds = "v8"
 pin = "src/v8"
 roll_file = "DEPS"
@@ -114,6 +116,7 @@ enable_check_container_fields = false
 #   binary: build/bin/jsc  (static, no dyld_lib_path needed)
 # To add LTO to the cmake build: -DLTO_MODE=thin (needs clang).
 [jsc]
+runtime = "shell"
 # Safari on Apple Silicon uses the arm64e ABI, including pointer authentication
 # and JSC's architecture-specific JIT paths. The result arch remains the host's
 # arm64 label; the build command is recorded through build_cfg_hash.

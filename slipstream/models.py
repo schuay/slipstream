@@ -96,3 +96,19 @@ class CommitKey(NamedTuple):
 
     def __repr__(self) -> str:
         return f"CommitKey({self.embedder_id}, {self.commit_id})"
+
+
+class Score(NamedTuple):
+    """One measured number, as a runner reports it and the store keeps it.
+
+    ``flags`` is the variant name, not the flag list: it is the column the
+    store and the perf database key a configuration by, and the field keeps
+    the name the schema has.
+    """
+
+    suite: str
+    flags: str
+    benchmark: str
+    metric: str
+    run: int
+    score: float

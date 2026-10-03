@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import os
-import re
 import subprocess
 from types import SimpleNamespace
 
@@ -12,21 +11,17 @@ import pytest
 
 from slipstream.collector import BenchCollector, FetchError
 from slipstream.config import EngineConfig, RunSpec
+from slipstream.runners import ShellRunner
+from slipstream.runners.shell import parse_stdout
 from keys import K1
 
 
 class TestParseStdout:
-    """Test _parse_stdout with real score regexes from benchmarks.toml."""
+    """Test parse_stdout with real score regexes from benchmarks.toml."""
 
     JS3_REGEX = r"^([A-Za-z0-9-]+)\s+([A-Za-z0-9-]+-Score|Score)\s+([0-9.]+)\s+pts$"
     JS2_REGEX = r"^([A-Za-z0-9.-]+) (Stdlib-Score|Tests-Score|Total-Score|Startup-Score|Average-Score|Worst-Case-Score|Run-Time-Score): ([0-9.]+)$"
     JS2_SUITE_REGEX = r"^\s+([A-Za-z]+-Score):\s+([0-9.]+)$"
-
-    def _make_collector(self, tmp_path):
-        """Minimal collector for testing _parse_stdout (no real config needed)."""
-        # We call _parse_stdout directly, which doesn't use self.cfg
-        collector = object.__new__(BenchCollector)
-        return collector
 
     def test_js3_output(self, tmp_path):
         stdout = tmp_path / "stdout.1.js3.default.txt"
@@ -35,76 +30,59 @@ class TestParseStdout:
             "chai-wtb               Score            112.50 pts\n"
             "Overall                Score            78.00 pts\n"
         )
-        collector = self._make_collector(tmp_path)
-        patterns = {"js3": re.compile(self.JS3_REGEX)}
-        results = collector._parse_stdout(stdout, "js3", "default", 1, patterns, {})
+        results = parse_stdout(stdout, "js3", "default", 1, self.JS3_REGEX, None)
 
         assert len(results) == 3
-        assert results[0]["benchmark"] == "regexp-octane"
-        assert results[0]["metric"] == "Total-Score"
-        assert results[0]["score"] == 45.23
-        assert results[1]["benchmark"] == "chai-wtb"
-        assert results[1]["metric"] == "Total-Score"  # "Score" → "Total-Score" for js3
-        assert results[1]["score"] == 112.50
-        assert results[2]["benchmark"] == "Overall"
-        assert results[2]["metric"] == "Total-Score"
-        assert results[2]["score"] == 78.00
+        assert results[0].benchmark == "regexp-octane"
+        assert results[0].metric == "Total-Score"
+        assert results[0].score == 45.23
+        assert results[1].benchmark == "chai-wtb"
+        assert results[1].metric == "Total-Score"  # "Score" → "Total-Score" for js3
+        assert results[1].score == 112.50
+        assert results[2].benchmark == "Overall"
+        assert results[2].metric == "Total-Score"
+        assert results[2].score == 78.00
 
     def test_js2_output(self, tmp_path):
         stdout = tmp_path / "stdout.1.js2.default.txt"
         stdout.write_text("Air Total-Score: 85.5\nAir Stdlib-Score: 90.2\n")
-        collector = self._make_collector(tmp_path)
-        patterns = {"js2": re.compile(self.JS2_REGEX)}
-        results = collector._parse_stdout(stdout, "js2", "default", 1, patterns, {})
+        results = parse_stdout(stdout, "js2", "default", 1, self.JS2_REGEX, None)
 
         assert len(results) == 2
-        assert results[0]["benchmark"] == "Air"
-        assert results[0]["metric"] == "Total-Score"
-        assert results[1]["metric"] == "Stdlib-Score"
+        assert results[0].benchmark == "Air"
+        assert results[0].metric == "Total-Score"
+        assert results[1].metric == "Stdlib-Score"
 
     def test_js2_suite_score(self, tmp_path):
         stdout = tmp_path / "stdout.1.js2.default.txt"
         stdout.write_text(
             "Air Total-Score: 85.5\n    Total-Score: 331.675\n    Mean-Score: 210.3\n"
         )
-        collector = self._make_collector(tmp_path)
-        patterns = {"js2": re.compile(self.JS2_REGEX)}
-        suite_patterns = {"js2": re.compile(self.JS2_SUITE_REGEX)}
-        results = collector._parse_stdout(
-            stdout, "js2", "default", 1, patterns, suite_patterns
+        results = parse_stdout(
+            stdout, "js2", "default", 1, self.JS2_REGEX, self.JS2_SUITE_REGEX
         )
 
         assert len(results) == 3
-        overall = [r for r in results if r["benchmark"] == "Overall"]
+        overall = [r for r in results if r.benchmark == "Overall"]
         assert len(overall) == 2
-        assert overall[0]["metric"] == "Total-Score"
-        assert overall[0]["score"] == 331.675
+        assert overall[0].metric == "Total-Score"
+        assert overall[0].score == 331.675
 
     def test_empty_file(self, tmp_path):
         stdout = tmp_path / "stdout.1.js3.default.txt"
         stdout.write_text("")
-        collector = self._make_collector(tmp_path)
-        patterns = {"js3": re.compile(self.JS3_REGEX)}
-        assert collector._parse_stdout(stdout, "js3", "default", 1, patterns, {}) == []
-
-    def test_unknown_suite(self, tmp_path):
-        stdout = tmp_path / "stdout.txt"
-        stdout.write_text("data")
-        collector = self._make_collector(tmp_path)
-        assert collector._parse_stdout(stdout, "unknown", "default", 1, {}, {}) == []
+        assert parse_stdout(stdout, "js3", "default", 1, self.JS3_REGEX, None) == []
 
     def test_run_and_flags_preserved(self, tmp_path):
         stdout = tmp_path / "stdout.txt"
         stdout.write_text("bench1          Total-Score      99.9 pts\n")
-        collector = self._make_collector(tmp_path)
-        patterns = {"js3": re.compile(self.JS3_REGEX)}
-        results = collector._parse_stdout(
-            stdout, "js3", "turbolev_future", 3, patterns, {}
+        results = parse_stdout(
+            stdout, "js3", "turbolev_future", 3, self.JS3_REGEX, None
         )
 
         assert len(results) == 1
-        assert results[0]["flags"] == "turbolev_future"
-        assert results[0]["run"] == 3
+        assert results[0].flags == "turbolev_future"
+        assert results[0].run == 3
 
 
 class TestRunEnv:
@@ -383,12 +361,12 @@ class TestBenchAtRoot:
         engine.dyld_lib_path = "lib"
         seen = {}
 
-        def fake_cmd(argv, cwd, env, out_f, err_f, stderr_file, label):
+        def fake_cmd(self, argv, cwd, env, out_f, err_f, stderr_file, label):
             seen["argv"] = argv
             seen["dyld"] = env.get("DYLD_FRAMEWORK_PATH")
             return True
 
-        monkeypatch.setattr(c, "_run_bench_cmd", fake_cmd)
+        monkeypatch.setattr(ShellRunner, "exec", fake_cmd)
         root = tmp_path / "roots" / "v8" / "109680"
         config.benchmarks["js3"].dir.mkdir(parents=True, exist_ok=True)
         c._run_benchmarks(engine, "109680", 1, root)
@@ -402,11 +380,11 @@ class TestBenchAtRoot:
         c = self._collector(config, tmp_path, monkeypatch)
         seen = {}
 
-        def fake_cmd(argv, *a, **k):
+        def fake_cmd(self, argv, *a, **k):
             seen["argv"] = argv
             return True
 
-        monkeypatch.setattr(c, "_run_bench_cmd", fake_cmd)
+        monkeypatch.setattr(ShellRunner, "exec", fake_cmd)
         root = tmp_path / "a root with spaces"
         config.benchmarks["js3"].dir.mkdir(parents=True, exist_ok=True)
         c._run_benchmarks(config.engines["v8"], "109680", 1, root)
@@ -457,7 +435,7 @@ class TestConfiguredMatrix:
         ]
         seen = []
         monkeypatch.setattr(
-            c, "_run_bench_cmd", lambda argv, *a, **k: seen.append(argv) or True
+            ShellRunner, "exec", lambda self, argv, *a, **k: seen.append(argv) or True
         )
         c._run_benchmarks(config.engines["v8"], "109680", 1, tmp_path / "root")
         (argv,) = seen
@@ -486,13 +464,13 @@ class TestConfiguredMatrix:
         res_dir = config.commit_results_dir("v8", "109680")
         res_dir.mkdir(parents=True, exist_ok=True)
 
-        def fake_cmd(argv, *a, **k):
+        def fake_cmd(self, argv, *a, **k):
             (res_dir / "stdout.1.js3.by_item.txt").write_text(
                 "Air Total-Score 4.0 pts\nBox2D Total-Score 9.0 pts\n"
             )
             return True
 
-        monkeypatch.setattr(c, "_run_bench_cmd", fake_cmd)
+        monkeypatch.setattr(ShellRunner, "exec", fake_cmd)
         c._run_benchmarks(config.engines["v8"], "109680", 1, tmp_path / "root")
         rows = c.store.conn.execute(
             "SELECT benchmark, score FROM scores WHERE benchmark = 'Overall'"
@@ -519,7 +497,7 @@ class TestResultsLayout:
             )
         config.benchmarks["js3"].dir.mkdir(parents=True, exist_ok=True)
         c = BenchCollector(config)
-        monkeypatch.setattr(c, "_run_bench_cmd", lambda *a, **k: True)
+        monkeypatch.setattr(ShellRunner, "exec", lambda *a, **k: True)
         for name in ("v8", "jsc"):
             c._run_benchmarks(config.engines[name], "500", 1, tmp_path / "root")
 

@@ -109,6 +109,10 @@ class RelaySource:
     cursor_dir: Path  # holds <bot_name>.cursor, the last seq delivered
 
 
+# How an engine's binary is driven on the bench; see EngineConfig.runtime.
+RUNTIMES = ("shell", "chromium", "safari")
+
+
 @dataclass
 class EngineConfig:
     """An engine this machine knows about.
@@ -127,6 +131,11 @@ class EngineConfig:
     one in ``embeds``; its series is then the inner engine's commits as the
     outer tree's ``roll_file`` took them in, found with ``roll_regex``, and
     each build pins the inner engine at ``pin`` under the outer checkout.
+
+    ``runtime`` is how the binary is driven on the bench: a shell is given
+    the suite's cli script as argv and prints scores; a browser is pointed
+    at a served page and reports them back. It is a fact about the engine,
+    bundled with it, and picks the runner.
     """
 
     name: str
@@ -147,10 +156,16 @@ class EngineConfig:
     # Where gn_args go, relative to src_dir. d8 and jsc sit directly in it;
     # a browser's binary is several directories down inside its bundle.
     build_dir: str | None = None
+    runtime: str = "shell"
 
     def __post_init__(self):
         if self.build_dir is None:
             self.build_dir = str(Path(self.binary_path).parent)
+        if self.runtime not in RUNTIMES:
+            raise ValueError(
+                f"engine {self.name}: runtime must be one of {list(RUNTIMES)}: "
+                f"{self.runtime!r}"
+            )
 
     def require_src_dir(self) -> Path:
         if self.src_dir is None:
@@ -446,6 +461,7 @@ def load_config(user_config_path: Path | None = None) -> Config:
             roll_file=defaults.get("roll_file", "DEPS"),
             roll_regex=defaults.get("roll_regex"),
             build_dir=defaults.get("build_dir"),
+            runtime=defaults.get("runtime", "shell"),
         )
 
     benchmarks: dict[str, BenchmarkConfig] = {}
