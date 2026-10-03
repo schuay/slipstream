@@ -1026,6 +1026,19 @@ class TestDerivedEngine:
         assert entry.build_cfg_hash != inner.build_cfg_hash
         assert any("packaging 1-101 from v8 101" in m for m in builder.logs)
 
+    def test_without_a_from_entry_it_starts_at_the_first_eligible_inner_entry(
+        self, derived
+    ):
+        """Its candidates are bounded by the bus, so there is no reason to
+        demand a starting point the way a git-driven engine must."""
+        builder, _ = derived
+        del builder.cfg.build.start_from["safari"]
+        assert builder.frontier("safari") == CommitKey(0, 0)
+        first_inner = builder.bus.keys("v8")[0]
+        result = builder.build_one("safari")
+        assert result.published and result.key == CommitKey(1, first_inner.commit_id)
+        assert builder.frontier("safari") == result.key
+
     def test_the_app_blob_is_archived_once_across_entries(self, derived):
         builder, _ = derived
         builder.build_one("safari")

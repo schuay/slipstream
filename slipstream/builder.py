@@ -258,6 +258,11 @@ class Builder:
         Published entries and terminal build failures both count, so a compile
         failure at the head is not rebuilt every cycle. [build] from is
         consulted only when there is neither, so a restart cannot rewind.
+
+        A derived engine with no history starts at the bottom: its candidates
+        are the inner entries on this bus that carry the full run set, a
+        bounded list with no past to reach into, where a git-driven engine
+        with no [build] from would start at the first commit of the repo.
         """
         keys = self.bus.keys(engine_name)
         published = keys[-1] if keys else None
@@ -265,7 +270,10 @@ class Builder:
         candidates = [c for c in (published, failed) if c is not None]
         if candidates:
             return max(candidates)
-        return self.cfg.build.start_from.get(engine_name)
+        start = self.cfg.build.start_from.get(engine_name)
+        if start is None and self.cfg.engines[engine_name].derives:
+            return CommitKey(0, 0)
+        return start
 
     def consecutive_burns(self, engine_name: str) -> int:
         """Infrastructure burns with no successful publish between them.
