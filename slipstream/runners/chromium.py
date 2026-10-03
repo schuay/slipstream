@@ -48,7 +48,7 @@ class ChromiumRunner(BrowserRunner):
         # commit, and nothing a crashed run leaves behind.
         self._profile = tempfile.mkdtemp(prefix="slipstream-chromium-")
         argv = [
-            str(req.run_root / req.engine.binary_path),
+            str(req.engine.resolve_binary(req.run_root)),
             f"--user-data-dir={self._profile}",
             *CHROMIUM_FLAGS,
             *req.spec.flags,

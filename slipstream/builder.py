@@ -31,7 +31,13 @@ from .collector import BenchCollector, BuildStepError, FetchError
 from .config import Config, EngineConfig
 from .lock import MachineLock
 from .models import CommitKey
-from .resolve import BuildJob, EmbedderResolver, IdentityResolver, Resolver
+from .resolve import (
+    BuildJob,
+    DerivedResolver,
+    EmbedderResolver,
+    IdentityResolver,
+    Resolver,
+)
 
 # A stalled engine still retries, or the guard against a permanent burn becomes
 # a permanent stall. Each attempt is a full checkout, sync and compile holding
@@ -62,7 +68,7 @@ class BuildResult:
     status: str | None = None
 
 
-def build_cfg_hash(engine: EngineConfig) -> str:
+def build_cfg_hash(engine: EngineConfig, inherited: str | None = None) -> str:
     """Identifies the build inputs an artifact was produced with.
 
     Everything the user config can override, not just the compiler flags: the
@@ -71,6 +77,10 @@ def build_cfg_hash(engine: EngineConfig) -> str:
     run_env asserting inputs match when they do not. The run set is in for the
     same reason and is the one most likely to change -- adding a file to it
     changes what every later artifact contains, with nothing else to notice.
+
+    A derived engine compiles nothing of its own; ``inherited`` is the inner
+    entry's hash, so a change to how the inner engine is built shows on the
+    derived series too, which is where the engine actually runs.
     """
     import hashlib
 
@@ -88,6 +98,8 @@ def build_cfg_hash(engine: EngineConfig) -> str:
         # only when there is one, so an engine built from its own checkout
         # hashes exactly as it did before embedding existed.
         parts.append(f"{engine.embeds}@{engine.pin}")
+    if engine.derives:
+        parts.append(f"derives {engine.derives}@{inherited or ''}")
     payload = "\n--\n".join(parts)
     return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
 
@@ -193,7 +205,23 @@ class Builder:
         """
         if engine_name not in self._resolvers:
             engine = self.cfg.engines[engine_name]
-            if engine.embeds:
+            if engine.derives:
+                inner = self.cfg.engines.get(engine.derives)
+                if inner is None:
+                    raise ValueError(
+                        f"{engine_name} derives from {engine.derives}, which "
+                        f"this machine has no [engines.{engine.derives}] for"
+                    )
+                self._seed_embedder_numbers(engine_name)
+                self._resolvers[engine_name] = DerivedResolver(
+                    self.bus,
+                    engine,
+                    inner,
+                    number_for=lambda app, name=engine_name: self.store.embedder_number(
+                        name, app.version, app.title
+                    ),
+                )
+            elif engine.embeds:
                 inner = self.cfg.engines.get(engine.embeds)
                 if inner is None:
                     raise ValueError(
@@ -212,6 +240,17 @@ class Builder:
             else:
                 self._resolvers[engine_name] = IdentityResolver(self.collector, engine)
         return self._resolvers[engine_name]
+
+    def _seed_embedder_numbers(self, engine_name: str) -> None:
+        """Numbers the published manifests already use, into a store that
+        lacks them. The topic is the durable record; the database is a
+        cache of it that a rebuilt builder box starts without."""
+        known: dict[str, int] = {}
+        for entry in self.bus.entries(engine_name):
+            if entry.embedder_hash:
+                known[entry.embedder_hash] = entry.embedder_id
+        if known:
+            self.store.seed_embedder_numbers(engine_name, known)
 
     def frontier(self, engine_name: str) -> CommitKey | None:
         """The highest key this builder has finished with.
@@ -338,19 +377,25 @@ class Builder:
         log_path = self.cfg.logs_dir / f"build-{engine_name}-{key}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         started = time.time()
-        self.log(f"{engine_name}: building {key} ({job.hash[:8]})")
-        failure = self.collector.build_at(
-            engine, job.checkout_hash, log_path, pins=job.pins
-        )
-        if failure is not None:
-            return self._record_failure(
-                engine_name,
-                key,
-                failure,
-                log_path,
-                state,
-                stalled=stalled,
-                was_retry=was_retry,
+        if job.compiles:
+            self.log(f"{engine_name}: building {key} ({job.hash[:8]})")
+            failure = self.collector.build_at(
+                engine, job.checkout_hash, log_path, pins=job.pins
+            )
+            if failure is not None:
+                return self._record_failure(
+                    engine_name,
+                    key,
+                    failure,
+                    log_path,
+                    state,
+                    stalled=stalled,
+                    was_retry=was_retry,
+                )
+        else:
+            self.log(
+                f"{engine_name}: packaging {key} from {job.inherits.engine} "
+                f"{job.inherits.key} ({job.hash[:8]})"
             )
 
         state.in_flight = self._in_flight(job, "package")
@@ -423,9 +468,31 @@ class Builder:
     ) -> Entry:
         key = job.key
         commit = job.commit
-        blobs = store_run_set(
-            self.bus, engine.require_src_dir(), engine.require_run_set()
-        )
+        inherited = None
+        if job.compiles:
+            blobs = store_run_set(
+                self.bus, engine.require_src_dir(), engine.require_run_set()
+            )
+        else:
+            # The inner entry's blobs by reference, then this engine's own.
+            # The app can be replaced under us by its updater: its identity
+            # is read again after archiving, and a change means what was
+            # archived is not what the job names. Content addressing makes
+            # the torn blob unique, not correctly labelled, so it is dropped
+            # on the floor (the sweep reclaims it) and the cycle retries.
+            resolver = self.resolver(engine.name)
+            before, _ = resolver.installed()
+            own = store_run_set(
+                self.bus, engine.require_src_dir(), engine.require_run_set()
+            )
+            after, _ = resolver.installed()
+            if after != before:
+                raise BuildError(
+                    f"{before.title} became {after.title} while it was being "
+                    f"packaged; retrying next cycle"
+                )
+            blobs = [*job.inherits.blobs, *own]
+            inherited = job.inherits.build_cfg_hash
         entry = Entry(
             engine=engine.name,
             commit_id=key.commit_id,
@@ -436,7 +503,7 @@ class Builder:
             date=commit.get("date", ""),
             timestamp=int(commit.get("timestamp", 0)),
             title=commit.get("title", ""),
-            build_cfg_hash=build_cfg_hash(engine),
+            build_cfg_hash=build_cfg_hash(engine, inherited),
             blobs=blobs,
             builder=dict(self.identity),
             built_at=int(time.time()),

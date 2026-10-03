@@ -334,6 +334,15 @@ class CommitStore:
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS embedders (
+                engine     TEXT    NOT NULL,
+                hash       TEXT    NOT NULL,
+                number     INTEGER NOT NULL,
+                title      TEXT    NOT NULL DEFAULT '',
+                first_seen INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (engine, hash),
+                UNIQUE (engine, number)
+            );
             """
             + ";\n".join(_KEYED_TABLES.values())
             + ";\n"
@@ -1183,6 +1192,61 @@ class CommitStore:
             (engine,),
         ).fetchall()
         return [CommitKey.from_commit(r) for r in rows]
+
+    # --- builder-assigned embedder numbers ---
+    #
+    # An embedder with no position of its own (Safari Technology Preview: its
+    # Info.plist has a build string but no release number) gets one here:
+    # the first distinct hash is 1, the next 2, in the order the builder met
+    # them. Never 0, which is what "no embedder" is everywhere else.
+
+    def embedder_number(self, engine: str, hash_: str, title: str = "") -> int:
+        """The number for ``hash_``, assigning the next one if it is new."""
+        row = self.conn.execute(
+            "SELECT number FROM embedders WHERE engine=? AND hash=?", (engine, hash_)
+        ).fetchone()
+        if row:
+            return int(row[0])
+        with self.conn:
+            top = self.conn.execute(
+                "SELECT COALESCE(MAX(number), 0) FROM embedders WHERE engine=?",
+                (engine,),
+            ).fetchone()[0]
+            number = int(top) + 1
+            self.conn.execute(
+                "INSERT INTO embedders (engine, hash, number, title, first_seen)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (engine, hash_, number, title, int(time.time())),
+            )
+        return number
+
+    def embedder_numbers(self, engine: str) -> dict[str, int]:
+        rows = self.conn.execute(
+            "SELECT hash, number FROM embedders WHERE engine=?", (engine,)
+        ).fetchall()
+        return {r[0]: int(r[1]) for r in rows}
+
+    def seed_embedder_numbers(self, engine: str, known: dict[str, int]) -> None:
+        """Record pairs this store has no row for, e.g. read back from the
+        published manifests after the builder's database was lost. A pair
+        that contradicts an existing row is an error, not a silent renumber."""
+        with self.conn:
+            for hash_, number in known.items():
+                row = self.conn.execute(
+                    "SELECT number FROM embedders WHERE engine=? AND hash=?",
+                    (engine, hash_),
+                ).fetchone()
+                if row is None:
+                    self.conn.execute(
+                        "INSERT INTO embedders (engine, hash, number, first_seen)"
+                        " VALUES (?, ?, ?, ?)",
+                        (engine, hash_, int(number), int(time.time())),
+                    )
+                elif int(row[0]) != int(number):
+                    raise StoreError(
+                        f"{engine}: embedder {hash_!r} is number {row[0]} here "
+                        f"but {number} on the bus"
+                    )
 
     def max_terminal_build_key(self, engine: str) -> CommitKey | None:
         """Highest commit with a terminal build failure.

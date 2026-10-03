@@ -16,9 +16,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import NamedTuple, Protocol
+from pathlib import Path
+from typing import Callable, NamedTuple, Protocol
 
+from .bus import Bus, Entry
 from .collector import FetchError
+from .hostapp import HostApp, HostAppError, read_app
 from .models import CommitKey
 
 
@@ -40,6 +43,10 @@ class BuildJob:
     ``commit["hash"]``, otherwise it is the embedder's commit and ``pins``
     says where the engine goes under it. ``embedder`` is that outer commit's
     identity, empty when there is none.
+
+    ``inherits`` is set for a derived engine: the inner engine's published
+    entry whose blobs this job's entry will name. There is then nothing to
+    check out or compile, and ``checkout_hash`` is empty.
     """
 
     key: CommitKey
@@ -47,10 +54,15 @@ class BuildJob:
     checkout_hash: str
     pins: dict[str, str] = field(default_factory=dict)
     embedder: dict = field(default_factory=dict)
+    inherits: Entry | None = None
 
     @property
     def hash(self) -> str:
         return self.commit["hash"]
+
+    @property
+    def compiles(self) -> bool:
+        return self.inherits is None
 
 
 class Resolver(Protocol):
@@ -398,4 +410,124 @@ class EmbedderResolver:
                 "commit_id": int(outer["commit_id"]),
                 "title": outer.get("title", ""),
             },
+        )
+
+
+class DerivedResolver:
+    """An engine whose entries wrap another's: key = (B, inner key).
+
+    Safari Technology Preview around jsc's WebKit build. There is no source
+    and nothing to compile: each inner entry ``w`` that has what this engine
+    needs becomes ``(B, w)`` -- the inner entry's blobs plus this engine's own
+    run set, which is the installed app. ``B`` names the app. Its
+    ``Info.plist`` has a build string and no position, so the builder
+    assigns one per distinct string through ``number_for``, which the store
+    keeps monotone; the string itself is the embedder hash.
+
+    An inner entry qualifies when its blobs cover the inner engine's current
+    run set: a jsc entry archived before the WebKit runtime joined the run
+    set has a shell and nothing a browser can load, and would crash STP at
+    startup. Migrated version 1 entries have no paths and never qualify.
+
+    The series moves with two causes. A new inner entry above the frontier
+    is the ordinary step. A new app (auto-update landed) is first published
+    as ``(B', w)`` on the frontier's own ``w``, so the app change is a step
+    of its own rather than folded into the next WebKit commit; the inner
+    entries above ``w`` then follow under ``B'``. An app older than the
+    frontier's (a reinstall) is an error until a newer one is installed:
+    the series does not go backwards.
+    """
+
+    def __init__(
+        self,
+        bus: Bus,
+        engine,
+        inner,
+        *,
+        number_for: Callable[[HostApp], int],
+        installed: Callable[[], HostApp] | None = None,
+    ):
+        self.bus = bus
+        self.engine = engine
+        self.inner = inner
+        self.number_for = number_for
+        self._installed = installed or self._read_installed
+
+    # --- the app ---
+
+    def app_path(self) -> Path:
+        run_set = self.engine.require_run_set()
+        if self.engine.src_dir is None:
+            raise ValueError(
+                f"engine {self.engine.name} has no src_dir on this machine; set it "
+                f"to the directory holding {run_set[0]!r}"
+            )
+        return self.engine.src_dir / run_set[0]
+
+    def _read_installed(self) -> HostApp:
+        try:
+            return read_app(self.app_path())
+        except HostAppError as e:
+            raise ValueError(f"{self.engine.name}: {e}") from None
+
+    def installed(self) -> tuple[HostApp, int]:
+        app = self._installed()
+        return app, self.number_for(app)
+
+    # --- Resolver ---
+
+    def fetch(self) -> None:
+        """The inner topic is on this bus and the app is on this disk."""
+
+    def eligible(self, entry: Entry) -> bool:
+        have = {b.path for b in entry.blobs}
+        return all(p in have for p in self.inner.run_set)
+
+    def _candidates(self) -> list[Entry]:
+        return [e for e in self.bus.entries(self.inner.name) if self.eligible(e)]
+
+    def next_after(self, frontier: CommitKey) -> BuildJob | None:
+        app, number = self.installed()
+        prev_number, w = frontier
+        if prev_number and number < prev_number:
+            raise ValueError(
+                f"{self.engine.name}: the installed {app.title} is number {number}, "
+                f"below the series' frontier {frontier}; the series does not go "
+                f"backwards, so nothing is published until a newer one is installed"
+            )
+        if prev_number and number > prev_number:
+            # The app-only step: same inner commit, new app.
+            on_frontier = self.bus.read_entry(self.inner.name, CommitKey(0, w))
+            if on_frontier is not None and self.eligible(on_frontier):
+                return self._job(number, app, on_frontier)
+            # Retention took it; the step lands on the next entry instead.
+        for entry in self._candidates():
+            if entry.key.commit_id > w:
+                return self._job(number, app, entry)
+        return None
+
+    def for_key(self, key: CommitKey) -> BuildJob | None:
+        app, number = self.installed()
+        if key.embedder_id != number:
+            # Another app's entry cannot be rebuilt: the bytes are gone from
+            # the disk, and this engine has no history to reach back into.
+            return None
+        entry = self.bus.read_entry(self.inner.name, CommitKey(0, key.commit_id))
+        if entry is None or not self.eligible(entry):
+            return None
+        return self._job(number, app, entry)
+
+    def _job(self, number: int, app: HostApp, inner: Entry) -> BuildJob:
+        return BuildJob(
+            key=CommitKey(number, inner.commit_id),
+            commit={
+                "hash": inner.hash,
+                "commit_id": inner.commit_id,
+                "date": inner.date,
+                "timestamp": inner.timestamp,
+                "title": inner.title,
+            },
+            checkout_hash="",
+            embedder={"hash": app.version, "commit_id": number, "title": app.title},
+            inherits=inner,
         )

@@ -59,11 +59,11 @@ class ShellRunner:
         self._progress = progress
 
     def run(self, req: RunRequest) -> RunResult:
-        binary = req.run_root / req.engine.binary_path
+        binary = req.engine.resolve_binary(req.run_root)
         env = os.environ.copy()
         env_prefix: list[str] = []
-        if req.engine.dyld_lib_path:
-            dyld_path = str(req.run_root / req.engine.dyld_lib_path)
+        dyld_path = req.engine.dyld_search_path(req.run_root)
+        if dyld_path:
             env["DYLD_LIBRARY_PATH"] = dyld_path
             env["DYLD_FRAMEWORK_PATH"] = dyld_path
             # macOS SIP strips DYLD_ vars from protected processes (caffeinate/gtimeout),

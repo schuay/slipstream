@@ -136,16 +136,25 @@ class EngineConfig:
     the suite's cli script as argv and prints scores; a browser is pointed
     at a served page and reports them back. It is a fact about the engine,
     bundled with it, and picks the runner.
+
+    An engine that ``derives`` from another (safari from jsc) has no source
+    and no compile: each of its entries is an entry of the inner engine plus
+    this engine's own ``run_set``, taken from ``src_dir`` -- for safari the
+    directory the installed app sits in. Its series is ``(B, w)`` with ``w``
+    the inner engine's key and ``B`` a number the builder assigns per
+    distinct installed app. ``binary_path`` may then be absolute: the
+    process that hosts the run is provided by the machine, not the artifact.
     """
 
     name: str
     src_dir: Path | None
     build_cmd: str
-    binary_path: str  # relative to src_dir
+    binary_path: str  # relative to src_dir / the run root, or absolute
     id_regex: str
     path_filter: str = ""
     sync_cmd: str | None = None
-    dyld_lib_path: str | None = None  # relative to src_dir (JSC/macOS)
+    # Search directories for DYLD_*_PATH, relative to the run root, in order.
+    dyld_lib_path: list[str] = field(default_factory=list)
     pre_build_patches: list[str] = field(default_factory=list)
     gn_args: str | None = None  # GN args for build dir setup
     run_set: list[str] = field(default_factory=list)
@@ -157,6 +166,7 @@ class EngineConfig:
     # a browser's binary is several directories down inside its bundle.
     build_dir: str | None = None
     runtime: str = "shell"
+    derives: str | None = None  # the inner engine whose entries this wraps
 
     def __post_init__(self):
         if self.build_dir is None:
@@ -166,6 +176,22 @@ class EngineConfig:
                 f"engine {self.name}: runtime must be one of {list(RUNTIMES)}: "
                 f"{self.runtime!r}"
             )
+        if isinstance(self.dyld_lib_path, str):
+            self.dyld_lib_path = [self.dyld_lib_path]
+        if self.derives and self.embeds:
+            raise ValueError(
+                f"engine {self.name}: derives and embeds are exclusive"
+            )
+
+    def dyld_search_path(self, run_root: Path) -> str | None:
+        """``DYLD_*_PATH`` for a run root, or None if the engine sets none."""
+        if not self.dyld_lib_path:
+            return None
+        return ":".join(str(Path(run_root) / d) for d in self.dyld_lib_path)
+
+    def resolve_binary(self, run_root: Path) -> Path:
+        """The executable for a run: in the root, or the host's if absolute."""
+        return Path(run_root) / self.binary_path
 
     def require_src_dir(self) -> Path:
         if self.src_dir is None:
@@ -467,17 +493,26 @@ def load_config(user_config_path: Path | None = None) -> Config:
                     raise ValueError(
                         f"[{name}] embeds {embeds!r} but has no {required}"
                     )
+        # Likewise a derivation: whether the inner engine is configured on
+        # this box matters to the builder, not to a bench box reading its
+        # entries off the bus.
+        derives = defaults.get("derives")
+        if derives is not None and (derives not in engine_defaults or derives == name):
+            raise ValueError(f"[{name}] derives {derives!r}, which is not an engine")
+        dyld = defaults.get("dyld_lib_path") or []
+        if isinstance(dyld, str):
+            dyld = [dyld]
         # The build inputs are overridable: the two boxes do not have to build
         # the same way, and run_set is discovered per platform.
         engines[name] = EngineConfig(
             name=name,
             src_dir=Path(src_dir).expanduser() if src_dir else None,
-            build_cmd=user_engine.get("build_cmd", defaults["build_cmd"]),
+            build_cmd=user_engine.get("build_cmd", defaults.get("build_cmd", "")),
             binary_path=defaults["binary_path"],
-            id_regex=defaults["id_regex"],
+            id_regex=defaults.get("id_regex", ""),
             path_filter=defaults.get("path_filter", ""),
             sync_cmd=user_engine.get("sync_cmd", defaults.get("sync_cmd")),
-            dyld_lib_path=defaults.get("dyld_lib_path"),
+            dyld_lib_path=list(dyld),
             pre_build_patches=defaults.get("pre_build_patches", []),
             gn_args=user_engine.get("gn_args", defaults.get("gn_args")),
             run_set=_parse_run_set(
@@ -489,6 +524,7 @@ def load_config(user_config_path: Path | None = None) -> Config:
             roll_regex=defaults.get("roll_regex"),
             build_dir=defaults.get("build_dir"),
             runtime=defaults.get("runtime", "shell"),
+            derives=derives,
         )
 
     benchmarks: dict[str, BenchmarkConfig] = {}

@@ -358,7 +358,7 @@ class TestBenchAtRoot:
     ):
         c = self._collector(config, tmp_path, monkeypatch)
         engine = config.engines["v8"]
-        engine.dyld_lib_path = "lib"
+        engine.dyld_lib_path = ["lib"]
         seen = {}
 
         def fake_cmd(self, argv, cwd, env, out_f, err_f, stderr_file, label):

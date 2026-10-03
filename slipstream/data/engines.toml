@@ -155,3 +155,23 @@ pre_build_patches = [
     "Source/JavaScriptCore/Configurations/Base.xcconfig",
     "Source/WTF/Configurations/Base.xcconfig",
 ]
+
+# Safari Technology Preview around the WebKit build jsc produced. It has no
+# source and nothing to compile: each safari entry is a jsc entry's blobs
+# plus the installed app, and its series is (B, WebKit commit) with B a
+# number the builder assigns per distinct installed STP (its Info.plist
+# carries no release number; the build string is the embedder hash). STP
+# auto-updates on the builder; a new build string is a new B, published
+# first as the STP-only step (B, last WebKit commit).
+#
+# The process is not STP's own executable, which drops DYLD_* (no
+# allow-dyld-environment-variables entitlement), but system Safari's
+# development launcher, with the run root's WebKit first and the packaged
+# STP's UI frameworks second on the search path. The launcher is the host's,
+# like the OS, and is recorded in run_env rather than the key.
+[safari]
+runtime = "safari"
+derives = "jsc"
+binary_path = "/Applications/Safari.app/Contents/MacOS/SafariForWebKitDevelopment"
+dyld_lib_path = ["WebKitBuild/Release", "Safari Technology Preview.app/Contents/Frameworks"]
+run_set = ["Safari Technology Preview.app"]

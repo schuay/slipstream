@@ -965,3 +965,132 @@ class TestPublicationCleanup:
         assert [h for h, _ in builder.built] == ["hash101", "hash102"]
         assert builder.store.get_build_state("v8", 101) is None
         assert builder.bus.read_builder_state("v8").last_error is None
+
+
+class TestDerivedEngine:
+    """safari: a jsc entry's blobs plus the installed app, no compile."""
+
+    @pytest.fixture
+    def derived(self, builder, tmp_path):
+        import plistlib
+
+        apps = tmp_path / "Applications"
+        bundle = apps / "Safari Technology Preview.app" / "Contents"
+        (bundle / "MacOS").mkdir(parents=True)
+        (bundle / "MacOS" / "Safari Technology Preview").write_bytes(b"stp")
+        with open(bundle / "Info.plist", "wb") as f:
+            plistlib.dump(
+                {
+                    "CFBundleName": "Safari Technology Preview",
+                    "CFBundleVersion": "22626.1.8.19.2",
+                    "CFBundleShortVersionString": "27.0",
+                },
+                f,
+            )
+        builder.cfg.engines["safari"] = EngineConfig(
+            name="safari",
+            src_dir=apps,
+            build_cmd="",
+            binary_path="/Applications/Safari.app/Contents/MacOS/SafariForWebKitDevelopment",
+            id_regex="",
+            run_set=["Safari Technology Preview.app"],
+            derives="v8",  # the fixture's inner engine; jsc in life
+        )
+        builder.cfg.build.start_from["safari"] = K1(100)
+        # Two inner entries, built the ordinary way.
+        builder.build_one("v8")
+        builder.build_one("v8")
+        return builder, bundle
+
+    def test_publishes_the_inner_blobs_plus_its_own_without_compiling(self, derived):
+        builder, _ = derived
+        built_before = list(builder.built)
+        result = builder.build_one("safari")
+        assert result.published and result.key == CommitKey(1, 101)
+        assert builder.built == built_before  # no build_at call
+        entry = builder.bus.read_entry("safari", CommitKey(1, 101))
+        inner = builder.bus.read_entry("v8", K1(101))
+        assert entry.blobs[: len(inner.blobs)] == inner.blobs
+        assert [b.path for b in entry.blobs[len(inner.blobs) :]] == [
+            "Safari Technology Preview.app"
+        ]
+        assert entry.hash == inner.hash and entry.title == inner.title
+        assert entry.embedder == {
+            "hash": "22626.1.8.19.2",
+            "commit_id": 1,
+            "title": "Safari Technology Preview 22626.1.8.19.2 (27.0)",
+        }
+        assert entry.build_cfg_hash == build_cfg_hash(
+            builder.cfg.engines["safari"], inner.build_cfg_hash
+        )
+        assert entry.build_cfg_hash != inner.build_cfg_hash
+        assert any("packaging 1-101 from v8 101" in m for m in builder.logs)
+
+    def test_the_app_blob_is_archived_once_across_entries(self, derived):
+        builder, _ = derived
+        builder.build_one("safari")
+        builder.build_one("safari")
+        a = builder.bus.read_entry("safari", CommitKey(1, 101)).blobs[-1]
+        b = builder.bus.read_entry("safari", CommitKey(1, 102)).blobs[-1]
+        assert a.id == b.id
+        assert builder.bus.read_entry("safari", CommitKey(1, 102)).blobs[0] == (
+            builder.bus.read_entry("v8", K1(102)).blobs[0]
+        )
+
+    def test_numbers_come_from_the_store_and_survive_a_fresh_builder(self, derived):
+        import plistlib
+
+        from slipstream.bus import Bus
+
+        builder, bundle = derived
+        builder.build_one("safari")
+        assert builder.store.embedder_numbers("safari") == {"22626.1.8.19.2": 1}
+        # The updater lands a new build.
+        with open(bundle / "Info.plist", "wb") as f:
+            plistlib.dump(
+                {"CFBundleName": "Safari Technology Preview", "CFBundleVersion": "22627.1"},
+                f,
+            )
+        result = builder.build_one("safari")
+        assert result.key == CommitKey(2, 101)  # the app-only step
+        # A builder with an empty database recovers the numbering from the topic.
+        fresh = Builder(builder.cfg, Bus(builder.bus.root))
+        fresh.store.conn.execute("DELETE FROM embedders")
+        fresh.store.conn.commit()
+        fresh.resolver("safari")
+        assert fresh.store.embedder_numbers("safari") == {
+            "22626.1.8.19.2": 1,
+            "22627.1": 2,
+        }
+        fresh.store.close()
+
+    def test_an_update_during_packaging_is_a_retry_not_an_entry(
+        self, derived, monkeypatch
+    ):
+        import plistlib
+
+        from slipstream import builder as builder_mod
+
+        builder, bundle = derived
+        real = builder_mod.store_run_set
+
+        def swap_mid_archive(*a, **kw):
+            blobs = real(*a, **kw)
+            with open(bundle / "Info.plist", "wb") as f:
+                plistlib.dump({"CFBundleVersion": "22627.1"}, f)
+            return blobs
+
+        monkeypatch.setattr(builder_mod, "store_run_set", swap_mid_archive)
+        result = builder.build_one("safari")
+        assert not result.published
+        assert builder.bus.keys("safari") == []
+        state = builder.bus.read_builder_state("safari")
+        assert "while it was being packaged" in state.last_error
+
+    def test_a_derived_engine_needs_the_inner_one_configured(self, derived):
+        builder, _ = derived
+        builder.cfg.engines["safari"] = replace(
+            builder.cfg.engines["safari"], derives="jsc"
+        )
+        with pytest.raises(ValueError, match=r"no \[engines.jsc\]"):
+            builder.resolver("safari")
