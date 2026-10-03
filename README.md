@@ -76,6 +76,11 @@ separately to send them onward.
 `clear` forgets a range so it can be measured again, which is also how you
 backfill history for a `[[run]]` entry added after the fact.
 
+Chrome runs use `--headless=new` (Chromium 112 or newer), without opening a
+browser window or requiring a display. Headless mode changes the browser's
+rendering environment; compare scores against a headed baseline before joining
+the two into one performance series.
+
 ## Two machines
 
 `build` and `watch` can be split across a pair of boxes over a shared directory

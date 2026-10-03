@@ -329,6 +329,7 @@ class TestChromiumRunner:
         profile = cmd.argv[1].removeprefix("--user-data-dir=")
         assert Path(profile).is_dir() and not os.listdir(profile)
         assert cmd.argv[2 : 2 + len(CHROMIUM_FLAGS)] == list(CHROMIUM_FLAGS)
+        assert "--headless=new" in cmd.argv
         assert cmd.argv[-2:] == [
             "--js-flags=--maglev",
             "http://127.0.0.1:1/index.html?report=true",

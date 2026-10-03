@@ -26,6 +26,7 @@ from .browser import BrowserRunner, Command
 # metrics, Chrome Labs, model downloads. The background pair keeps the
 # page at full speed if the window is ever not in front.
 CHROMIUM_FLAGS = (
+    "--headless=new",
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-search-engine-choice-screen",
