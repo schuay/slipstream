@@ -208,7 +208,10 @@ class BusConsumer:
         root = self.run_root(engine.name, entry.key)
         if root.exists():
             shutil.rmtree(root)
+        t0 = time.monotonic()
         paths = source.fetch(entry, self.bus)
+        t1 = time.monotonic()
+        size_mb = sum(p.stat().st_size for p in paths) / 1e6
         tmp_root = root.with_name(root.name + ".unpacking")
         if tmp_root.exists():
             shutil.rmtree(tmp_root)
@@ -216,11 +219,20 @@ class BusConsumer:
         for path in paths:
             _unpack(path, tmp_root)
         tmp_root.rename(root)
+        t2 = time.monotonic()
         self._trim_run_roots(engine.name, keep=entry.key)
         # The blobs this entry needed are in the bench state by now, so the
         # sweep keeps them for the next entry to share and reclaims the
         # previous entry's.
         self.bus.sweep_blobs()
+        t3 = time.monotonic()
+        # A browser bundle is a gigabyte of small files; this is where the
+        # minute between two commits goes, and it should say so.
+        self.log(
+            f"{engine.name}: provisioned {entry.key} from {len(paths)} blob(s), "
+            f"{size_mb:.0f} MB: fetch {t1 - t0:.0f}s, unpack {t2 - t1:.0f}s, "
+            f"trim {t3 - t2:.0f}s"
+        )
         return root
 
     def _trim_run_roots(self, engine: str, keep=None) -> None:
