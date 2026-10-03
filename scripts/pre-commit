@@ -26,4 +26,30 @@ if ((${#staged_files[@]})); then
     --check --files "${staged_files[@]}"
 fi
 
+# Prose stays out of this repository: README.md is the one markdown file it
+# carries. Anything else -- design notes, runbooks, incident write-ups --
+# belongs in a private place, and a doc that lands here by habit is in the
+# public history for good. Renames count, so moving a doc in is caught too.
+markdown_allowed=(README.md)
+mapfile -d '' -t staged_new < <(
+  git diff --cached --name-only --diff-filter=ACR -z
+)
+markdown_rejected=()
+for path in "${staged_new[@]}"; do
+  lower=${path,,}
+  [[ $lower == *.md || $lower == *.markdown || $lower == *.mdx ]] || continue
+  allowed=0
+  for ok in "${markdown_allowed[@]}"; do
+    [[ $path == "$ok" ]] && allowed=1
+  done
+  ((allowed)) || markdown_rejected+=("$path")
+done
+if ((${#markdown_rejected[@]})); then
+  echo "markdown outside the allowlist (${markdown_allowed[*]}):" >&2
+  printf '  %s\n' "${markdown_rejected[@]}" >&2
+  echo "keep docs out of the public repo; edit markdown_allowed in" \
+    "scripts/pre-commit for a deliberate exception" >&2
+  exit 1
+fi
+
 scripts/check-private-patterns staged

@@ -51,14 +51,15 @@ For upgrades, stop all running `build`, `watch`, and `deliver` processes before
 its loaded code after reinstalling; leaving an old daemon running across a
 schema migration can cause incompatible writes and retained SQLite locks.
 
-See [background analysis on benchmark hosts](docs/benchmark-host.md) for disabling
-macOS media and photo analysis on a dedicated benchmark account.
+On a dedicated macOS benchmark account, disable the media and photo analysis
+agents; they can take a core for minutes at a time next to a running engine.
 
 JSC archives include matching WebKit frameworks, XPC helpers and MiniBrowser,
 selecting commits that touch `Source/JavaScriptCore`. Builds target `arm64e` to
-use the pointer-authentication ABI and JIT paths used by Safari on Apple Silicon. Results keep the host architecture label
-`arm64` and the existing series. See [JSC build configuration](docs/jsc-build.md)
-for build overrides, verification, and browser compatibility.
+use the pointer-authentication ABI and JIT paths used by Safari on Apple Silicon.
+Results keep the host architecture label `arm64` and the existing series. The
+build command and archived set are in `slipstream/data/engines.toml` and can be
+overridden per engine in `config.toml`.
 
 ## Measuring
 
@@ -99,9 +100,8 @@ so a cycle only sends what is new. A target is either a Spanner database
 sequenced log for a machine that has no route to the database. The receiving
 machine configures `[[relay]]` sources and runs one `slipstream deliver` owner
 for both its local DB and remote spools. The `relay` command is removed.
-
-See [delivery operations](docs/delivery.md) for configuration, crash recovery,
-explicit replay/rebuild, index prerequisites, and deployment/rollback preparation.
+`slipstream deliver --help` lists the maintenance switches (explicit replay,
+rebuild, legacy reconciliation); the `launchd/` example keeps it running.
 
 ## Development
 
