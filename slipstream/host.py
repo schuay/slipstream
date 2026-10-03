@@ -49,7 +49,13 @@ _READ_COMMANDS = {
         "com.apple.screensaver",
         "idleTime",
     ],
+    "ps": ["ps", "-axo", "comm="],
 }
+
+# Executables whose presence means a browser is up. Matched on the basename's
+# prefix: "Safari" covers Safari, SafariForWebKitDevelopment and Safari
+# Technology Preview; a helper's name begins with its browser's.
+BROWSER_PREFIXES = ("Safari", "Chromium", "Google Chrome", "com.apple.WebKit")
 
 
 def is_macos() -> bool:
@@ -97,6 +103,23 @@ def parse_power_source(text: str) -> bool | None:
     return "AC" in m.group(1)
 
 
+def parse_browsers(text: str) -> tuple[str, ...]:
+    """The distinct browser executables in a `ps -axo comm=` listing."""
+    names = set()
+    for line in text.splitlines():
+        name = Path(line.strip()).name
+        if name.startswith(BROWSER_PREFIXES):
+            names.add(name)
+    return tuple(sorted(names))
+
+
+def parse_therm(text: str) -> int | None:
+    """The CPU speed limit from `pmset -g therm`, in percent; None when the
+    line is missing, which it is on hardware that does not report it."""
+    m = re.search(r"CPU_Speed_Limit\s*=\s*(\d+)", text)
+    return int(m.group(1)) if m else None
+
+
 @dataclass(frozen=True)
 class HostState:
     os_version: str | None = None
@@ -106,6 +129,7 @@ class HostState:
     ac: dict[str, str] = field(default_factory=dict)
     battery: dict[str, str] = field(default_factory=dict)
     screensaver_idle: int | None = None
+    browsers: tuple[str, ...] = ()
     raw: dict[str, str] = field(default_factory=dict)
 
 
@@ -142,6 +166,7 @@ def read_state(read: Callable[[list[str]], str | None] | None = None) -> HostSta
         ac=custom.get(_AC, {}),
         battery=custom.get(_BATTERY, {}),
         screensaver_idle=screensaver_idle,
+        browsers=parse_browsers(raw.get("ps", "")),
         raw=raw,
     )
 
@@ -245,11 +270,75 @@ def checks(state: HostState) -> list[Check]:
         )
 
     out.append(_setting(state, "powermode", "2", "high power mode", ADVISORY))
+    # Advisory: the browser runners refuse to launch beside one of these at
+    # every run, so this is a heads-up at session start, not the gate.
+    out.append(
+        Check(
+            name="no browser running",
+            want="none",
+            got=", ".join(state.browsers) or "none",
+            ok=not state.browsers,
+            severity=ADVISORY,
+            fix="quit it; a browser run is refused while one is up",
+        )
+    )
     return out
 
 
 def failures(results: list[Check]) -> list[Check]:
     return [c for c in results if not c.ok and c.severity == BLOCKING]
+
+
+# --- Thermal cool-down, before every measurement ---
+
+COOL_DOWN_SECONDS = 300.0
+COOL_DOWN_POLL_SECONDS = 5.0
+_THERM = ["pmset", "-g", "therm"]
+
+
+def cool_down(
+    log: Callable[[str], None],
+    *,
+    read: Callable[[list[str]], str | None] | None = None,
+    timeout: float = COOL_DOWN_SECONDS,
+    poll: float = COOL_DOWN_POLL_SECONDS,
+    clock: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
+) -> float:
+    """Wait until the CPU is no longer thermally limited; the seconds waited.
+
+    A suite heats the machine, and the next one would start under a speed
+    limit the previous one earned, so every measurement waits here first.
+    Bounded: a machine that does not cool within ``timeout`` is measured
+    anyway, with a warning, rather than stalling the series. macOS only, and
+    quiet where pmset does not report a limit.
+    """
+    import time
+
+    if not is_macos():
+        return 0.0
+    read = read or _read
+    clock = clock or time.monotonic
+    sleep = sleep or time.sleep
+    start = clock()
+    limit = parse_therm(read(_THERM) or "")
+    if limit is None or limit >= 100:
+        return 0.0
+    log(f"  cooling down: CPU speed limit {limit}%")
+    while True:
+        waited = clock() - start
+        if waited >= timeout:
+            log(
+                f"  [yellow]still throttled at {limit}% after {int(waited)}s; "
+                f"measuring anyway[/yellow]"
+            )
+            return waited
+        sleep(min(poll, max(0.0, timeout - waited)))
+        limit = parse_therm(read(_THERM) or "")
+        if limit is None or limit >= 100:
+            waited = clock() - start
+            log(f"  cooled down after {int(waited)}s")
+            return waited
 
 
 # The AC-profile settings --apply writes, in report order.

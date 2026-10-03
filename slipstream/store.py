@@ -55,6 +55,8 @@ _ADDED_COLUMNS = [
     ("processing_state", "configs_total", "INTEGER"),
     ("push_state", "bot", "TEXT"),
     ("commits", "embedder_hash", "TEXT NOT NULL DEFAULT ''"),
+    ("run_env", "runner_cfg_hash", "TEXT NOT NULL DEFAULT ''"),
+    ("run_env", "host_env", "TEXT NOT NULL DEFAULT '{}'"),
 ]
 
 # Version 3 put embedder_id into every key. It is a primary key column, which
@@ -152,6 +154,8 @@ _KEYED_TABLES = {
             os_version         TEXT    NOT NULL DEFAULT '',
             toolchain          TEXT    NOT NULL DEFAULT '',
             build_cfg_hash     TEXT    NOT NULL DEFAULT '',
+            runner_cfg_hash    TEXT    NOT NULL DEFAULT '',
+            host_env           TEXT    NOT NULL DEFAULT '{}',
             slipstream_version TEXT    NOT NULL DEFAULT '',
             recorded_at        INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (engine, bot, embedder_id, commit_id)
@@ -1065,6 +1069,7 @@ class CommitStore:
             "runs": None,
             "run_configs": "[]",
             "harness_revs": "{}",
+            "host_env": "{}",
         }
         columns = [
             "source",
@@ -1075,6 +1080,8 @@ class CommitStore:
             "os_version",
             "toolchain",
             "build_cfg_hash",
+            "runner_cfg_hash",
+            "host_env",
             "slipstream_version",
         ]
         values = [env.get(c, defaults.get(c, "")) for c in columns]

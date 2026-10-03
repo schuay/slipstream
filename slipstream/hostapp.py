@@ -40,6 +40,25 @@ class HostAppError(RuntimeError):
     """The bundle is not there or has no readable identity."""
 
 
+def bundle_of(path: Path) -> Path | None:
+    """The nearest ``.app`` enclosing ``path``, or None."""
+    for candidate in (path, *Path(path).parents):
+        if candidate.suffix == ".app":
+            return candidate
+    return None
+
+
+def describe(app: Path | None) -> str:
+    """``read_app(app).title``, or the reason there is none. For a record
+    that must be written whatever the bundle looks like."""
+    if app is None:
+        return ""
+    try:
+        return read_app(app).title
+    except HostAppError as e:
+        return f"unknown ({e})"
+
+
 def read_app(app: Path) -> HostApp:
     """The identity of the bundle at ``app`` (``…/Foo.app``)."""
     plist = Path(app) / "Contents" / "Info.plist"

@@ -19,6 +19,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.markup import escape
 
+from . import host
 from .config import Config, EngineConfig, RunSpec
 from .lock import MachineLock
 from .models import CommitKey
@@ -87,6 +88,8 @@ class BenchCollector:
             bot=self.cfg.bot_name,
             backup=backup,
         )
+        # Before every measurement; a seam so tests do not read pmset.
+        self.cool_down: Callable[[Callable[[str], None]], float] = host.cool_down
 
     def _log(self, message: str, **kwargs):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -498,6 +501,7 @@ class BenchCollector:
                     console.print("." * 5, end="")
                     result = RunResult(True, [])
                 else:
+                    self.cool_down(self._log)
                     result = runner.run(
                         RunRequest(
                             engine=engine,
@@ -619,22 +623,34 @@ class BenchCollector:
             # the breaker never firing.
             return BenchOutcome(0, outcome.configs_total, 0)
         self.store.record_run_env(
-            engine.name, key, provenance or self.local_provenance(engine, runs)
+            engine.name,
+            key,
+            provenance or self.local_provenance(engine, runs, run_root),
         )
         return outcome
 
-    def local_provenance(self, engine: EngineConfig, runs: int) -> dict:
+    def local_provenance(
+        self, engine: EngineConfig, runs: int, run_root: Path | None = None
+    ) -> dict:
         """What produced the numbers when the binary was built on this machine.
 
         Recorded so the mixture is visible: a repair with `bench` puts a
         locally built commit among archive-built neighbours, which is exactly
         the case the re-bench rules refuse for one command and permit for
         another.
+
+        Two of the fields are the runner's. ``runner_cfg_hash`` is how the
+        engine was driven, beside ``build_cfg_hash`` for how it was built;
+        ``host_env`` is what the run went through on this machine that is
+        neither -- for a browser, the application around the engine and the
+        launcher that started it -- and needs the run root to read it.
         """
-        from . import __version__, host
+        from . import __version__
         from .builder import build_cfg_hash
 
         identity = host.identity()
+        runner = self._runner(engine)
+        host_env = runner.host_env(engine, run_root) if run_root is not None else {}
         return {
             "source": "local",
             "runs": runs,
@@ -646,6 +662,8 @@ class BenchCollector:
             "os_version": identity["os_version"],
             "toolchain": identity["toolchain"],
             "build_cfg_hash": build_cfg_hash(engine),
+            "runner_cfg_hash": runner.cfg_hash(),
+            "host_env": json.dumps(host_env, sort_keys=True),
             "slipstream_version": __version__,
         }
 

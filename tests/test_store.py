@@ -700,6 +700,20 @@ class TestEmbedderKeyMigration:
         assert [tuple(r) for r in rows] == [(100, ""), (101, "")]
         s.close()
 
+    def test_run_env_gains_the_runners_columns(self, tmp_path):
+        s = self._open(tmp_path)
+        row = s.get_run_env("v8", 100)
+        assert row["runner_cfg_hash"] == "" and row["host_env"] == "{}"
+        s.record_run_env(
+            "v8",
+            101,
+            {"runner_cfg_hash": "sha256:r", "host_env": '{"host_app": "STP 1"}'},
+        )
+        row = s.get_run_env("v8", 101)
+        assert row["runner_cfg_hash"] == "sha256:r"
+        assert row["host_env"] == '{"host_app": "STP 1"}'
+        s.close()
+
 
 class TestEmbedderHash:
     def test_upsert_writes_and_updates_it(self, store):

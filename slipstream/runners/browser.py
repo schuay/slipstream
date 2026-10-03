@@ -24,7 +24,8 @@ from pathlib import Path
 
 from rich.markup import escape
 
-from .base import Log, Progress, RunRequest, RunResult, geomean_overall
+from ..config import EngineConfig
+from .base import Log, Progress, RunRequest, RunResult, cfg_digest, geomean_overall
 from .report import ReportError, parse_report
 from .server import BenchServer
 
@@ -57,6 +58,8 @@ class Verdict:
 
 
 class BrowserRunner:
+    runtime = "browser"
+
     def __init__(self, *, log: Log, progress: Progress):
         self._log = log
         self._progress = progress
@@ -65,6 +68,21 @@ class BrowserRunner:
 
     def command(self, req: RunRequest, url: str) -> Command:
         raise NotImplementedError
+
+    def conventions(self) -> tuple[str, ...]:
+        """What every run of this browser gets, for ``cfg_hash``: the fixed
+        flags, the launch mechanism. Not the ``[[run]]`` flags."""
+        raise NotImplementedError
+
+    def cfg_hash(self) -> str:
+        return cfg_digest(
+            self.runtime,
+            f"GET {PAGE}?report=true; POST /report",
+            *self.conventions(),
+        )
+
+    def host_env(self, engine: EngineConfig, run_root: Path) -> dict[str, str]:
+        return {}
 
     def precondition(self, req: RunRequest) -> str | None:
         """Why the browser must not be launched right now, or None."""

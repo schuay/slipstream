@@ -18,12 +18,12 @@ from slipstream.runners import (
 )
 
 
-def _engine(name="v8", **kw):
+def _engine(name="v8", binary_path="out/d8", **kw):
     return EngineConfig(
         name=name,
         src_dir=None,
         build_cmd="true",
-        binary_path="out/d8",
+        binary_path=binary_path,
         id_regex=r"#([0-9]+)",
         **kw,
     )
@@ -146,8 +146,27 @@ class TestCollectorSeam:
         monkeypatch.setattr(
             ShellRunner, "run", lambda self, req: pytest.fail("ran in dry-run")
         )
+        c.cool_down = lambda log: pytest.fail("cooled down in dry-run")
         outcome = c._run_benchmarks(config.engines["v8"], "1", 1, tmp_path / "root")
         assert outcome == (1, 1, 0)
+
+    def test_every_measurement_waits_for_the_machine_to_cool(
+        self, config, tmp_path, monkeypatch
+    ):
+        """Before each (run, config), not once per commit: the previous suite
+        is what heated the machine."""
+        c = self._collector(config)
+        order = []
+        c.cool_down = lambda log: order.append("cool")
+
+        class _Noting(_Fixed):
+            def run(self, req):
+                order.append("run")
+                return super().run(req)
+
+        monkeypatch.setattr(c, "_runner", lambda engine: _Noting(RunResult(True, [])))
+        c._run_benchmarks(config.engines["v8"], "1", 3, tmp_path / "root")
+        assert order == ["cool", "run"] * 3
 
 
 class _Fixed:
@@ -156,3 +175,101 @@ class _Fixed:
 
     def run(self, req):
         return self._result
+
+
+def _bundle(app, version, short="", name=None):
+    import plistlib
+
+    contents = app / "Contents"
+    contents.mkdir(parents=True)
+    info = {"CFBundleVersion": version}
+    if short:
+        info["CFBundleShortVersionString"] = short
+    if name:
+        info["CFBundleName"] = name
+    with open(contents / "Info.plist", "wb") as f:
+        plistlib.dump(info, f)
+    return app
+
+
+class TestRunnerProvenance:
+    """Every runner says how it drives an engine and what host application
+    a run went through; the collector records both beside the build's."""
+
+    kw = dict(log=lambda m: None, progress=lambda: None)
+
+    def test_each_runtime_has_a_distinct_stable_cfg_hash(self):
+        hashes = {
+            rt: runner_for(rt, **self.kw).cfg_hash()
+            for rt in ("shell", "chromium", "safari")
+        }
+        assert all(h.startswith("sha256:") for h in hashes.values())
+        assert len(set(hashes.values())) == 3
+        assert runner_for("safari", **self.kw).cfg_hash() == hashes["safari"]
+
+    def test_the_fixed_flags_are_in_the_hash_and_the_variant_is_not(self, monkeypatch):
+        from slipstream.runners import chromium
+
+        before = ChromiumRunner(**self.kw).cfg_hash()
+        monkeypatch.setattr(
+            chromium, "CHROMIUM_FLAGS", (*chromium.CHROMIUM_FLAGS, "--x")
+        )
+        assert ChromiumRunner(**self.kw).cfg_hash() != before
+        # The [[run]] flags are the variant, which the request carries; the
+        # hash is a property of the runner alone and takes no request.
+        assert (
+            ChromiumRunner(**self.kw).cfg_hash() == ChromiumRunner(**self.kw).cfg_hash()
+        )
+
+    def test_a_shell_binary_has_no_host_app(self, tmp_path):
+        assert ShellRunner(**self.kw).host_env(_engine(), tmp_path) == {}
+
+    def test_chromium_names_the_bundle_it_ran(self, tmp_path):
+        engine = _engine(
+            "chrome",
+            runtime="chromium",
+            binary_path="out/Chromium.app/Contents/MacOS/Chromium",
+        )
+        _bundle(
+            tmp_path / "out" / "Chromium.app", "7300.0.1", "146.0.7300.1", "Chromium"
+        )
+        env = ChromiumRunner(**self.kw).host_env(engine, tmp_path)
+        assert env == {"host_app": "Chromium 7300.0.1 (146.0.7300.1)"}
+
+    def test_safari_names_the_packaged_stp_and_the_hosts_launcher(self, tmp_path):
+        from slipstream.runners import SafariRunner
+
+        launcher_app = _bundle(
+            tmp_path / "sys" / "Safari.app", "20622.1.2", "26.1", "Safari"
+        )
+        engine = _engine(
+            "safari",
+            runtime="safari",
+            binary_path=str(launcher_app / "Contents/MacOS/SafariForWebKitDevelopment"),
+            run_set=["Safari Technology Preview.app"],
+        )
+        root = tmp_path / "root"
+        _bundle(
+            root / "Safari Technology Preview.app",
+            "22626.1.8.19.2",
+            "27.0",
+            "Safari Technology Preview",
+        )
+        env = SafariRunner(**self.kw).host_env(engine, root)
+        assert env == {
+            "host_app": "Safari Technology Preview 22626.1.8.19.2 (27.0)",
+            "launcher": "Safari 20622.1.2 (26.1)",
+        }
+
+    def test_a_missing_bundle_is_recorded_as_unknown_not_raised(self, tmp_path):
+        from slipstream.runners import SafariRunner
+
+        engine = _engine(
+            "safari",
+            runtime="safari",
+            binary_path="/nowhere/Safari.app/Contents/MacOS/SafariForWebKitDevelopment",
+            run_set=["Safari Technology Preview.app"],
+        )
+        env = SafariRunner(**self.kw).host_env(engine, tmp_path)
+        assert env["host_app"].startswith("unknown (no application bundle")
+        assert env["launcher"].startswith("unknown (no application bundle")

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from types import SimpleNamespace
@@ -540,7 +541,43 @@ class TestLocalProvenance:
         row = c.store.get_run_env("v8", 100)
         assert row["source"] == "local" and row["runs"] == 3
         assert row["build_cfg_hash"].startswith("sha256:")
+        assert row["runner_cfg_hash"].startswith("sha256:")
+        assert row["host_env"] == "{}"
         assert c.store.run_env_source_counts("v8") == {"local": 1}
+
+    def test_the_runners_side_is_recorded_beside_the_builds(
+        self, config, tmp_path, monkeypatch
+    ):
+        """How the engine was driven and what it ran inside, from the run root:
+        a browser's host application is read off the unpacked entry."""
+        from slipstream.collector import BenchCollector
+        from slipstream.config import EngineConfig
+
+        config.engines["chrome"] = EngineConfig(
+            name="chrome",
+            src_dir=tmp_path / "src",
+            build_cmd="true",
+            binary_path="out/Chromium.app/Contents/MacOS/Chromium",
+            id_regex=r"#([0-9]+)",
+            runtime="chromium",
+            run_set=["out/Chromium.app"],
+        )
+        root = tmp_path / "root"
+        contents = root / "out" / "Chromium.app" / "Contents"
+        contents.mkdir(parents=True)
+        import plistlib
+
+        with open(contents / "Info.plist", "wb") as f:
+            plistlib.dump(
+                {"CFBundleVersion": "7300.0.1", "CFBundleName": "Chromium"}, f
+            )
+        c = BenchCollector(config)
+        monkeypatch.setattr(c, "harness_revs", lambda: {})
+        env = c.local_provenance(config.engines["chrome"], 1, root)
+        assert env["runner_cfg_hash"] == c._runner(config.engines["chrome"]).cfg_hash()
+        assert json.loads(env["host_env"]) == {"host_app": "Chromium 7300.0.1"}
+        # Without a root there is nothing to read the host app from.
+        assert c.local_provenance(config.engines["chrome"], 1)["host_env"] == "{}"
 
     def test_a_missing_benchmark_dir_does_not_kill_the_bench(self, config, tmp_path):
         """Provenance runs after scores are already written."""

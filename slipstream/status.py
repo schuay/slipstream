@@ -100,6 +100,7 @@ def local_env(cfg: Config, collector, engine: str | None = None) -> dict:
         env["run_configs"] = [
             f"{c.suite}/{c.variant}" for c in collector.run_configs(cfg.engines[engine])
         ]
+        env["runner_cfg_hash"] = collector._runner(cfg.engines[engine]).cfg_hash()
     return env
 
 
@@ -110,7 +111,7 @@ def compare_env(local: dict, remote: dict) -> list[str]:
     own engine lists; the rest are compared as read.
     """
     out = []
-    for key in ("slipstream_version", "os_version", "harness"):
+    for key in ("slipstream_version", "os_version", "harness", "runner_cfg_hash"):
         if key in remote and remote[key] != local.get(key):
             out.append(f"{key}: here {local.get(key)!r}, there {remote[key]!r}")
     if "run_configs" in remote and "run_configs" in local:

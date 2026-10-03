@@ -483,3 +483,131 @@ class TestRestoreUndoesEverythingApplyWrites:
             c for c in applied if c not in restored and "com.apple.screensaver" not in c
         }
         assert not missing, f"apply writes with no undo: {sorted(missing)}"
+
+
+PMSET_THERM_HOT = """Note: No thermal warning level has been recorded
+Note: No performance warning level has been recorded
+CPU_Scheduler_Limit \t= 100
+CPU_Available_CPUs \t= 10
+CPU_Speed_Limit \t= 62
+"""
+PMSET_THERM_COOL = PMSET_THERM_HOT.replace("= 62", "= 100")
+
+
+class TestCoolDown:
+    """Every measurement starts on a machine that is not throttled by the
+    previous one, within a bound."""
+
+    def _therm(self, readings):
+        it = iter(readings)
+        last = [readings[-1]]
+
+        def read(cmd):
+            assert cmd == ["pmset", "-g", "therm"]
+            last[0] = next(it, last[0])
+            return last[0]
+
+        return read
+
+    def _clock(self, step=5.0):
+        t = [0.0]
+
+        def clock():
+            return t[0]
+
+        def sleep(s):
+            t[0] += s
+
+        return clock, sleep
+
+    def test_parses_the_speed_limit(self):
+        assert host.parse_therm(PMSET_THERM_HOT) == 62
+        assert host.parse_therm(PMSET_THERM_COOL) == 100
+        assert host.parse_therm("Note: nothing\n") is None
+
+    def test_a_cool_machine_does_not_wait(self, monkeypatch):
+        monkeypatch.setattr(host, "is_macos", lambda: True)
+        logged = []
+        clock, sleep = self._clock()
+        waited = host.cool_down(
+            logged.append,
+            read=self._therm([PMSET_THERM_COOL]),
+            clock=clock,
+            sleep=sleep,
+        )
+        assert waited == 0.0 and logged == []
+
+    def test_waits_until_the_limit_lifts(self, monkeypatch):
+        monkeypatch.setattr(host, "is_macos", lambda: True)
+        logged = []
+        clock, sleep = self._clock()
+        read = self._therm([PMSET_THERM_HOT, PMSET_THERM_HOT, PMSET_THERM_COOL])
+        waited = host.cool_down(
+            logged.append, read=read, clock=clock, sleep=sleep, poll=5
+        )
+        assert waited == 10.0
+        assert logged[0].strip() == "cooling down: CPU speed limit 62%"
+        assert logged[-1].strip() == "cooled down after 10s"
+
+    def test_gives_up_after_the_bound_with_a_warning(self, monkeypatch):
+        monkeypatch.setattr(host, "is_macos", lambda: True)
+        logged = []
+        clock, sleep = self._clock()
+        waited = host.cool_down(
+            logged.append,
+            read=self._therm([PMSET_THERM_HOT]),
+            clock=clock,
+            sleep=sleep,
+            poll=5,
+            timeout=30,
+        )
+        assert waited == 30.0
+        assert "still throttled at 62% after 30s" in logged[-1]
+
+    def test_hardware_without_a_limit_line_is_not_waited_on(self, monkeypatch):
+        monkeypatch.setattr(host, "is_macos", lambda: True)
+        assert host.cool_down(lambda m: None, read=lambda cmd: "Note: n/a\n") == 0.0
+        assert host.cool_down(lambda m: None, read=lambda cmd: None) == 0.0
+
+    def test_not_macos_reads_nothing(self, monkeypatch):
+        monkeypatch.setattr(host, "is_macos", lambda: False)
+        assert host.cool_down(lambda m: None, read=lambda cmd: pytest.fail("read")) == 0
+
+
+class TestRunningBrowsers:
+    """A browser left up at session start is reported; the runner is what
+    refuses to launch beside one, per run."""
+
+    PS = """/sbin/launchd
+/usr/sbin/sshd
+/Applications/Safari.app/Contents/MacOS/SafariForWebKitDevelopment
+/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent
+/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/1/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)
+/Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+"""
+
+    def test_names_each_browser_executable_once(self):
+        assert host.parse_browsers(self.PS) == (
+            "Google Chrome",
+            "Google Chrome Helper (Renderer)",
+            "SafariForWebKitDevelopment",
+            "com.apple.WebKit.WebContent",
+        )
+        assert host.parse_browsers("/sbin/launchd\n/usr/bin/safaridriver-ish\n") == ()
+
+    def test_is_an_advisory_check(self):
+        read = fake_reader(custom=PMSET_CUSTOM_NO_POWERMODE)
+        state = host.read_state(
+            lambda cmd: self.PS if cmd == ["ps", "-axo", "comm="] else read(cmd)
+        )
+        (check,) = [c for c in host.checks(state) if c.name == "no browser running"]
+        assert not check.ok and check.severity == host.ADVISORY
+        assert "SafariForWebKitDevelopment" in check.got
+        assert host.failures(host.checks(state)) == [
+            c for c in host.checks(state) if not c.ok and c.severity == host.BLOCKING
+        ]
+
+    def test_a_quiet_machine_passes_it(self):
+        state = host.read_state(fake_reader(custom=PMSET_CUSTOM_NO_POWERMODE))
+        (check,) = [c for c in host.checks(state) if c.name == "no browser running"]
+        assert check.ok and check.got == "none"

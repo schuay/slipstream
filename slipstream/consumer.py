@@ -275,7 +275,7 @@ class BusConsumer:
             "timestamp": entry.timestamp,
             "title": entry.title,
         }
-        provenance = self.collector.local_provenance(engine, runs)
+        provenance = self.collector.local_provenance(engine, runs, root)
         provenance.update(
             {
                 "source": "bus",
@@ -634,6 +634,7 @@ class BusConsumer:
             "run_configs": [
                 f"{c.suite}/{c.variant}" for c in self.collector.run_configs(engine)
             ],
+            "runner_cfg_hash": self.collector._runner(engine).cfg_hash(),
             "harness": self.collector.harness_revs(),
         }
         # `since` is when these values took effect, so a divergence report can

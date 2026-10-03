@@ -15,8 +15,9 @@ from pathlib import Path
 
 from rich.markup import escape
 
+from ..config import EngineConfig
 from ..models import Score
-from .base import Log, Progress, RunRequest, RunResult, geomean_overall
+from .base import Log, Progress, RunRequest, RunResult, cfg_digest, geomean_overall
 
 
 def parse_stdout(
@@ -57,6 +58,20 @@ class ShellRunner:
     def __init__(self, *, log: Log, progress: Progress):
         self._log = log
         self._progress = progress
+
+    def cfg_hash(self) -> str:
+        # The conventions below, in words: what wraps the binary, how the
+        # engine's libraries are found, how a suite is split per benchmark.
+        return cfg_digest(
+            "shell",
+            "caffeinate -im; timeout <bench.timeout>",
+            "env DYLD_LIBRARY_PATH=DYLD_FRAMEWORK_PATH=<dyld_search_path>",
+            "<binary> <flags> <bench.dir>/<bench.cli> [-- <name>]",
+            "scores: stdout by score_regex / suite_score_regex",
+        )
+
+    def host_env(self, engine: EngineConfig, run_root: Path) -> dict[str, str]:
+        return {}
 
     def run(self, req: RunRequest) -> RunResult:
         binary = req.engine.resolve_binary(req.run_root)

@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+from pathlib import Path
 
+from ..config import EngineConfig
+from ..hostapp import bundle_of, describe
 from .base import RunRequest
 from .browser import BrowserRunner, Command
 
@@ -39,9 +42,20 @@ CHROMIUM_FLAGS = (
 
 
 class ChromiumRunner(BrowserRunner):
+    runtime = "chromium"
+
     def __init__(self, **kw):
         super().__init__(**kw)
         self._profile: str | None = None
+
+    def conventions(self) -> tuple[str, ...]:
+        return ("--user-data-dir=<fresh per run>", *CHROMIUM_FLAGS)
+
+    def host_env(self, engine: EngineConfig, run_root: Path) -> dict[str, str]:
+        # The bundle is the artifact, so this names the build itself; it is
+        # here so a chrome row reads like a safari row.
+        app = bundle_of(engine.resolve_binary(run_root))
+        return {"host_app": describe(app)} if app else {}
 
     def command(self, req: RunRequest, url: str) -> Command:
         # A fresh profile per run: no cache, no state from the previous

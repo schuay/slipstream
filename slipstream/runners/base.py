@@ -67,6 +67,29 @@ class RunResult:
 class Runner(Protocol):
     def run(self, req: RunRequest) -> RunResult: ...
 
+    def cfg_hash(self) -> str:
+        """Identifies how this runner drives an engine: the flags every run
+        gets, the launch mechanism, the protocol the numbers come back by.
+        Recorded beside ``build_cfg_hash`` so a change to the harness side
+        shows in provenance the way a change to the build does. The
+        ``[[run]]`` flags are not in it: they are the variant."""
+        ...
+
+    def host_env(self, engine: EngineConfig, run_root: Path) -> dict[str, str]:
+        """Host facts a run depends on that are neither the build nor this
+        runner: the application a browser ran inside, the launcher that
+        started it. Empty for a shell binary."""
+        ...
+
+
+def cfg_digest(kind: str, *parts: str) -> str:
+    """``sha256:`` over ``kind`` and its conventions, in the form of
+    ``build_cfg_hash`` so the two columns read alike."""
+    import hashlib
+
+    payload = "\n--\n".join((kind, *parts))
+    return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
+
 
 def geomean_overall(scores: list[Score], run: int) -> list[Score]:
     """Synthesise ``Overall Total-Score`` as the geomean of every benchmark's.

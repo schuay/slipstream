@@ -32,6 +32,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from ..config import EngineConfig
+from ..hostapp import bundle_of, describe
 from .base import RunRequest
 from .browser import GRACE_SECONDS, BrowserRunner, Command, Verdict
 
@@ -63,9 +65,28 @@ def _is_macos() -> bool:
 
 
 class SafariRunner(BrowserRunner):
+    runtime = "safari"
+
     def __init__(self, **kw):
         super().__init__(**kw)
         self._content_pids: list[int] = []
+
+    def conventions(self) -> tuple[str, ...]:
+        return (
+            f"{ARCH} -arm64e -e <var>=<dyld_search_path> for " + ", ".join(DYLD_VARS),
+            "<launcher> -HomePage <url>",
+            *LAUNCH_ARGS,
+        )
+
+    def host_env(self, engine: EngineConfig, run_root: Path) -> dict[str, str]:
+        # host_app is the STP the entry packaged, read from the run root;
+        # launcher is the macOS Safari whose SafariForWebKitDevelopment ran it,
+        # which is host state and the one thing here the archive does not pin.
+        apps = [Path(run_root) / e for e in engine.run_set if e.endswith(".app")]
+        return {
+            "host_app": describe(apps[0]) if apps else "",
+            "launcher": describe(bundle_of(engine.resolve_binary(run_root))),
+        }
 
     # --- launch ---
 

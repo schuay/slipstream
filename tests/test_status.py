@@ -274,6 +274,12 @@ class TestCompareEnv:
     def test_keys_absent_from_the_source_are_not_reported(self):
         assert compare_env({"harness": {}}, {}) == []
 
+    def test_how_the_engine_is_driven_is_a_shared_input(self):
+        local = {"runner_cfg_hash": "sha256:a"}
+        assert compare_env(local, {"runner_cfg_hash": "sha256:a"}) == []
+        (line,) = compare_env(local, {"runner_cfg_hash": "sha256:b"})
+        assert line.startswith("runner_cfg_hash: here 'sha256:a', there 'sha256:b'")
+
 
 def test_render_produces_lines(env):
     env.publish(100)
