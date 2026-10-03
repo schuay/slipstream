@@ -52,10 +52,24 @@ _READ_COMMANDS = {
     "ps": ["ps", "-axo", "comm="],
 }
 
-# Executables whose presence means a browser is up. Matched on the basename's
-# prefix: "Safari" covers Safari, SafariForWebKitDevelopment and Safari
-# Technology Preview; a helper's name begins with its browser's.
-BROWSER_PREFIXES = ("Safari", "Chromium", "Google Chrome", "com.apple.WebKit")
+# Executables whose presence means a browser is up: the browsers themselves,
+# the same names the Safari runner refuses to launch beside, and their
+# content/helper processes. Exact names, not a "Safari" prefix: macOS runs
+# SafariBookmarksSyncAgent, SafariLaunchAgent and friends at all times.
+BROWSER_NAMES = frozenset(
+    {
+        "Safari",
+        "SafariForWebKitDevelopment",
+        "Safari Technology Preview",
+        "Chromium",
+        "Google Chrome",
+    }
+)
+BROWSER_HELPER_PREFIXES = (
+    "com.apple.WebKit.",
+    "Chromium Helper",
+    "Google Chrome Helper",
+)
 
 
 def is_macos() -> bool:
@@ -108,7 +122,7 @@ def parse_browsers(text: str) -> tuple[str, ...]:
     names = set()
     for line in text.splitlines():
         name = Path(line.strip()).name
-        if name.startswith(BROWSER_PREFIXES):
+        if name in BROWSER_NAMES or name.startswith(BROWSER_HELPER_PREFIXES):
             names.add(name)
     return tuple(sorted(names))
 

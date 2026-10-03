@@ -580,6 +580,11 @@ class TestRunningBrowsers:
 
     PS = """/sbin/launchd
 /usr/sbin/sshd
+/System/Library/CoreServices/SafariSupport.bundle/Contents/MacOS/SafariBookmarksSyncAgent
+/System/Library/PrivateFrameworks/SafariShared.framework/Versions/A/XPCServices/SafariLaunchAgent
+/System/Library/CoreServices/SafariSupport.bundle/Contents/MacOS/SafariNotificationAgent
+/System/Library/CoreServices/SafariSupport.bundle/Contents/MacOS/SafariSyncService
+/System/Library/CoreServices/SafariSupport.bundle/Contents/MacOS/SafariConfigurationSubscriber
 /Applications/Safari.app/Contents/MacOS/SafariForWebKitDevelopment
 /System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent
 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/1/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)
@@ -594,6 +599,15 @@ class TestRunningBrowsers:
             "com.apple.WebKit.WebContent",
         )
         assert host.parse_browsers("/sbin/launchd\n/usr/bin/safaridriver-ish\n") == ()
+
+    def test_safaris_always_on_agents_are_not_a_browser(self):
+        """macOS runs these for every user whether Safari is open or not."""
+        agents = "\n".join(
+            line
+            for line in self.PS.splitlines()
+            if "Agent" in line or "Sync" in line or "Subscriber" in line
+        )
+        assert host.parse_browsers(agents) == ()
 
     def test_is_an_advisory_check(self):
         read = fake_reader(custom=PMSET_CUSTOM_NO_POWERMODE)
