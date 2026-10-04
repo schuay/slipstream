@@ -64,7 +64,14 @@ class FakeDb:
 
 
 ALL_TABLES = [
-    (t,) for t in ("slipstream", "benchmarks", "meta", *spanner.STAGING_TABLES)
+    (t,)
+    for t in (
+        "slipstream",
+        "benchmarks",
+        "benchmarks_v2",
+        "meta",
+        *spanner.STAGING_TABLES,
+    )
 ]
 
 
@@ -237,7 +244,7 @@ class TestSchema:
         db = FakeDb([[("slipstream",), ("benchmarks",), ("meta",)]])
         spanner.ensure_schema(db)
         ddl = [c[1] for c in db.of("execute")]
-        assert len(ddl) == len(spanner.schema_statements()) == 11
+        assert len(ddl) == len(spanner.schema_statements()) == 14
         assert any("trace_id INT64 NOT NULL AS (FARM_FINGERPRINT" in s for s in ddl)
         assert all(not s.startswith("--") for s in ddl)
         assert all("--" not in s for s in ddl), "inline comments break statements"
@@ -249,8 +256,32 @@ class TestSchema:
             "imports",
             "slipstream",
             "benchmarks",
+            "benchmarks_v2",
             "meta",
         ]
+
+    def test_benchmarks_v2_keys_on_the_embedder_and_keeps_trace_id(self):
+        v1, v2 = [
+            s
+            for s in spanner.schema_statements()
+            if "TABLE IF NOT EXISTS benchmarks" in s
+        ]
+
+        def key(stmt):
+            return (
+                stmt.split("PRIMARY KEY")[1].strip(" ();").replace(" ", "").split(",")
+            )
+
+        assert key(v1) == spanner.AGG_COLUMNS[:6]
+        assert key(v2) == spanner.AGG_COLUMNS[:5] + ["embedder_number", "commit_number"]
+
+        # The stored expression is byte-identical: a series keeps its id.
+        def trace(stmt):
+            return stmt.split("trace_id")[1].split("STORED")[0].replace(" ", "")
+
+        assert trace(v1) == trace(v2)
+        assert "'\\\\x1f'" in v2
+        assert "embedder_hash   STRING(MAX)" in v2 and "embedder_hash" not in v1
 
     def test_samples_key_is_the_group_then_what_varies_in_it(self):
         (samples,) = [
@@ -267,8 +298,14 @@ class TestSchema:
             spanner.GROUP_INDEX,
             "benchmarks_filter_idx",
             "benchmarks_trace_idx",
+            "benchmarks_v2_filter_idx",
+            "benchmarks_v2_trace_idx",
         }
         assert "STORING (commit_time, git_hash, val)" in idx[spanner.GROUP_INDEX]
+        assert (
+            "(trace_id, embedder_number, commit_number)"
+            in idx["benchmarks_v2_trace_idx"]
+        )
 
 
 def _item(test, mean, *, bench="jetstream2.slipstream", commit=1, variant="v"):
@@ -316,11 +353,31 @@ class TestRefresh:
         assert spanner.refresh(db) is None
         (agg,) = [c for c in db.of("query") if "GROUP BY s.bot" in c[1]]
         assert "FORCE_INDEX" not in agg[1] and agg[2] is None
+        # Both aggregate tables, in one write; the previous design's rows
+        # are points at embedder 0 without an embedder hash.
+        assert db.of("write") == [("write", ["benchmarks", "benchmarks_v2"])]
         assert db.of("upsert") == [
-            ("upsert", "benchmarks", spanner.AGG_COLUMNS, [line])
+            ("upsert", "benchmarks", spanner.AGG_COLUMNS, [line]),
+            ("upsert", "benchmarks_v2", spanner.AGG_V2_COLUMNS, [(*line, 0, None)]),
         ]
         assert db.calls[-1][0] == "execute"
         assert db.calls[-1][2] == [spanner.WATERMARK_KEY, T0.isoformat()]
+
+    @pytest.mark.parametrize(
+        "into, tables",
+        [("benchmarks", ["benchmarks"]), ("benchmarks_v2", ["benchmarks_v2"])],
+    )
+    def test_aggregate_into_selects_the_tables(self, into, tables):
+        line = _item("t", 1.0, bench="jetstream3.slipstream")
+        db = FakeDb([[], [(T0,)], [line]])
+        assert spanner.refresh(db, into=into) is None
+        assert [u[1] for u in db.of("upsert")] == tables
+
+    def test_unknown_aggregate_target_is_rejected_before_any_io(self):
+        db = FakeDb()
+        with pytest.raises(ValueError, match="aggregate_into must be one of"):
+            spanner.refresh(db, into="all")
+        assert db.calls == []
 
     def test_incremental_reads_changed_groups_through_indexes(self):
         last = datetime(2026, 9, 1, tzinfo=timezone.utc)
@@ -402,6 +459,24 @@ class TestGeomeanTotals:
     def test_harness_total_wins(self):
         rows = [_item("a", 2.0), _item("b", 8.0), _item("Total", 5.0)]
         assert spanner._geomean_totals(rows) == []
+
+    def test_each_embedder_is_its_own_group(self):
+        # The same inner commit under two embedders (a roll boundary) gets a
+        # Total per embedder, carrying that embedder's columns; a harness
+        # Total under one of them does not cover the other.
+        rows = [
+            (*_item("a", 2.0), 0, None),
+            (*_item("b", 8.0), 0, None),
+            (*_item("a", 3.0), 7, "c0ffee"),
+            (*_item("b", 27.0), 7, "c0ffee"),
+            (*_item("Total", 1.0), 8, "f00d"),
+            (*_item("a", 5.0), 8, "f00d"),
+        ]
+        totals = {t[14:]: t for t in spanner._geomean_totals(rows)}
+        assert set(totals) == {(0, None), (7, "c0ffee")}
+        assert totals[(0, None)][9] == pytest.approx(4.0)
+        assert totals[(7, "c0ffee")][9] == pytest.approx(9.0)
+        assert all(len(t) == len(spanner.AGG_V2_COLUMNS) for t in totals.values())
 
     def test_only_js2_and_positive_means(self):
         rows = [
@@ -591,6 +666,7 @@ class TestRebuild:
             "samples",
             "dirty_groups",
             "benchmarks",
+            "benchmarks_v2",
             "meta",
             "imports",
         ]
@@ -601,10 +677,31 @@ class TestRebuild:
     def test_legacy_and_samples_modes(self):
         db = FakeDb()
         spanner.rebuild_bot(db, "bot", write="legacy")
-        assert self._tables(db) == ["slipstream", "benchmarks", "meta"]
+        assert self._tables(db) == ["slipstream", "benchmarks", "benchmarks_v2", "meta"]
         db = FakeDb()
         spanner.rebuild_bot(db, "bot", write="samples")
+        assert self._tables(db) == [
+            "samples",
+            "dirty_groups",
+            "benchmarks",
+            "benchmarks_v2",
+            "imports",
+        ]
+
+    def test_aggregate_targets(self):
+        db = FakeDb()
+        spanner.rebuild_bot(db, "bot", write="samples", into="benchmarks_v2")
+        assert self._tables(db) == [
+            "samples",
+            "dirty_groups",
+            "benchmarks_v2",
+            "imports",
+        ]
+        db = FakeDb()
+        spanner.rebuild_bot(db, "bot", write="samples", into="benchmarks")
         assert self._tables(db) == ["samples", "dirty_groups", "benchmarks", "imports"]
+        with pytest.raises(ValueError, match="aggregate_into must be one of"):
+            spanner.rebuild_bot(FakeDb(), "bot", into="v3")
 
 
 def _dirty(
@@ -642,13 +739,41 @@ class TestRefreshSamples:
         out = spanner.refresh(db, source="samples")
         assert "incomplete" in out and "a9" in out
 
-    def test_groups_outside_embedder_zero_stop_the_refresh(self):
+    def test_groups_outside_embedder_zero_stop_a_benchmarks_only_refresh(self):
         db = FakeDb([[_dirty(), _dirty(embedder=7, commit=2)]])
-        out = spanner.refresh(db, source="samples")
+        out = spanner.refresh(db, source="samples", into="benchmarks")
         assert (
             "outside embedder 0" in out and "('b', 'js3', 'v8', 'default', 7, 2)" in out
         )
         assert db.of("upsert") == [] and db.of("execute") == []
+
+    def test_an_embedded_group_lands_in_benchmarks_v2_only(self):
+        def agg(commit, test, mean, ehash):
+            return (commit, test, T0, "h", ehash, mean, mean, mean, 0.0, 1)
+
+        db = FakeDb(
+            [
+                [_dirty(commit=5), _dirty(embedder=7, commit=5)],
+                [agg(5, "x", 1.0, None)],  # embedder 0
+                [agg(5, "x", 2.0, "c0ffee")],  # embedder 7, same commit
+            ]
+        )
+        assert spanner.refresh(db, source="samples") is None
+        aggs = [q[2] for q in db.of("query") if "FROM samples s" in q[1]]
+        assert aggs == [
+            ["b", "js3", "v8", "default", 0, [5]],
+            ["b", "js3", "v8", "default", 7, [5]],
+        ]
+        v1, v2 = db.of("upsert")
+        assert v1[1:3] == ("benchmarks", spanner.AGG_COLUMNS)
+        assert [r[5] for r in v1[3]] == [5] and all(len(r) == 14 for r in v1[3])
+        assert v2[1:3] == ("benchmarks_v2", spanner.AGG_V2_COLUMNS)
+        # Two points for one commit, one per embedder, with the outer hash.
+        assert [(r[5], r[14], r[15], r[9]) for r in v2[3]] == [
+            (5, 0, None, 1.0),
+            (5, 7, "c0ffee", 2.0),
+        ]
+        assert db.calls[-1][1].startswith("DELETE FROM dirty_groups")
 
     def test_one_query_per_prefix_then_upsert_then_delete_up_to_the_cutoff(self):
         later = datetime(2026, 9, 5, 12, 0, 1, tzinfo=timezone.utc)
@@ -660,7 +785,7 @@ class TestRefreshSamples:
         ]
 
         def agg(commit, test, mean):
-            return (commit, test, T0, "h", mean, mean, mean, 0.0, 1)
+            return (commit, test, T0, "h", None, mean, mean, mean, 0.0, 1)
 
         db = FakeDb(
             [
@@ -678,8 +803,12 @@ class TestRefreshSamples:
             ["b", "js3", "v8", "default", 0, [1, 3]],
         ]
         assert all("IN UNNEST(%s)" in q[1] for q in aggs)
-        (up,) = db.of("upsert")
+        up, v2 = db.of("upsert")
         assert up[1:3] == ("benchmarks", spanner.AGG_COLUMNS)
+        assert v2[1:3] == ("benchmarks_v2", spanner.AGG_V2_COLUMNS)
+        # Same rows in both, benchmarks_v2's with the embedder columns.
+        assert [r[:14] for r in v2[3]] == up[3]
+        assert {r[14:] for r in v2[3]} == {(0, None)}
         rows = {r[:6]: r for r in up[3]}
         # Labels are the frontend ones, and the JS2 group got its geomean.
         assert set(rows) == {
@@ -703,7 +832,7 @@ class TestRefreshSamples:
             "DELETE FROM dirty_groups WHERE dirtied_at <= %s",
             [later],
         )
-        assert db.calls.index(up) < len(db.calls) - 1
+        assert db.calls.index(v2) < len(db.calls) - 1
 
     def test_sql_shape(self):
         db = FakeDb([[_dirty()], []])
@@ -715,20 +844,22 @@ class TestRefreshSamples:
         assert "s.test = 'Overall' AND s.metric = 'Total-Score'" in agg
         assert "COALESCE(STDDEV_SAMP(s.value), 0.0), COUNT(*)" in agg
         assert "LEFT JOIN commits c" in agg
-        assert "MIN(c.commit_time), MIN(c.git_hash)" in agg
+        assert "MIN(c.commit_time), MIN(c.git_hash), MIN(c.embedder_hash)" in agg
         assert (
             "GROUP BY s.commit_number, IF(s.test = 'Overall', 'Total', s.test)" in agg
         )
         assert "FROM benchmarks" not in agg and "FROM slipstream" not in agg
 
     def test_nan_becomes_null(self):
-        db = FakeDb([[_dirty()], [(1, "x", T0, "h", 1.0, 1.0, 1.0, float("nan"), 1)]])
+        db = FakeDb(
+            [[_dirty()], [(1, "x", T0, "h", None, 1.0, 1.0, 1.0, float("nan"), 1)]]
+        )
         spanner.refresh(db, source="samples")
         assert db.of("upsert")[0][3][0][12] is None
 
     def test_failed_upsert_leaves_the_dirty_rows(self):
-        db = FakeDb([[_dirty()], [(1, "x", T0, "h", 1.0, 1.0, 1.0, 0.0, 1)]])
-        db.upsert = lambda *a: (_ for _ in ()).throw(RuntimeError("boom"))
+        db = FakeDb([[_dirty()], [(1, "x", T0, "h", None, 1.0, 1.0, 1.0, 0.0, 1)]])
+        db.write = lambda *a: (_ for _ in ()).throw(RuntimeError("boom"))
         with pytest.raises(RuntimeError):
             spanner.refresh(db, source="samples")
         assert db.of("execute") == []

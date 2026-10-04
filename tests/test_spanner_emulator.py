@@ -76,6 +76,8 @@ def test_ensure_schema_creates_tables_from_bundled_ddl(instance):
 
 
 def test_push_aggregate_and_rebuild(db):
+    # The previous design's path: watermark in meta, its skip message.
+    legacy = {"aggregate_from": "legacy"}
     js3 = _csv(
         *[
             {"benchmark": "bench-a", "run": str(r), "score": s}
@@ -85,7 +87,7 @@ def test_push_aggregate_and_rebuild(db):
         {"benchmark": "Overall", "score": "7"},
         {"benchmark": "bench-a", "flags": "v8_turbolev_future", "score": "20"},
     )
-    out = spanner.push_csv(db, "bot1", js3)
+    out = spanner.push_csv(db, "bot1", js3, **legacy)
     assert out == "6 rows staged for bot1, aggregated"
 
     agg = _agg(db)
@@ -103,7 +105,7 @@ def test_push_aggregate_and_rebuild(db):
     )
 
     # Replaying the same CSV converges: same aggregates, no duplicates.
-    spanner.push_csv(db, "bot1", js3)
+    spanner.push_csv(db, "bot1", js3, **legacy)
     assert _agg(db)[("bench-a", "v8_default")][:5] == (
         12.0,
         10.0,
@@ -116,7 +118,7 @@ def test_push_aggregate_and_rebuild(db):
 
     # A later push touching one group re-aggregates only that group's full run set.
     more = _csv({"benchmark": "bench-a", "run": "4", "score": "16"})
-    assert spanner.push_csv(db, "bot1", more).endswith("aggregated")
+    assert spanner.push_csv(db, "bot1", more, **legacy).endswith("aggregated")
     assert _agg(db)[("bench-a", "v8_default")][:5] == (
         13.0,
         10.0,
@@ -130,7 +132,7 @@ def test_push_aggregate_and_rebuild(db):
         {"suite": "js2", "commit_id": "200", "benchmark": "Air", "score": "4"},
         {"suite": "js2", "commit_id": "200", "benchmark": "Basic", "score": "9"},
     )
-    spanner.push_csv(db, "bot1", js2)
+    spanner.push_csv(db, "bot1", js2, **legacy)
     rows = db.query(
         f"SELECT mean FROM {spanner.AGG_TABLE} WHERE benchmark = 'jetstream2.slipstream' AND test = 'Total'"
     )
@@ -138,12 +140,12 @@ def test_push_aggregate_and_rebuild(db):
 
     # Nothing new: aggregation reports the skip instead of claiming work.
     assert (
-        spanner.push_csv(db, "bot1", _csv())
+        spanner.push_csv(db, "bot1", _csv(), **legacy)
         == "0 rows staged for bot1, aggregation skipped (no rows newer than the last refresh)"
     )
 
     # Rebuild wipes this bot's staging rows before re-staging.
-    out = spanner.push_csv(db, "bot1", js3, rebuild=True)
+    out = spanner.push_csv(db, "bot1", js3, rebuild=True, **legacy)
     assert out.startswith("6 rows staged for bot1 (rebuild)")
     (n,) = db.query(f"SELECT COUNT(*) FROM {spanner.IMPORT_TABLE}")[0]
     assert n == 6
@@ -301,9 +303,9 @@ def test_failed_aggregate_write_retries_on_idle_without_reupload(
         def close(self):
             pass
 
-        def upsert(self, table, columns, rows):
-            db.upsert(table, columns, rows)
-            if table == spanner.AGG_TABLE and failed[0]:
+        def write(self, groups):
+            db.write(groups)
+            if any(t == spanner.AGG_TABLE for t, _, _ in groups) and failed[0]:
                 failed[0] = False
                 raise RuntimeError("aggregate failure before watermark")
 
@@ -315,7 +317,7 @@ def test_failed_aggregate_write_retries_on_idle_without_reupload(
     def make():
         return Coordinator(
             [source],
-            [PushTarget(spanner="p/i/d")],
+            [PushTarget(spanner="p/i/d", aggregate_from="legacy")],
             tmp_path / "delivery",
             session_factory=lambda t, **kw: SpannerSession(t),
         )
@@ -388,8 +390,12 @@ def test_both_paths_aggregate_identically(db):
     exactly the same set of groups from the other tables.
     """
     bot1, bot2 = _varied_csvs()
-    assert spanner.push_csv(db, "bot1", bot1).endswith("aggregated")
-    assert spanner.push_csv(db, "bot2", bot2).endswith("aggregated")
+    assert spanner.push_csv(db, "bot1", bot1, aggregate_from="legacy").endswith(
+        "aggregated"
+    )
+    assert spanner.push_csv(db, "bot2", bot2, aggregate_from="legacy").endswith(
+        "aggregated"
+    )
     legacy = _benchmarks(db)
     # bot1: js3 bench-a, bench-b, Total (+ turbolev bench-a), js2 200 Air,
     # Basic, geomean Total, js2 201 Air, Total; bot2: jsc bench-a, Total,
@@ -452,7 +458,9 @@ def test_both_paths_aggregate_identically(db):
         pytest.approx(2.581988897),
         4,
     )
-    assert spanner.push_csv(db, "bot1", more) == ("1 rows staged for bot1, aggregated")
+    assert spanner.push_csv(db, "bot1", more, aggregate_from="legacy") == (
+        "1 rows staged for bot1, aggregated"
+    )
     assert _benchmarks(db)[key][3:8] == (
         13.0,
         10.0,
@@ -621,3 +629,87 @@ def test_rebuild_wipes_the_bots_samples_but_not_commits(db):
     ]
     # Finished imports remain as the ledger.
     assert _count(db, spanner.IMPORTS_TABLE, "WHERE bot = 'bot1'") == 2
+
+
+# --- The aggregate transition (benchmarks / benchmarks_v2) ---
+
+
+def _benchmarks_v2(db):
+    rows = db.query(
+        f"SELECT {', '.join(spanner.AGG_V2_COLUMNS)}, trace_id FROM {spanner.AGG_TABLE_V2}"
+    )
+    out = {(*r[:5], r[14], r[5]): r for r in rows}
+    assert len(out) == len(rows)
+    return out
+
+
+def test_benchmarks_v2_mirrors_benchmarks_and_holds_embedded_points(db):
+    """The guarantee of the aggregate transition: for every embedder-0 group
+    both tables hold the same row, trace_id included; a group under another
+    embedder is a point in benchmarks_v2 beside the embedder-0 one and absent
+    from benchmarks, whose key cannot hold it."""
+    bot1, bot2 = _varied_csvs()
+    assert spanner.push_csv(db, "bot1", bot1).endswith("aggregated")
+    assert spanner.push_csv(db, "bot2", bot2).endswith("aggregated")
+    v1 = _benchmarks(db)
+    v2 = _benchmarks_v2(db)
+    assert len(v1) == len(v2) == 13
+    for key, row in v2.items():
+        bot, benchmark, test, submetric, variant, embedder, commit = key
+        assert embedder == 0 and row[15] is None
+        # Same values and the same stored trace_id.
+        assert v1[(bot, benchmark, test, submetric, variant, commit)] == (
+            *row[6:14],
+            row[16],
+        )
+
+    # What a two-coordinate push will stage: the same inner commit measured
+    # under embedder 7, with the outer hash on its commits row.
+    db.write(
+        [
+            (
+                spanner.SAMPLES_TABLE,
+                spanner.SAMPLE_COLUMNS,
+                [
+                    ("bot1", "js3", "v8", "default", 7, 100, "bench-a", "Total-Score",
+                     1, 50.0, None, spanner.COMMIT_TIMESTAMP),
+                    ("bot1", "js3", "v8", "default", 7, 100, "Overall", "Total-Score",
+                     1, 70.0, None, spanner.COMMIT_TIMESTAMP),
+                ],
+            ),
+            (
+                spanner.COMMITS_TABLE,
+                spanner.COMMIT_COLUMNS,
+                [("v8", 7, 100, "abc", None, "t", "c0ffee", "roll 7")],
+            ),
+            (
+                spanner.DIRTY_TABLE,
+                spanner.DIRTY_COLUMNS,
+                [("bot1", "js3", "v8", "default", 7, 100, spanner.COMMIT_TIMESTAMP)],
+            ),
+        ]
+    )  # fmt: skip
+    # benchmarks alone cannot take it and says so; nothing is drained.
+    out = spanner.refresh(db, source="samples", into="benchmarks")
+    assert "outside embedder 0" in out
+    assert _count(db, spanner.DIRTY_TABLE) == 1
+    # Both tables: the point lands in benchmarks_v2 only.
+    assert spanner.refresh(db, source="samples") is None
+    assert _count(db, spanner.DIRTY_TABLE) == 0
+    assert _benchmarks(db) == v1
+    after = _benchmarks_v2(db)
+    key7 = ("bot1", "jetstream3.slipstream", "bench-a", "", "v8_default", 7, 100)
+    key0 = ("bot1", "jetstream3.slipstream", "bench-a", "", "v8_default", 0, 100)
+    assert set(after) == set(v2) | {
+        key7,
+        ("bot1", "jetstream3.slipstream", "Total", "", "v8_default", 7, 100),
+    }
+    assert after[key7][9] == 50.0 and after[key7][15] == "c0ffee"
+    assert after[key0] == v2[key0]
+    # One series, two points at the commit: the trace_id is the same.
+    assert after[key7][16] == after[key0][16]
+
+    # A rebuild of the bot clears both tables.
+    spanner.rebuild_bot(db, "bot1")
+    assert not [k for k in _benchmarks(db) if k[0] == "bot1"]
+    assert not [k for k in _benchmarks_v2(db) if k[0] == "bot1"]

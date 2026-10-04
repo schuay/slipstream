@@ -26,9 +26,12 @@ def parse_spanner_spec(spec: str) -> tuple[str, str, str]:
 # (see spanner.py). A target says which to write and which refresh reads.
 WRITE_MODES = ("legacy", "both", "samples")
 AGGREGATE_SOURCES = ("legacy", "samples")
+# The aggregate side likewise: benchmarks keys on the commit alone,
+# benchmarks_v2 on (embedder, commit). Refresh writes one or both.
+AGGREGATE_TARGETS = ("benchmarks", "both", "benchmarks_v2")
 
 
-def check_modes(write: str, aggregate_from: str) -> None:
+def check_modes(write: str, aggregate_from: str, aggregate_into: str = "both") -> None:
     """Reject a write/aggregate pair that reads a design nothing writes.
 
     Aggregating from a table that is no longer written would stage every
@@ -40,6 +43,10 @@ def check_modes(write: str, aggregate_from: str) -> None:
     if aggregate_from not in AGGREGATE_SOURCES:
         raise ValueError(
             f"aggregate_from must be one of {AGGREGATE_SOURCES}, not {aggregate_from!r}"
+        )
+    if aggregate_into not in AGGREGATE_TARGETS:
+        raise ValueError(
+            f"aggregate_into must be one of {AGGREGATE_TARGETS}, not {aggregate_into!r}"
         )
     if write != "both" and write != aggregate_from:
         raise ValueError(
@@ -60,6 +67,8 @@ class PushTarget:
     names the staging design(s) a push writes and ``aggregate_from`` the one
     refresh reads; the defaults write both and read the current design, so
     the previous one keeps every row for a rollback (see spanner.py).
+    ``aggregate_into`` names the aggregate table(s) refresh writes; the
+    default writes both until the frontends read benchmarks_v2.
     """
 
     spool_dir: Path | None = None
@@ -68,6 +77,7 @@ class PushTarget:
     refresh: bool = True
     write: str = "both"
     aggregate_from: str = "samples"
+    aggregate_into: str = "both"
 
 
 @dataclass
@@ -927,14 +937,22 @@ def _parse_target(t: dict) -> PushTarget:
         )
     _reject_unknown(
         t,
-        ("spool_dir", "retain_days", "spanner", "refresh", "write", "aggregate_from"),
+        (
+            "spool_dir",
+            "retain_days",
+            "spanner",
+            "refresh",
+            "write",
+            "aggregate_from",
+            "aggregate_into",
+        ),
         "[[push.targets]]",
     )
     kinds = [k for k in ("spool_dir", "spanner") if k in t]
     if len(kinds) != 1:
         raise ValueError("[[push.targets]] needs exactly one of spool_dir, spanner")
     kind = kinds[0]
-    for key in ("refresh", "write", "aggregate_from"):
+    for key in ("refresh", "write", "aggregate_from", "aggregate_into"):
         if kind != "spanner" and key in t:
             raise ValueError(f"[[push.targets]] {key} applies to spanner targets only")
     if kind != "spool_dir" and "retain_days" in t:
@@ -953,8 +971,9 @@ def _parse_target(t: dict) -> PushTarget:
     parse_spanner_spec(t["spanner"])
     write = t.get("write", "both")
     aggregate_from = t.get("aggregate_from", "samples")
+    aggregate_into = t.get("aggregate_into", "both")
     try:
-        check_modes(write, aggregate_from)
+        check_modes(write, aggregate_from, aggregate_into)
     except ValueError as e:
         raise ValueError(f"[[push.targets]] {e}") from e
     return PushTarget(
@@ -962,6 +981,7 @@ def _parse_target(t: dict) -> PushTarget:
         refresh=t.get("refresh", True),
         write=write,
         aggregate_from=aggregate_from,
+        aggregate_into=aggregate_into,
     )
 
 

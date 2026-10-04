@@ -19,6 +19,12 @@ A push target says which to write (``write``: legacy, both, samples) and
 which to aggregate from (``aggregate_from``: legacy, samples). The frontend
 labels, and with them trace_id, come out identical from both paths; the
 functions that derive them are pinned by tests against the live values.
+
+The aggregate side is in a transition of its own (``aggregate_into``:
+benchmarks, both, benchmarks_v2): ``benchmarks_v2`` adds the embedder
+coordinate a browser point needs (chrome around V8, Safari around JSC) to
+the key, ``benchmarks`` is written beside it until the frontends read the
+new table by name.
 Both paths are idempotent: staging rows are upserted on their primary key
 and aggregates are recomputed over the full run set of a group, so a
 replayed push converges to the same state.
@@ -41,8 +47,9 @@ from importlib.resources import files as pkg_files
 from pathlib import Path
 from typing import NamedTuple
 
-from .config import (  # noqa: F401  (WRITE_MODES, AGGREGATE_SOURCES re-exported)
+from .config import (  # noqa: F401  (the mode tuples are re-exported)
     AGGREGATE_SOURCES,
+    AGGREGATE_TARGETS,
     WRITE_MODES,
     check_modes,
     parse_spanner_spec,
@@ -50,6 +57,7 @@ from .config import (  # noqa: F401  (WRITE_MODES, AGGREGATE_SOURCES re-exported
 
 IMPORT_TABLE = "slipstream"
 AGG_TABLE = "benchmarks"
+AGG_TABLE_V2 = "benchmarks_v2"
 META_TABLE = "meta"
 SAMPLES_TABLE = "samples"
 COMMITS_TABLE = "commits"
@@ -108,6 +116,12 @@ AGG_COLUMNS = [
     "stdev",
     "count",
 ]
+# An aggregate row is carried in AGG_V2_COLUMNS order: benchmarks' columns
+# followed by the embedder coordinate and its hash, so the previous table's
+# row is a prefix of the current one and the first 14 positions mean the
+# same thing in both.
+AGG_V2_COLUMNS = AGG_COLUMNS + ["embedder_number", "embedder_hash"]
+_EMBEDDER_POS = len(AGG_COLUMNS)
 SAMPLE_COLUMNS = [
     "bot",
     "suite",
@@ -145,7 +159,7 @@ DIRTY_COLUMNS = [
 # Secondary indexes per table, for the mutation budget of a write: each row
 # costs about one mutation per column for the table and the same again per
 # index. benchmarks also has a stored generated column, counted as an index.
-_INDEXES = {IMPORT_TABLE: 2, AGG_TABLE: 2}
+_INDEXES = {IMPORT_TABLE: 2, AGG_TABLE: 2, AGG_TABLE_V2: 2}
 # Each commit is limited to 80k mutations; aim for half.
 _MUTATION_BUDGET = 40_000
 
@@ -363,7 +377,7 @@ def ensure_schema(db) -> None:
             "SELECT table_name FROM INFORMATION_SCHEMA.TABLES WHERE table_schema = ''"
         )
     }
-    if {IMPORT_TABLE, AGG_TABLE, META_TABLE, *STAGING_TABLES} <= have:
+    if {IMPORT_TABLE, AGG_TABLE, AGG_TABLE_V2, META_TABLE, *STAGING_TABLES} <= have:
         return
     for stmt in schema_statements():
         db.execute(stmt)
@@ -395,7 +409,7 @@ def index_drift(db) -> tuple[list[str], list[str], list[str]]:
             "SELECT index_name, index_state FROM INFORMATION_SCHEMA.INDEXES"
             " WHERE table_schema = '' AND index_type = 'INDEX'"
             " AND table_name IN UNNEST(%s)",
-            [[IMPORT_TABLE, AGG_TABLE, META_TABLE, *STAGING_TABLES]],
+            [[IMPORT_TABLE, AGG_TABLE, AGG_TABLE_V2, META_TABLE, *STAGING_TABLES]],
         )
     }
     missing = [n for n in declared if n not in live]
@@ -667,13 +681,19 @@ def wipe_bot(db, bot: str, *, write: str = "both") -> int:
     return count
 
 
-def rebuild_bot(db, bot: str, *, write: str = "both") -> int:
-    """Explicit destructive repair, including obsolete aggregate score keys."""
+def rebuild_bot(db, bot: str, *, write: str = "both", into: str = "both") -> int:
+    """Explicit destructive repair, including obsolete aggregate score keys.
+
+    ``into`` names the aggregate table(s) the target writes, which are the
+    ones that exist to be wiped.
+    """
+    _check_into(into)
     count = wipe_bot(db, bot, write=write)
-    db.partitioned_dml(
-        f"DELETE FROM {AGG_TABLE} WHERE bot = @bot AND source = 'slipstream'",
-        {"bot": bot},
-    )
+    for table in _agg_tables(into):
+        db.partitioned_dml(
+            f"DELETE FROM {table} WHERE bot = @bot AND source = 'slipstream'",
+            {"bot": bot},
+        )
     # After the explicit full wipe, old imports for this bot contain no partial
     # raw rows. Preserve other bots' markers and the global refresh watermark.
     if write != "samples":
@@ -768,14 +788,19 @@ _GEOMEAN_BENCHMARK = "jetstream2.slipstream"
 
 
 def _geomean_totals(rows: list[tuple]) -> list[tuple]:
-    """Total rows for JS2 groups that have line items but no Total."""
+    """Total rows for JS2 groups that have line items but no Total.
+
+    Rows are in AGG_COLUMNS or AGG_V2_COLUMNS order; a group is one point,
+    so the embedder is part of its identity, and the Total carries the
+    group's embedder columns when the rows have them.
+    """
     groups: dict[tuple, list[tuple]] = defaultdict(list)
     have_total = set()
     for r in rows:
         bot, benchmark, test, _, variant, commit = r[:6]
         if benchmark != _GEOMEAN_BENCHMARK:
             continue
-        key = (bot, benchmark, variant, commit)
+        key = (bot, benchmark, variant, commit, *r[_EMBEDDER_POS:])
         if test == "Total":
             have_total.add(key)
         elif r[9] is not None and r[9] > 0:
@@ -784,7 +809,7 @@ def _geomean_totals(rows: list[tuple]) -> list[tuple]:
     for key, items in groups.items():
         if key in have_total:
             continue
-        bot, benchmark, variant, commit = key
+        bot, benchmark, variant, commit, *embedder = key
 
         def geo(col, floor=None):
             # fsum is exactly rounded, so the result does not depend on the
@@ -813,12 +838,40 @@ def _geomean_totals(rows: list[tuple]) -> list[tuple]:
                 geo(11, 1e-9),
                 0.0,
                 min(r[13] for r in items),
+                *embedder,
             )
         )
     return out
 
 
-def refresh(db, *, source: str = "legacy") -> str | None:
+def _check_into(into: str) -> None:
+    if into not in AGGREGATE_TARGETS:
+        raise ValueError(
+            f"aggregate_into must be one of {AGGREGATE_TARGETS}, not {into!r}"
+        )
+
+
+def _agg_tables(into: str) -> list[str]:
+    return [t for t in (AGG_TABLE, AGG_TABLE_V2) if into in ("both", t)]
+
+
+def _upsert_aggregates(db, rows: list[tuple], into: str) -> None:
+    """Write AGG_V2_COLUMNS rows to the aggregate table(s) ``into`` names.
+
+    benchmarks has no embedder coordinate: it gets the embedder-0 rows,
+    projected to its columns; a browser point exists in benchmarks_v2 only.
+    Both go through one write so the chunks are committed together.
+    """
+    groups = []
+    if AGG_TABLE in _agg_tables(into):
+        legacy = [r[:_EMBEDDER_POS] for r in rows if r[_EMBEDDER_POS] == 0]
+        groups.append((AGG_TABLE, AGG_COLUMNS, legacy))
+    if AGG_TABLE_V2 in _agg_tables(into):
+        groups.append((AGG_TABLE_V2, AGG_V2_COLUMNS, rows))
+    db.write(groups)
+
+
+def refresh(db, *, source: str = "legacy", into: str = "both") -> str | None:
     """Aggregate staging into benchmarks. Returns None when it ran, else why not.
 
     ``source`` names the staging design to read: the previous one with its
@@ -827,17 +880,19 @@ def refresh(db, *, source: str = "legacy") -> str | None:
     over its full run set, so a group aggregated by either path lands the
     same, and both leave their change-tracking state alone until the
     aggregates are written, so a failed run is retried next time.
+    ``into`` names the aggregate table(s) written (:func:`_upsert_aggregates`).
     """
     if source not in AGGREGATE_SOURCES:
         raise ValueError(
             f"aggregate_from must be one of {AGGREGATE_SOURCES}, not {source!r}"
         )
+    _check_into(into)
     if source == "samples":
-        return _refresh_samples(db)
-    return _refresh_legacy(db)
+        return _refresh_samples(db, into)
+    return _refresh_legacy(db, into)
 
 
-def _refresh_legacy(db) -> str | None:
+def _refresh_legacy(db, into: str = "both") -> str | None:
     """The watermark path over the previous staging table.
 
     Every (bot, benchmark, commit) group with a row newer than the watermark
@@ -900,10 +955,11 @@ def _refresh_legacy(db) -> str | None:
         for (bot, benchmark), nums in sorted(commits.items()):
             rows += db.query(sql, [bot, benchmark, sorted(nums)])
 
-    rows = [_clean(r) for r in rows]
+    # The previous design has no embedder: every row is a point at 0.
+    rows = [(*_clean(r), 0, None) for r in rows]
     rows += _geomean_totals(rows)
     if rows:
-        db.upsert(AGG_TABLE, AGG_COLUMNS, rows)
+        _upsert_aggregates(db, rows, into)
     db.execute(
         f"INSERT OR UPDATE INTO {META_TABLE} (key, value) VALUES (%s, %s)",
         [WATERMARK_KEY, _watermark_text(raw_cutoff)],
@@ -921,7 +977,7 @@ def _refresh_legacy(db) -> str | None:
 _SAMPLES_AGG_SELECT = f"""
     SELECT
         s.commit_number, IF(s.test = 'Overall', 'Total', s.test) AS test,
-        MIN(c.commit_time), MIN(c.git_hash),
+        MIN(c.commit_time), MIN(c.git_hash), MIN(c.embedder_hash),
         AVG(s.value), MIN(s.value), MAX(s.value),
         COALESCE(STDDEV_SAMP(s.value), 0.0), COUNT(*)
     FROM {SAMPLES_TABLE} s
@@ -946,7 +1002,7 @@ def aggregate_samples(
     embedder: int,
     commits: list[int] | None = None,
 ) -> list[tuple]:
-    """benchmarks rows (AGG_COLUMNS order) for one group prefix from samples.
+    """Aggregate rows (AGG_V2_COLUMNS order) for one group prefix from samples.
 
     ``commits`` restricts to those commit numbers; None means every commit
     of the prefix, which is what a full re-aggregation or a validator wants.
@@ -961,7 +1017,7 @@ def aggregate_samples(
     benchmark = frontend_benchmark(suite)
     label = frontend_variant(engine, variant)
     rows = []
-    for commit, test, commit_time, git_hash, *stats in db.query(
+    for commit, test, commit_time, git_hash, embedder_hash, *stats in db.query(
         _SAMPLES_AGG_SELECT.format(where=where), params
     ):
         rows.append(
@@ -977,13 +1033,15 @@ def aggregate_samples(
                     git_hash,
                     "slipstream",
                     *stats,
+                    embedder,
+                    embedder_hash,
                 )
             )
         )
     return rows
 
 
-def _refresh_samples(db) -> str | None:
+def _refresh_samples(db, into: str = "both") -> str | None:
     """The dirty-group path over the current staging tables.
 
     Every group in ``dirty_groups`` is recomputed over its full run set and
@@ -993,10 +1051,11 @@ def _refresh_samples(db) -> str | None:
     committed after the snapshot carries a later timestamp and survives for
     the next refresh. A failed refresh leaves everything dirty.
 
-    benchmarks has no column for an embedder, so a dirty group outside
-    embedder 0 cannot be represented there; push never writes one, and
-    rather than aggregate something half-described or skip it silently,
-    refresh stops until an operator looks.
+    benchmarks has no column for an embedder, so when it is the only table
+    written a dirty group outside embedder 0 cannot be represented; rather
+    than aggregate something half-described or skip it silently, refresh
+    stops until an operator looks. With benchmarks_v2 written such a group
+    is an ordinary point there and absent from benchmarks.
     """
     incomplete = db.query(
         f"SELECT attempt FROM {IMPORTS_TABLE} WHERE finished_at IS NULL LIMIT 1"
@@ -1010,10 +1069,10 @@ def _refresh_samples(db) -> str | None:
     if not dirty:
         return "no dirty groups since the last refresh"
     outside = [r for r in dirty if r[4] != 0]
-    if outside:
+    if outside and into == AGG_TABLE:
         return (
             f"{len(outside)} dirty groups are outside embedder 0"
-            f" (first: {outside[0][:6]}); benchmarks has no column for that"
+            f" (first: {outside[0][:6]}); {AGG_TABLE} has no column for that"
         )
     cutoff = max(r[6] for r in dirty)
     prefixes: dict[tuple, list[int]] = defaultdict(list)
@@ -1024,7 +1083,7 @@ def _refresh_samples(db) -> str | None:
         rows += aggregate_samples(db, *prefix, commits=nums)
     rows += _geomean_totals(rows)
     if rows:
-        db.upsert(AGG_TABLE, AGG_COLUMNS, rows)
+        _upsert_aggregates(db, rows, into)
     db.execute(f"DELETE FROM {DIRTY_TABLE} WHERE dirtied_at <= %s", [cutoff])
     return None
 
@@ -1121,9 +1180,10 @@ def push_csv(
     refresh_agg: bool = True,
     write: str = "both",
     aggregate_from: str = "samples",
+    aggregate_into: str = "both",
 ) -> str:
     """Stage the CSV rows for ``bot`` and aggregate. Returns a summary line."""
-    check_modes(write, aggregate_from)
+    check_modes(write, aggregate_from, aggregate_into)
     ensure_schema(db)
     # Mapping first: a CSV that fails to parse must not cost the bot its
     # staged rows on a rebuild.
@@ -1143,6 +1203,8 @@ def push_csv(
         bot,
         len(records),
         rebuild=rebuild,
-        skipped=refresh(db, source=aggregate_from) if refresh_agg else None,
+        skipped=refresh(db, source=aggregate_from, into=aggregate_into)
+        if refresh_agg
+        else None,
         refreshed=refresh_agg,
     )

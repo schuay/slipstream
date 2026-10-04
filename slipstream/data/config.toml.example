@@ -123,9 +123,12 @@ suite = "js3"
 # # Staging is in transition between two table designs (see spanner.py).
 # # write names what a push writes: "both" (default), "legacy" or "samples";
 # # aggregate_from names what refresh reads: "samples" (default) or "legacy".
-# # Reading a design that is not written is rejected.
+# # Reading a design that is not written is rejected. aggregate_into names
+# # the aggregate table(s) refresh writes: "both" (default), "benchmarks" or
+# # "benchmarks_v2"; only benchmarks_v2 can hold a browser (embedder) point.
 # # write = "both"
 # # aggregate_from = "samples"
+# # aggregate_into = "both"
 #
 # A machine without Spanner access appends each push to a spool log:
 #

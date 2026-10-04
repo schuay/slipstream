@@ -95,12 +95,18 @@ class SpannerSession:
 
         if not self.target.refresh:
             return "refresh=false; staging only"
-        return spanner.refresh(self.db, source=self.target.aggregate_from)
+        return spanner.refresh(
+            self.db,
+            source=self.target.aggregate_from,
+            into=self.target.aggregate_into,
+        )
 
     def wipe(self, bot):
         from . import spanner
 
-        return spanner.rebuild_bot(self.db, bot, write=self.target.write)
+        return spanner.rebuild_bot(
+            self.db, bot, write=self.target.write, into=self.target.aggregate_into
+        )
 
     def reconcile_legacy(self, bot):
         from . import spanner

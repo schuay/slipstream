@@ -4,8 +4,8 @@
 -- Spanner schema (GoogleSQL). This is the authoritative DDL for the tables
 -- slipstream pushes into; index changes are applied to the live database by
 -- hand to match it. The database feeds other perf frontends through
--- benchmarks, so that table, including its stored trace_id, must not change
--- shape; the staging side is slipstream's own.
+-- benchmarks and benchmarks_v2, so those tables, including their stored
+-- trace_id, must not change shape; the staging side is slipstream's own.
 --
 -- Staging is in transition. samples, commits, dirty_groups and imports are
 -- the current design: the key of samples is the aggregation group followed
@@ -13,7 +13,8 @@
 -- push leaves the groups it touched in dirty_groups for refresh to drain.
 -- slipstream and meta are the previous design, still written alongside
 -- while the new tables prove themselves; see the push target's "write" and
--- "aggregate_from" settings.
+-- "aggregate_from" settings. The aggregate side is in the same kind of
+-- transition from benchmarks to benchmarks_v2 ("aggregate_into").
 
 -- One commit of one engine, possibly measured inside an embedder (chrome
 -- around V8, Safari around JSC). Written by push in the same commit as its
@@ -139,6 +140,43 @@ CREATE INDEX IF NOT EXISTS benchmarks_filter_idx
 
 CREATE INDEX IF NOT EXISTS benchmarks_trace_idx
     ON benchmarks (trace_id, commit_number);
+
+-- The aggregate table with an embedder coordinate: a browser build is a
+-- (chromium position | STP build, V8 | WebKit commit) pair, and the same
+-- inner commit is measured under two embedders at every roll boundary on
+-- purpose, which benchmarks' key cannot hold. embedder_number is 0 for an
+-- engine that is its own embedder. The trace_id expression is byte for
+-- byte the one above, so every existing series keeps its id; a series has
+-- no embedder coordinate, its points do. Written beside benchmarks until
+-- the frontends read this table by name, then benchmarks is dropped; see
+-- the push target's "aggregate_into" setting.
+CREATE TABLE IF NOT EXISTS benchmarks_v2 (
+    bot             STRING(MAX) NOT NULL,
+    benchmark       STRING(MAX) NOT NULL,
+    test            STRING(MAX) NOT NULL,
+    submetric       STRING(MAX) NOT NULL DEFAULT (''),
+    variant         STRING(MAX) NOT NULL,
+    embedder_number INT64       NOT NULL,
+    commit_number   INT64       NOT NULL,
+    commit_time     TIMESTAMP,
+    git_hash        STRING(MAX),
+    embedder_hash   STRING(MAX),
+    source          STRING(MAX) NOT NULL DEFAULT ('slipstream'),
+    mean            FLOAT64,
+    min             FLOAT64,
+    max             FLOAT64,
+    stdev           FLOAT64,
+    count           INT64,
+    trace_id        INT64 NOT NULL AS (FARM_FINGERPRINT(CONCAT(
+                        bot, '\\x1f', benchmark, '\\x1f', test, '\\x1f',
+                        submetric, '\\x1f', variant))) STORED,
+) PRIMARY KEY (bot, benchmark, test, submetric, variant, embedder_number, commit_number);
+
+CREATE INDEX IF NOT EXISTS benchmarks_v2_filter_idx
+    ON benchmarks_v2 (bot, benchmark, commit_time);
+
+CREATE INDEX IF NOT EXISTS benchmarks_v2_trace_idx
+    ON benchmarks_v2 (trace_id, embedder_number, commit_number);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   STRING(MAX) NOT NULL,
