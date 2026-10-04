@@ -523,12 +523,27 @@ def records_from_csv(csv_text: str) -> list[tuple]:
     return [tuple(r.get(c, "") for c in COLUMNS) for r in reader]
 
 
+def _embedder_of(r: dict) -> tuple[int, str | None]:
+    """The record's outer coordinate: ``(0, None)`` for an engine that is
+    its own embedder."""
+    number = int(str(r.get("embedder_id", "") or 0))
+    return number, (r.get("embedder_hash", "").strip() or None)
+
+
 def rows_from_records(records, bot: str, imported_at: datetime) -> list[tuple]:
+    """Rows for the previous-design staging table.
+
+    That table keys on the scalar commit number and has no place for an
+    embedder, so an embedded series is not projected onto it: it only ever
+    held d8 and jsc numbers, and a rollback to it loses nothing it had.
+    """
     from .delivery_batch import COLUMNS
 
     rows = []
     for record in records:
         r = dict(zip(COLUMNS, record))
+        if _embedder_of(r)[0] != 0:
+            continue
         suite = r["suite"].strip()
         rows.append(
             (
@@ -560,11 +575,11 @@ class Staging(NamedTuple):
 def staging_rows(records, bot: str) -> Staging:
     """Map export CSV records to samples, their commits and dirty groups.
 
-    The export carries no embedder: everything delivery reads is embedder 0
-    (see CommitStore.export_scores), and the perf database has no coordinate
-    for anything else yet. Timestamps that are commit timestamps carry the
-    sentinel; the commit's title comes along, the embedder columns stay
-    NULL until the export has them.
+    Every key is the pair ``(embedder_number, commit_number)``: the inner
+    engine commit plus the chromium position / STP sequence it was measured
+    under, 0 for d8 and jsc. The commit row keeps the inner hash, time and
+    title and the embedder's hash; its title is not in the export (NULL).
+    Timestamps that are commit timestamps carry the sentinel.
     """
     from .delivery_batch import COLUMNS
 
@@ -577,7 +592,8 @@ def staging_rows(records, bot: str) -> Staging:
         variant = variant_of(engine, r["flags"].strip())
         suite = r["suite"].strip()
         commit = int(str(r["commit_id"]))
-        group = (bot, suite, engine, variant, 0, commit)
+        embedder, embedder_hash = _embedder_of(r)
+        group = (bot, suite, engine, variant, embedder, commit)
         samples.append(
             (
                 *group,
@@ -590,15 +606,15 @@ def staging_rows(records, bot: str) -> Staging:
             )
         )
         commits.setdefault(
-            (engine, 0, commit),
+            (engine, embedder, commit),
             (
                 engine,
-                0,
+                embedder,
                 commit,
                 r.get("git_hash", "").strip() or None,
                 _commit_time(r.get("commit_timestamp", "")),
                 r.get("commit_title", "").strip() or None,
-                None,
+                embedder_hash,
                 None,
             ),
         )

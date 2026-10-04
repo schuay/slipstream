@@ -9,11 +9,15 @@ import json
 from pathlib import Path
 
 from .delivery_batch import Batch
+from .models import CommitKey
 from .durability import atomic_write, durable_unlink, identity_digest
 from .relay import RemoteSpool, cursor_path, read_cursor, write_cursor
 
 
 class LocalDbSource:
+    """A unit is one commit key of one engine on this platform; see
+    ``CommitKey``. The attempt record keeps the key in its JSON form."""
+
     def __init__(self, store, engine, platform, bot, valid):
         self.store, self.engine, self.platform = store, engine, platform
         if store.bot and store.bot != bot:
@@ -21,26 +25,35 @@ class LocalDbSource:
         self.bot, self.valid = bot, valid
         self.identity = f"local:{store.db_path}:{engine}:{platform}:{bot}"
 
+    @staticmethod
+    def _with_key(record):
+        if record is None:
+            return None
+        record = dict(record)
+        try:
+            record["unit"] = CommitKey.of(record["unit"])
+        except (KeyError, TypeError, ValueError):
+            pass  # validate_record reports it
+        return record
+
     def pending(self):
         record = self.store.pending_attempt(self.identity)
         if record:
-            return record
+            return self._with_key(record)
         for row in self.store.conn.execute("SELECT record FROM delivery_attempts"):
             other = json.loads(row[0])
             if other["engine"] == self.engine and other["platform"] == self.platform:
-                return other  # validation blocks changed source/bot identities
+                return self._with_key(other)  # validation blocks changed identities
         return None
 
+    def unit_ok(self, unit) -> bool:
+        return isinstance(unit, CommitKey) and unit.embedder_id >= 0 and unit.commit_id >= 0
+
     def acknowledged(self, unit):
-        row = self.store.conn.execute(
-            "SELECT 1 FROM push_state WHERE engine=? AND platform=? "
-            "AND embedder_id=0 AND commit_id=?",
-            (self.engine, self.platform, unit),
-        ).fetchone()
-        return row is not None
+        return self.store.is_pushed(self.engine, self.platform, unit)
 
     def discover(self, limit):
-        return self.store.unpushed_commit_ids(self.engine, self.platform, limit)
+        return self.store.unpushed_keys(self.engine, self.platform, limit)
 
     def prepare(self, unit, settings):
         self.store.conn.execute(
@@ -48,39 +61,41 @@ class LocalDbSource:
         )
         from .push import _export_rows
 
-        if not self.store.is_done(
-            self.engine, self.platform, unit
-        ) or self.acknowledged(unit):
+        key = CommitKey.of(unit)
+        if not self.store.is_done(self.engine, self.platform, key) or self.acknowledged(key):
             return None
-        if self.store.commit_ids_missing_commit_row(
-            self.engine, self.platform, unit, unit
-        ):
-            raise ValueError(f"{self.identity}/{unit}: scores have no commit row")
+        if self.store.key_missing_commit_row(self.engine, self.platform, key):
+            raise ValueError(f"{self.identity}/{key}: scores have no commit row")
         # Hard bound even before materializing score rows. SQLite length counts
         # characters; budget four bytes per character plus CSV escaping overhead.
         size = self.store.conn.execute(
             "SELECT COUNT(*), COALESCE(SUM(length(suite)+length(flags)+length(benchmark)"
             "+length(metric)+length(engine)+length(platform)+160), 0) FROM scores "
-            "WHERE engine=? AND platform=? AND embedder_id=0 AND commit_id=?",
-            (self.engine, self.platform, unit),
+            "WHERE engine=? AND platform=? AND embedder_id=? AND commit_id=?",
+            (self.engine, self.platform, *key),
         ).fetchone()
         meta = self.store.conn.execute(
-            "SELECT length(hash)+length(date)+length(title)+32 FROM commits "
-            "WHERE engine=? AND embedder_id=0 AND commit_id=?",
-            (self.engine, unit),
+            "SELECT length(hash)+length(date)+length(title)+length(embedder_hash)+32"
+            " FROM commits WHERE engine=? AND embedder_id=? AND commit_id=?",
+            (self.engine, *key),
         ).fetchone()
         if (
             size[1] + size[0] * (meta[0] if meta else 0)
         ) * 8 > settings.max_payload_bytes:
             raise ValueError(
-                f"{self.identity}/{unit}: estimated payload exceeds max_payload_bytes"
+                f"{self.identity}/{key}: estimated payload exceeds max_payload_bytes"
             )
-        rows = _export_rows(self.store, self.engine, self.platform, self.valid, [unit])
+        rows = _export_rows(self.store, self.engine, self.platform, self.valid, [key])
         self.store.conn.commit()  # no SQLite transaction crosses target I/O
-        return Batch.local(self.identity, self.bot, unit, rows)
+        return Batch.local(self.identity, self.bot, key, rows)
 
     def save(self, record):
-        record = dict(record, engine=self.engine, platform=self.platform)
+        record = dict(
+            record,
+            unit=CommitKey.of(record["unit"]).to_json(),
+            engine=self.engine,
+            platform=self.platform,
+        )
         self.store.save_attempt(self.identity, record)
 
     def retire(self):
@@ -113,6 +128,9 @@ class SshSpoolSource:
         if not isinstance(record, dict):
             raise ValueError(f"corrupt attempt metadata {self.attempt_path}")
         return record
+
+    def unit_ok(self, unit) -> bool:
+        return type(unit) is int and unit >= 0
 
     def acknowledged(self, unit):
         return read_cursor(self.path) >= unit
@@ -163,8 +181,7 @@ def validate_record(record, source, targets):
         or record.get("source") != source.identity
         or record.get("targets") != targets
         or record.get("bot") != source.bot
-        or type(record.get("unit")) is not int
-        or record["unit"] < 0
+        or not source.unit_ok(record.get("unit"))
         or not isinstance(record.get("targets"), list)
         or not record["targets"]
         or any(not isinstance(t, str) for t in record["targets"])

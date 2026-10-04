@@ -179,35 +179,35 @@ class TestPushState:
 
     def test_unpushed_initially_all_done(self, store):
         self._seed_done(store, [100, 200, 300])
-        assert store.unpushed_commit_ids("v8", "arm64") == [100, 200, 300]
+        assert store.unpushed_keys("v8", "arm64") == [CommitKey(0, 100), CommitKey(0, 200), CommitKey(0, 300)]
 
     def test_mark_pushed_filters_next_call(self, store):
         self._seed_done(store, [100, 200, 300])
         store.mark_pushed("v8", "arm64", [100, 200])
-        assert store.unpushed_commit_ids("v8", "arm64") == [300]
+        assert store.unpushed_keys("v8", "arm64") == [CommitKey(0, 300)]
 
     def test_mark_pushed_idempotent(self, store):
         self._seed_done(store, [100])
         store.mark_pushed("v8", "arm64", [100])
         store.mark_pushed("v8", "arm64", [100])  # no error
-        assert store.unpushed_commit_ids("v8", "arm64") == []
+        assert store.unpushed_keys("v8", "arm64") == []
 
     def test_clear_range_reinvalidates_push(self, store):
         self._seed_done(store, [100, 200])
         store.mark_pushed("v8", "arm64", [100, 200])
-        assert store.unpushed_commit_ids("v8", "arm64") == []
+        assert store.unpushed_keys("v8", "arm64") == []
 
         # Re-bench 100: its scores, processing_state, AND push_state all clear.
         store.clear_range("v8", "arm64", [100])
         # 100 is no longer "done" → not in unpushed. Re-run mark_done:
         store.mark_done("v8", "arm64", 100)
-        assert store.unpushed_commit_ids("v8", "arm64") == [100]
+        assert store.unpushed_keys("v8", "arm64") == [CommitKey(0, 100)]
 
     def test_platform_isolation(self, store):
         self._seed_done(store, [100])
         store.mark_pushed("v8", "arm64", [100])
         # x86_64 has no "done" commit here, so empty is expected.
-        assert store.unpushed_commit_ids("v8", "x86_64") == []
+        assert store.unpushed_keys("v8", "x86_64") == []
 
     def test_engine_isolation(self, store):
         self._seed_done(store, [100])
@@ -216,8 +216,8 @@ class TestPushState:
         store.mark_done("jsc", "arm64", 100)
 
         store.mark_pushed("v8", "arm64", [100])
-        assert store.unpushed_commit_ids("v8", "arm64") == []
-        assert store.unpushed_commit_ids("jsc", "arm64") == [100]
+        assert store.unpushed_keys("v8", "arm64") == []
+        assert store.unpushed_keys("jsc", "arm64") == [CommitKey(0, 100)]
 
 
 class TestStatus:
@@ -335,7 +335,7 @@ class TestClearScores:
         ).fetchone()[0]
         assert n == 0
         assert store.is_done("v8", "arm64", 100)
-        assert store.unpushed_commit_ids("v8", "arm64") == []
+        assert store.unpushed_keys("v8", "arm64") == []
 
 
 class TestBotIdentity:
@@ -651,7 +651,7 @@ class TestEmbedderKeyMigration:
         assert s.is_done("v8", "arm64", 100) and s.is_done("v8", "arm64", 101)
         assert s.get_status("v8", "arm64", 101) == "failed"
         assert s.max_done_key("v8", "arm64") == CommitKey(0, 101)
-        assert s.unpushed_commit_ids("v8", "arm64") == [101]
+        assert s.unpushed_keys("v8", "arm64") == [CommitKey(0, 101)]
         series = s.get_series("v8", "js3", "default", "b", "Total-Score")
         assert [(r["embedder_id"], r["commit_id"], r["score"]) for r in series] == [
             (0, 100, 1.0),

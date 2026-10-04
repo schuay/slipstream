@@ -634,6 +634,8 @@ class CommitStore:
         platform: str,
         lo: int | None = None,
         hi: int | None = None,
+        *,
+        embedder_id: int = 0,
     ) -> list[int]:
         """Commit ids with scores but no row in ``commits``.
 
@@ -646,21 +648,33 @@ class CommitStore:
         unbounded it is a DISTINCT LEFT JOIN over the engine's whole history.
         A range rather than an id list, so the caller's set can be any size.
 
-        Delivery speaks scalar commit numbers, so this sees embedder 0 only;
-        how an embedded series is projected into the perf database is not
-        decided yet, and until it is those rows are not candidates.
+        One embedder at a time: the git-driven frontier asks about its own
+        series (embedder 0); delivery asks about the key it is shipping.
         """
         rows = self.conn.execute(
             "SELECT DISTINCT s.commit_id FROM scores s"
             " LEFT JOIN commits c ON s.engine=c.engine"
             "   AND s.embedder_id=c.embedder_id AND s.commit_id=c.commit_id"
-            " WHERE s.engine=? AND s.platform=? AND s.embedder_id=0 AND c.hash IS NULL"
+            " WHERE s.engine=? AND s.platform=? AND s.embedder_id=? AND c.hash IS NULL"
             "   AND (? IS NULL OR s.commit_id >= ?)"
             "   AND (? IS NULL OR s.commit_id <= ?)"
             " ORDER BY s.commit_id",
-            (engine, platform, lo, lo, hi, hi),
+            (engine, platform, embedder_id, lo, lo, hi, hi),
         ).fetchall()
         return [r[0] for r in rows]
+
+    def key_missing_commit_row(self, engine: str, platform: str, key) -> bool:
+        """Whether one key has scores but no ``commits`` row (see above)."""
+        key = CommitKey.of(key)
+        return bool(
+            self.commit_ids_missing_commit_row(
+                engine,
+                platform,
+                key.commit_id,
+                key.commit_id,
+                embedder_id=key.embedder_id,
+            )
+        )
 
     def get_commits_with_metadata(
         self, engine: str, hashes: list[str]
@@ -986,17 +1000,18 @@ class CommitStore:
         engine: str,
         platform: str,
         valid_benchmarks_by_suite: dict[str, set[str]],
-        commit_ids: list[int] | None = None,
+        keys: list | None = None,
     ) -> list[sqlite3.Row]:
         """Score rows joined with commit metadata, for pushing.
 
         Benchmarks are filtered per suite so that e.g. js2-only names don't
-        leak into js3. ``commit_ids`` restricts the export; it is materialised
-        in a temp table to sidestep SQLite's bound-parameter limit.
+        leak into js3. ``keys`` restricts the export to those commit keys; it
+        is materialised in a temp table to sidestep SQLite's bound-parameter
+        limit.
 
-        Embedder 0 only, like everything delivery reads: the perf database
-        keys on a scalar commit number, and the projection of an embedded
-        series onto it is a decision not yet made.
+        Rows come out in spool column order (``delivery_batch.COLUMNS``):
+        the engine's commit as ``commit_id`` and the embedder pair last, so
+        an embedded series travels with both of its coordinates.
         """
         clauses = []
         params: list = [engine, platform]
@@ -1012,39 +1027,43 @@ class CommitStore:
         where_suite = " OR ".join(clauses)
 
         commit_filter = ""
-        if commit_ids is not None:
-            if not commit_ids:
+        if keys is not None:
+            if not keys:
                 return []
+            self.conn.execute("DROP TABLE IF EXISTS _export_commits")
             self.conn.execute(
-                "CREATE TEMP TABLE IF NOT EXISTS _export_commits"
-                " (commit_id INTEGER PRIMARY KEY)"
+                "CREATE TEMP TABLE _export_commits"
+                " (embedder_id INTEGER NOT NULL, commit_id INTEGER NOT NULL,"
+                "  PRIMARY KEY (embedder_id, commit_id))"
             )
-            self.conn.execute("DELETE FROM _export_commits")
             self.conn.executemany(
-                "INSERT INTO _export_commits (commit_id) VALUES (?)",
-                [(c,) for c in commit_ids],
+                "INSERT INTO _export_commits (embedder_id, commit_id) VALUES (?,?)",
+                [tuple(CommitKey.of(k)) for k in keys],
             )
             commit_filter = (
-                " AND s.commit_id IN (SELECT commit_id FROM _export_commits)"
+                " AND EXISTS (SELECT 1 FROM _export_commits x"
+                "  WHERE x.embedder_id = s.embedder_id AND x.commit_id = s.commit_id)"
             )
 
         try:
             return self.conn.execute(
                 "SELECT s.engine, s.platform, s.commit_id, s.suite, s.flags,"
                 "       s.benchmark, s.metric, s.run, s.score, s.timestamp,"
-                "       c.hash, c.date, c.timestamp, c.title"
+                "       c.hash, c.date, c.timestamp, c.title,"
+                "       s.embedder_id, c.embedder_hash"
                 " FROM scores s"
                 " JOIN commits c ON s.engine = c.engine"
                 "   AND s.embedder_id = c.embedder_id AND s.commit_id = c.commit_id"
-                f" WHERE s.engine = ? AND s.platform = ? AND s.embedder_id = 0"
+                f" WHERE s.engine = ? AND s.platform = ?"
                 f"   AND ({where_suite})"
                 f"{commit_filter}"
-                " ORDER BY s.commit_id, s.suite, s.flags, s.benchmark, s.metric, s.run",
+                " ORDER BY s.embedder_id, s.commit_id, s.suite, s.flags,"
+                "          s.benchmark, s.metric, s.run",
                 params,
             ).fetchall()
         finally:
             if commit_filter:
-                self.conn.execute("DELETE FROM _export_commits")
+                self.conn.execute("DROP TABLE IF EXISTS _export_commits")
 
     # --- Provenance ---
 
@@ -1291,36 +1310,46 @@ class CommitStore:
         ).fetchall()
 
     # --- Push state ---
-    #
-    # Scalar, like the rest of delivery: see commit_ids_missing_commit_row.
 
-    def unpushed_commit_ids(
+    def unpushed_keys(
         self, engine: str, platform: str, limit: int | None = None
-    ) -> list[int]:
-        """Return commit_ids that are done but not yet pushed, ordered ascending."""
+    ) -> list[CommitKey]:
+        """Keys that are done but not yet pushed, in CommitKey order.
+
+        Every embedder: an embedded series is delivered under its own pair,
+        and the perf database keys on the same pair.
+        """
         rows = self.conn.execute(
-            "SELECT ps.commit_id FROM processing_state ps"
+            "SELECT ps.embedder_id, ps.commit_id FROM processing_state ps"
             " LEFT JOIN push_state pu"
             "   ON pu.engine=ps.engine AND pu.platform=ps.platform"
             "  AND pu.embedder_id=ps.embedder_id AND pu.commit_id=ps.commit_id"
-            " WHERE ps.engine=? AND ps.platform=? AND ps.embedder_id=0"
+            " WHERE ps.engine=? AND ps.platform=?"
             "   AND pu.commit_id IS NULL"
-            " ORDER BY ps.commit_id LIMIT ?",
+            " ORDER BY ps.embedder_id, ps.commit_id LIMIT ?",
             (engine, platform, limit if limit is not None else -1),
         ).fetchall()
-        return [r[0] for r in rows]
+        return [CommitKey(r[0], r[1]) for r in rows]
+
+    def is_pushed(self, engine: str, platform: str, key) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM push_state WHERE engine=? AND platform=?"
+            " AND embedder_id=? AND commit_id=?",
+            (engine, platform, *CommitKey.of(key)),
+        ).fetchone()
+        return row is not None
 
     @_write
-    def mark_pushed(self, engine: str, platform: str, commit_ids: list[int]) -> None:
-        """Mark commit_ids as successfully pushed to Spanner."""
-        if not commit_ids:
+    def mark_pushed(self, engine: str, platform: str, keys: list) -> None:
+        """Mark keys as successfully pushed to Spanner."""
+        if not keys:
             return
         now = int(time.time())
         self.conn.executemany(
             "INSERT OR REPLACE INTO push_state"
             " (engine, platform, embedder_id, commit_id, pushed_at, bot)"
-            " VALUES (?,?,0,?,?,?)",
-            [(engine, platform, cid, now, self._bot) for cid in commit_ids],
+            " VALUES (?,?,?,?,?,?)",
+            [(engine, platform, *CommitKey.of(k), now, self._bot) for k in keys],
         )
         self.conn.commit()
 

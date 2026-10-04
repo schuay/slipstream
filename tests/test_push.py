@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from slipstream.config import PushConfig, PushTarget
+from slipstream.models import CommitKey
 from slipstream.push import (
     _COLUMNS as _COLUMNS_FOR_TEST,
     build_export_csv,
@@ -86,13 +87,13 @@ class TestBuildExportCsv:
 
     def test_commit_filter(self, store):
         _seed(store, [100, 200, 300])
-        text, n = build_export_csv(store, "v8", "arm64", VALID, commit_ids=[200])
+        text, n = build_export_csv(store, "v8", "arm64", VALID, keys=[200])
         assert n == 1
         assert _rows(text)[0]["commit_id"] == "200"
 
     def test_empty_commit_filter_exports_nothing(self, store):
         _seed(store, [100])
-        assert build_export_csv(store, "v8", "arm64", VALID, commit_ids=[]) == ("", 0)
+        assert build_export_csv(store, "v8", "arm64", VALID, keys=[]) == ("", 0)
 
 
 SPOOL_A = PushTarget(spool_dir=Path("/spool/a"))
@@ -107,7 +108,7 @@ class TestPush:
         n = push(store, ["v8"], self.cfg, VALID, "arm64")
         assert n == 2
         assert len(deliveries.calls) == 2
-        assert store.unpushed_commit_ids("v8", "arm64") == []
+        assert store.unpushed_keys("v8", "arm64") == []
 
     def test_only_unpushed_commits_are_sent(self, store, deliveries):
         _seed(store, [100, 200])
@@ -121,7 +122,7 @@ class TestPush:
         deliveries.state["fail"] = True
         with pytest.raises(OSError):
             push(store, ["v8"], self.cfg, VALID, "arm64")
-        assert store.unpushed_commit_ids("v8", "arm64") == [100]
+        assert store.unpushed_keys("v8", "arm64") == [CommitKey(0, 100)]
 
     def test_engines_keep_separate_commit_units(self, store, deliveries):
         _seed(store, [100])
@@ -141,7 +142,7 @@ class TestPush:
         with pytest.raises(OSError):
             push(store, ["v8"], cfg, VALID, "arm64")
         assert len(deliveries.calls) == 2
-        assert store.unpushed_commit_ids("v8", "arm64") == [100]
+        assert store.unpushed_keys("v8", "arm64") == [CommitKey(0, 100)]
 
     def test_retry_after_failure_resends_to_all_targets(self, store, deliveries):
         _seed(store, [100])
@@ -152,14 +153,14 @@ class TestPush:
         deliveries.state.pop("fail_at")
         push(store, ["v8"], cfg, VALID, "arm64")
         assert len(deliveries.calls) == 4
-        assert store.unpushed_commit_ids("v8", "arm64") == []
+        assert store.unpushed_keys("v8", "arm64") == []
 
     def test_commits_without_exportable_rows_are_marked(self, store, deliveries):
         # Nothing to send, so no delivery, but the commit must not retry forever.
         _seed(store, [100], scores=[_score("not-in-whitelist")])
         assert push(store, ["v8"], self.cfg, VALID, "arm64") == 0
         assert deliveries.calls == []
-        assert store.unpushed_commit_ids("v8", "arm64") == []
+        assert store.unpushed_keys("v8", "arm64") == []
 
     def test_nothing_unpushed_delivers_nothing(self, store, deliveries):
         _seed(store, [100])
@@ -185,7 +186,7 @@ class TestSpoolTarget:
             "100",
             "200",
         ]
-        assert store.unpushed_commit_ids("v8", "arm64") == []
+        assert store.unpushed_keys("v8", "arm64") == []
 
     def test_successive_pushes_take_the_next_seq(self, store, tmp_path):
         spool = tmp_path / "outbox"
@@ -283,7 +284,7 @@ class TestRebuild:
             bot_name="bot", targets=[PushTarget(spool_dir=store.db_path.parent / "out")]
         )
         assert push(store, ["v8"], cfg, VALID, "arm64", rebuild=True) == 2
-        assert store.unpushed_commit_ids("v8", "arm64") == []
+        assert store.unpushed_keys("v8", "arm64") == []
 
 
 def self_cfg():
@@ -331,14 +332,14 @@ class TestOrphanedScores:
         with pytest.raises(ValueError, match="no commit row"):
             push(store, ["v8"], self._cfg(), VALID, "arm64", log=logged.append)
 
-        assert store.unpushed_commit_ids("v8", "arm64") == [101]
+        assert store.unpushed_keys("v8", "arm64") == [CommitKey(0, 101)]
         assert any("no commit row" in m for m in logged)
 
     def test_a_commit_with_nothing_exportable_is_still_marked(self, store, deliveries):
         """Deliberate: its scores are outside the whitelist, not missing."""
         _seed(store, [100], scores=[_score("not-whitelisted")])
         push(store, ["v8"], self._cfg(), VALID, "arm64")
-        assert store.unpushed_commit_ids("v8", "arm64") == []
+        assert store.unpushed_keys("v8", "arm64") == []
 
 
 class TestOrphanScanIsBounded:
@@ -358,9 +359,9 @@ class TestOrphanScanIsBounded:
         seen = {}
         real = store.commit_ids_missing_commit_row
 
-        def spy(engine, platform, lo=None, hi=None):
-            seen["bounds"] = (lo, hi)
-            return real(engine, platform, lo, hi)
+        def spy(engine, platform, lo=None, hi=None, *, embedder_id=0):
+            seen["bounds"] = (embedder_id, lo, hi)
+            return real(engine, platform, lo, hi, embedder_id=embedder_id)
 
         store.commit_ids_missing_commit_row = spy
         push(
@@ -370,7 +371,7 @@ class TestOrphanScanIsBounded:
             VALID,
             "arm64",
         )
-        assert seen["bounds"] == (200, 200)  # each snapshot scans only its exact unit
+        assert seen["bounds"] == (0, 200, 200)  # each snapshot scans only its exact key
 
     def test_an_orphan_inside_the_range_is_still_held_back(self, store, deliveries):
         _seed(store, [100])
@@ -384,4 +385,4 @@ class TestOrphanScanIsBounded:
                 VALID,
                 "arm64",
             )
-        assert store.unpushed_commit_ids("v8", "arm64") == [101]
+        assert store.unpushed_keys("v8", "arm64") == [CommitKey(0, 101)]

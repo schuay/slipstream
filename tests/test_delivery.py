@@ -13,9 +13,10 @@ import time
 import pytest
 
 from slipstream.config import DeliveryConfig, PushTarget, RelaySource
+from slipstream.models import CommitKey
 from slipstream.delivery import Coordinator
 from slipstream.delivery_batch import Batch, Receipt
-from slipstream.delivery_sources import LocalDbSource, SshSpoolSource
+from slipstream.delivery_sources import LocalDbSource, SshSpoolSource, validate_record
 from slipstream.delivery_targets import SpannerSession, SpoolSession, target_identity
 from slipstream.durability import FileLock, target_lock_path
 from slipstream.push import parse_seq, spool_append
@@ -92,12 +93,12 @@ def test_bounded_snapshot_rotates_between_sources_and_engines(tmp_path, store):
     )
     c = coordinator(tmp_path, [a, b], settings=DeliveryConfig(max_units=3))
     assert cycle(c) == 3
-    assert store.unpushed_commit_ids("v8", "arm64")[0] == 4
+    assert store.unpushed_keys("v8", "arm64")[0] == CommitKey(0, 4)
     assert read_cursor(b.path) == 0
     assert b.spool.fetched == []
     assert cycle(c) == 3
     assert read_cursor(b.path) == 3
-    assert store.unpushed_commit_ids("v8", "arm64")[0] == 4
+    assert store.unpushed_keys("v8", "arm64")[0] == CommitKey(0, 4)
 
 
 def test_new_work_waits_until_next_snapshot(tmp_path, store):
@@ -112,7 +113,7 @@ def test_new_work_waits_until_next_snapshot(tmp_path, store):
 
     c = coordinator(tmp_path, [source], session_factory=lambda t, **kw: Arrivals(t))
     assert cycle(c) == 1
-    assert store.unpushed_commit_ids("v8", "arm64") == [2]
+    assert store.unpushed_keys("v8", "arm64") == [CommitKey(0, 2)]
 
 
 @pytest.mark.parametrize("kind", ["local", "remote"])
@@ -220,7 +221,7 @@ def test_remote_failure_does_not_stop_healthy_local_source(tmp_path, store):
     assert cycle(c) == 1
     assert c.errors
     assert read_cursor(broken.path) == 0
-    assert store.unpushed_commit_ids("v8", "arm64") == []
+    assert store.unpushed_keys("v8", "arm64") == []
     assert cycle(c) == 0
     assert broken.spool.fetched == [1]  # source backoff, independent idle refresh
 
@@ -629,7 +630,7 @@ def test_refresh_failed_after_ack_is_retried_without_upload_on_idle_cycle(
     assert c.errors and source.acknowledged(1)
     assert cycle(c) == 0
     assert not c.errors
-    assert stages == [1] and len(refreshes) == 2
+    assert stages == [CommitKey(0, 1)] and len(refreshes) == 2
 
 
 def test_one_session_accepts_multiple_bot_identities_and_refreshes_once(
@@ -742,7 +743,7 @@ def test_interrupted_rebuild_blocks_another_state_directory_and_resumes(
     assert not target_guard(c.identities[0]).exists()
     assert not (tmp_path / "delivery" / "maintenance.json").exists()
     assert wipes == ["bot", "bot"]
-    assert store.unpushed_commit_ids("v8", "arm64") == [1]
+    assert store.unpushed_keys("v8", "arm64") == [CommitKey(0, 1)]
 
 
 def test_new_targets_do_not_implicitly_replay_acknowledged_history(tmp_path, store):
@@ -908,7 +909,7 @@ def test_watch_has_no_delivery_side_effects(config, store, monkeypatch):
 
     reopened = CommitStore(store.db_path, backup=False)
     try:
-        assert reopened.unpushed_commit_ids("v8", "arm64") == [1]
+        assert reopened.unpushed_keys("v8", "arm64") == [CommitKey(0, 1)]
     finally:
         reopened.close()
 
@@ -934,7 +935,7 @@ class Slow(SpoolSession):
         return super().stage(*args)
 c = Coordinator([LocalDbSource(store, "v8", "arm64", "bot", VALID)], [PushTarget(spool_dir=Path(p)) for p in {targets!r}], Path({str(tmp_path / str(index) / "delivery")!r}), session_factory=lambda t, **kw: Slow(t))
 assert c.run(once=True)
-assert store.unpushed_commit_ids("v8", "arm64") == []
+assert store.unpushed_keys("v8", "arm64") == []
 store.close()
 """)
     children = [subprocess.Popen([sys.executable, "-c", s]) for s in scripts]
@@ -946,3 +947,141 @@ store.close()
                 p.kill()
                 p.wait()
     assert len(files(tmp_path / "a")) == len(files(tmp_path / "b")) == 2
+
+
+# --- Two-coordinate delivery -------------------------------------------------
+#
+# A chrome or safari key is (embedder, inner commit). It travels under its own
+# pair: discovery, the attempt record, the spool CSV and the acknowledgement
+# all address the pair, and the receiving side keys samples on it.
+
+CHROMIUM = "c" * 40
+
+
+def _seed_embedded(store, engine="chrome", key=CommitKey(1500123, 109680)):
+    store.upsert_commit(
+        engine, f"h{key.commit_id}", key, "2026-01-01", key.commit_id, "inner", CHROMIUM
+    )
+    store.insert_scores(engine, "arm64", key, 0, [_score_dict()])
+    store.mark_done(engine, "arm64", key)
+    return key
+
+
+def _score_dict():
+    return {
+        "suite": "js3",
+        "flags": "default",
+        "benchmark": "bench-a",
+        "metric": "Total-Score",
+        "run": 1,
+        "score": 1.0,
+    }
+
+
+def test_embedded_key_is_discovered_delivered_and_acknowledged_as_a_pair(tmp_path, store):
+    key = _seed_embedded(store)
+    _seed(store, [1])  # a v8 key on the same box, embedder 0
+    chrome, v8 = local(store, "chrome"), local(store)
+    assert chrome.discover(10) == [key]
+    assert v8.discover(10) == [CommitKey(0, 1)]
+
+    c = coordinator(tmp_path, [chrome, v8])
+    assert cycle(c) == 2 and not c.errors
+    assert store.is_pushed("chrome", "arm64", key)
+    assert chrome.discover(10) == [] and chrome.pending() is None
+
+    import csv as _csvmod
+
+    texts = [p.read_text() for p in files(tmp_path / "output")]
+    rows = [r for t in texts for r in _csvmod.DictReader(t.splitlines())]
+    by_engine = {r["engine"]: r for r in rows}
+    assert by_engine["chrome"]["commit_id"] == "109680"
+    assert by_engine["chrome"]["embedder_id"] == "1500123"
+    assert by_engine["chrome"]["embedder_hash"] == CHROMIUM
+    assert by_engine["chrome"]["flags"] == "chrome_default"
+    assert by_engine["v8"]["embedder_id"] == "0"
+    assert by_engine["v8"]["embedder_hash"] == ""
+
+
+def test_embedded_attempt_record_round_trips_the_pair(tmp_path, store):
+    key = _seed_embedded(store)
+    source = local(store, "chrome")
+
+    class Stuck(SpoolSession):
+        def stage(self, batch, attempt):
+            raise OSError("spool full")
+
+    c = coordinator(tmp_path, [source], session_factory=lambda t, **kw: Stuck(t))
+    assert cycle(c) == 0 and c.errors
+    raw = json.loads(
+        store.conn.execute("SELECT record FROM delivery_attempts").fetchone()[0]
+    )
+    assert raw["unit"] == [1500123, 109680]  # CommitKey.to_json; an int for embedder 0
+    record = source.pending()
+    assert record["unit"] == key
+    validate_record(record, source, record["targets"])
+
+    # The retry resumes the same unit and acknowledges the pair.
+    c = coordinator(tmp_path, [source])
+    assert cycle(c) == 1 and not c.errors
+    assert store.is_pushed("chrome", "arm64", key) and source.pending() is None
+
+
+def test_local_attempt_record_rejects_a_unit_that_is_not_a_key(tmp_path, store):
+    source = local(store)
+    for unit in ("x", -1, [0, -5], [1, 2, 3], None):
+        record = dict(
+            version=1,
+            source=source.identity,
+            bot="bot",
+            unit=unit,
+            targets=["t"],
+            attempt="0" * 32,
+            digest="0" * 64,
+        )
+        with pytest.raises(ValueError, match="corrupt"):
+            validate_record(source._with_key(record), source, ["t"])
+
+
+def test_spool_unit_stays_a_sequence_number(tmp_path):
+    source = remote(tmp_path, "remote", {1: _csv({})})
+    record = dict(
+        version=1,
+        source=source.identity,
+        bot="remote",
+        unit=[1, 2],
+        targets=["t"],
+        attempt="0" * 32,
+        digest="0" * 64,
+    )
+    with pytest.raises(ValueError, match="corrupt"):
+        validate_record(record, source, ["t"])
+
+
+def test_spool_csv_requires_the_embedder_pair_to_agree(tmp_path):
+    for fields in (
+        {"embedder_id": "1500123"},  # hash missing
+        {"embedder_hash": CHROMIUM},  # id missing
+        {"embedder_id": "-1", "embedder_hash": CHROMIUM},
+        {"embedder_id": "x"},
+    ):
+        source = remote(tmp_path, "remote", {1: _csv(fields)})
+        c = coordinator(tmp_path, [source])
+        assert cycle(c) == 0
+        assert c.errors and not source.attempt_path.exists()
+        assert read_cursor(source.path) == 0
+    source = remote(
+        tmp_path, "ok", {1: _csv({"embedder_id": "1500123", "embedder_hash": CHROMIUM})}
+    )
+    c = coordinator(tmp_path, [source])
+    assert cycle(c) == 1 and not c.errors
+
+
+def test_old_spool_header_without_the_pair_is_refused(tmp_path):
+    text = _csv({})
+    lines = text.splitlines()
+    text = "\n".join(",".join(l.split(",")[:-2]) for l in lines) + "\n"
+    source = remote(tmp_path, "remote", {1: text})
+    c = coordinator(tmp_path, [source])
+    assert cycle(c) == 0
+    assert c.errors and "invalid spool CSV header" in str(c.errors[0])

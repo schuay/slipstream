@@ -93,6 +93,8 @@ def _csv(*rows):
             commit_date="2026-01-01",
             commit_timestamp="1700000000",
             commit_title="t",
+            embedder_id="0",
+            embedder_hash="",
         )
         d.update(r)
         lines.append(",".join(d[c] for c in _COLUMNS))
@@ -516,6 +518,53 @@ class TestStagingGroups:
         assert [len(c[3]) for c in db.of("upsert")] == [2, 2, 1, 1]
         assert db.of("upsert", "slipstream")[0][2] == spanner.IMPORT_COLUMNS
         assert db.of("upsert", "samples")[0][2] == spanner.SAMPLE_COLUMNS
+
+    def test_embedded_record_keys_on_the_pair_and_skips_the_previous_design(self):
+        chromium = "c" * 40
+        records = spanner.records_from_csv(
+            _csv(
+                {},
+                {
+                    "engine": "chrome",
+                    "flags": "chrome_default",
+                    "commit_id": "109680",
+                    "embedder_id": "1500123",
+                    "embedder_hash": chromium,
+                },
+                {
+                    "engine": "chrome",
+                    "flags": "chrome_default",
+                    "commit_id": "109680",
+                    "embedder_id": "1500124",
+                    "embedder_hash": "d" * 40,
+                    "run": "2",
+                },
+            )
+        )
+        staged = spanner.staging_rows(records, "bot1")
+        assert [s[:6] for s in staged.samples] == [
+            ("bot1", "js3", "v8", "default", 0, 100),
+            ("bot1", "js3", "chrome", "default", 1500123, 109680),
+            ("bot1", "js3", "chrome", "default", 1500124, 109680),
+        ]
+        # Same inner commit under two chromium positions: two commit rows,
+        # each with its own embedder hash; the inner hash is shared.
+        assert [(c[0], c[1], c[2], c[3], c[6]) for c in staged.commits] == [
+            ("v8", 0, 100, "abc", None),
+            ("chrome", 1500123, 109680, "abc", chromium),
+            ("chrome", 1500124, 109680, "abc", "d" * 40),
+        ]
+        assert [d[:6] for d in staged.dirty] == [s[:6] for s in staged.samples]
+        # The previous-design table has no embedder coordinate (D1): it
+        # receives the v8 row only, and both designs still go in one write.
+        db = FakeDb()
+        assert spanner.stage_records(db, records, "bot1") == 3
+        assert [len(c[3]) for c in db.of("upsert")] == [1, 3, 3, 3]
+        assert db.of("upsert", "slipstream")[0][3][0][6] == 100
+        # An all-embedded push under write=legacy stages nothing at all.
+        db = FakeDb()
+        spanner.stage_records(db, records[1:], "bot1", write="legacy")
+        assert db.of("upsert", "slipstream")[0][3] == []
 
     def test_write_modes_select_the_tables(self):
         records = spanner.records_from_csv(_csv({}))

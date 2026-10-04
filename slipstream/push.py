@@ -35,12 +35,10 @@ def _export_rows(
     engine: str,
     platform: str,
     valid_benchmarks_by_suite: dict[str, set[str]],
-    commit_ids: list[int] | None = None,
+    keys: list | None = None,
 ) -> list[list]:
     rows = []
-    for row in store.export_scores(
-        engine, platform, valid_benchmarks_by_suite, commit_ids
-    ):
+    for row in store.export_scores(engine, platform, valid_benchmarks_by_suite, keys):
         r = list(row)
         # Prefix flags with the engine so variants of different engines stay
         # distinct downstream, e.g. "default" -> "v8_default".
@@ -58,13 +56,13 @@ def build_export_csv(
     engine: str,
     platform: str,
     valid_benchmarks_by_suite: dict[str, set[str]],
-    commit_ids: list[int] | None = None,
+    keys: list | None = None,
 ) -> tuple[str, int]:
     """Export score rows for valid benchmarks, joined with commit metadata.
 
     Returns the CSV text and its row count; ("", 0) when nothing matches.
     """
-    rows = _export_rows(store, engine, platform, valid_benchmarks_by_suite, commit_ids)
+    rows = _export_rows(store, engine, platform, valid_benchmarks_by_suite, keys)
     if not rows:
         return "", 0
     return _to_csv(rows), len(rows)

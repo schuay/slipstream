@@ -11,6 +11,8 @@ import io
 import math
 from dataclasses import dataclass
 
+from .models import CommitKey
+
 COLUMNS = (
     "engine",
     "platform",
@@ -26,7 +28,16 @@ COLUMNS = (
     "commit_date",
     "commit_timestamp",
     "commit_title",
+    # The outer coordinate of a two-coordinate key: 0 / '' for an engine
+    # that is its own embedder (v8, jsc); the chromium position and CL hash
+    # for chrome, the STP sequence and CFBundleVersion for safari. The row's
+    # commit_id is always the inner (engine) commit.
+    "embedder_id",
+    "embedder_hash",
 )
+
+_EMBEDDER_ID = COLUMNS.index("embedder_id")
+_EMBEDDER_HASH = COLUMNS.index("embedder_hash")
 
 
 def to_csv(rows) -> str:
@@ -51,6 +62,9 @@ def parse_csv(text: str) -> tuple[tuple, ...]:
             raise ValueError("invalid commit, run or score")
         int(row[9])
         int(row[12])
+        embedder = int(row[_EMBEDDER_ID])
+        if embedder < 0 or (embedder == 0) != (not row[_EMBEDDER_HASH].strip()):
+            raise ValueError("embedder id and hash disagree")
         rows.append(tuple(row))
     return tuple(rows)
 
@@ -59,7 +73,7 @@ def parse_csv(text: str) -> tuple[tuple, ...]:
 class Batch:
     source: str
     bot: str
-    unit: int
+    unit: int | CommitKey  # spool sequence number, or the local commit key
     rows: tuple[tuple, ...]
     digest: str
     size: int
