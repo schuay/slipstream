@@ -67,9 +67,16 @@ def _shutdown_flag(label: str = "current commit", log=None):
 
     A callable rather than a variable so the flag reaches the collector's
     per-commit path, where a wait for the machine lock can last hours.
+
+    Also where the process takes a process group of its own: every command
+    that installs this may hold the machine lock, and the next holder finds
+    what a crashed one left running by that group.
     """
     import signal
 
+    from .lock import own_process_group
+
+    own_process_group()
     state = {"stop": False}
 
     def handle(signum, frame):

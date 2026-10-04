@@ -254,6 +254,10 @@ class BuildConfig:
     min_free_gb: float = 100.0
     max_infra_attempts: int = 5
     max_consecutive_burns: int = 3
+    # Jobs built per hold of the machine before a waiting bencher gets a turn.
+    # 0 holds it until the known work is built: a roll's commits share a warm
+    # build cache, and a bench-only peer box is waiting on the bus for them.
+    batch: int = 0
     # Only consulted when an engine has neither published entries nor terminal
     # build failures, so a restart cannot rewind the frontier.
     start_from: dict[str, CommitKey] = field(default_factory=dict)
@@ -817,6 +821,7 @@ def _parse_build(data: dict, engines: dict[str, EngineConfig]) -> BuildConfig:
             "min_free_gb",
             "max_infra_attempts",
             "max_consecutive_burns",
+            "batch",
             "from",
         ),
         "[build]",
@@ -843,6 +848,10 @@ def _parse_build(data: dict, engines: dict[str, EngineConfig]) -> BuildConfig:
             start_from[name] = CommitKey.of(value)
         except ValueError as e:
             raise ValueError(f"[build] from {name}: {e}") from e
+    batch = data.get("batch", 0)
+    # Zero is meaningful here (hold until drained), so not _positive.
+    if isinstance(batch, bool) or not isinstance(batch, int) or batch < 0:
+        raise ValueError("[build] batch must be a whole number; 0 means unbounded")
     return BuildConfig(
         engines=names,
         retain_gb=_positive(data, "retain_gb", 400.0, "[build]"),
@@ -851,6 +860,7 @@ def _parse_build(data: dict, engines: dict[str, EngineConfig]) -> BuildConfig:
         max_consecutive_burns=int(
             _positive(data, "max_consecutive_burns", 3, "[build]")
         ),
+        batch=batch,
         start_from=start_from,
     )
 

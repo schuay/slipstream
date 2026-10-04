@@ -3,10 +3,10 @@
 
 """Build every commit once and publish the artifact for both boxes to bench.
 
-The builder walks an engine's history upward, one commit per cycle: check out,
-build, package the run set, publish to the bus. It holds the machine lock
-across all of that, because zstd -T0 and a compile saturate every core and a
-build next to a measurement contaminates it.
+The builder walks an engine's history upward: check out, build, package the
+run set, publish to the bus, and on to the next until it is caught up. It
+holds the machine lock across all of that, because zstd -T0 and a compile
+saturate every core and a build next to a measurement contaminates it.
 
 Failures are recorded rather than skipped. Before this, a commit that failed to
 build was skipped once and never revisited as soon as a later commit was marked
@@ -46,6 +46,9 @@ from .resolve import (
 STALL_BACKOFF = 4
 STALL_BACKOFF_CAP_SECS = 6 * 3600
 DEFAULT_INTERVAL_SECS = 1800.0
+# A cycle drains, but not forever: commits that keep landing must not keep it
+# from re-reading its state, fetching again, or stopping when asked.
+MAX_JOBS_PER_CYCLE = 50
 # How many failures the published state file carries. Consumers cat it over
 # ssh every cycle; the count travels separately so nothing is hidden.
 MAX_REPORTED_FAILURES = 50
@@ -376,6 +379,7 @@ class Builder:
         key = job.key
         state.in_flight = self._in_flight(job, "build")
         self._publish_state(engine_name, state)
+        self.lock.set_job(f"{engine_name} {key}")
         # Said out loud: without -v nothing else reaches the console until the
         # build has published or failed, and a long one looks like a hang.
         self.log(f"{engine_name}: building {key}")
@@ -619,39 +623,80 @@ class Builder:
     # --- the loop ---
 
     def run_cycle(self, engine_names: list[str], should_stop) -> int:
-        """One pass over the engines; returns how many commits were published."""
+        """Drain what the engines have to build; returns how many published.
+
+        Round-robin over the engines, one job each per turn, so a long roll
+        on one cannot starve another. ``[build] batch`` says how many jobs
+        one hold of the machine covers before the lock is handed on and
+        taken again at the back of the queue; zero holds it until the known
+        work is gone, which is what a warm build cache and a bench-only peer
+        box waiting on the bus both want. The cycle itself is bounded, so
+        work that keeps arriving cannot keep it from refreshing or stopping.
+
+        An engine stays in the rotation only while it publishes. A failure
+        drops it until the next cycle: an infrastructure failure would
+        otherwise be retried back to back, and a stall or a floor has
+        already said it wants to wait. Each engine fetches once per cycle,
+        in its first turn; what lands after that is next cycle's.
+        """
         published = 0
-        for name in engine_names:
-            if should_stop():
-                break
+        jobs = 0
+        rotation = list(engine_names)
+        fetched: set[str] = set()
+        batch = self.cfg.build.batch
+        while rotation and jobs < MAX_JOBS_PER_CYCLE and not should_stop():
             if not self.lock.acquire(should_stop, wait=True, log=self.log):
                 break
+            in_hold = 0
             try:
-                self.resolver(name).fetch()  # so origin/main is current
-                result = self.build_one(name)
-            except FetchError:
-                self.log(f"{name}: skipping until fetch succeeds")
-                continue
-            except (BuildError, BusError, ValueError, OSError, sqlite3.Error) as e:
-                # ValueError is how require_run_set and require_src_dir report
-                # a misconfigured engine; BusError is a state file this version
-                # cannot read; OSError is a full disk or a missing tar; and
-                # sqlite3.Error, which is not an OSError, is every build_state
-                # write. None of them may take the working engines down too.
-                self.store.conn.rollback()
-                self.log(f"{name}: {e}")
-                # The operation ended, even if its bookkeeping could not be
-                # committed. Clear stale in-flight state and expose the error.
-                try:
-                    state = self.bus.read_builder_state(name)
-                    state.in_flight = None
-                    state.last_error = str(e)
-                    self._publish_state(name, state)
-                except (BusError, OSError, sqlite3.Error):
-                    pass
-                continue
+                while (
+                    rotation
+                    and jobs < MAX_JOBS_PER_CYCLE
+                    and (batch == 0 or in_hold < batch)
+                    and not should_stop()
+                ):
+                    name = rotation.pop(0)
+                    try:
+                        if name not in fetched:
+                            self.resolver(name).fetch()  # so origin/main is current
+                            fetched.add(name)
+                        result = self.build_one(name)
+                    except FetchError:
+                        self.log(f"{name}: skipping until fetch succeeds")
+                        continue
+                    except (
+                        BuildError,
+                        BusError,
+                        ValueError,
+                        OSError,
+                        sqlite3.Error,
+                    ) as e:
+                        # ValueError is how require_run_set and require_src_dir
+                        # report a misconfigured engine; BusError is a state
+                        # file this version cannot read; OSError is a full
+                        # disk or a missing tar; and sqlite3.Error, which is
+                        # not an OSError, is every build_state write. None of
+                        # them may take the working engines down too.
+                        self.store.conn.rollback()
+                        self.log(f"{name}: {e}")
+                        # The operation ended, even if its bookkeeping could
+                        # not be committed. Clear stale in-flight state and
+                        # expose the error.
+                        try:
+                            state = self.bus.read_builder_state(name)
+                            state.in_flight = None
+                            state.last_error = str(e)
+                            self._publish_state(name, state)
+                        except (BusError, OSError, sqlite3.Error):
+                            pass
+                        continue
+                    if result.key is None:
+                        continue  # nothing to build: up to date, floor, stall
+                    jobs += 1
+                    in_hold += 1
+                    if result.published:
+                        published += 1
+                        rotation.append(name)
             finally:
                 self.lock.release()
-            if result.published:
-                published += 1
         return published

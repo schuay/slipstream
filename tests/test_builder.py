@@ -625,9 +625,72 @@ class TestCycle:
             "build_one",
             lambda name: (held.append(peer.try_acquire()), real(name))[1],
         )
-        assert builder.run_cycle(["v8"], lambda: False) == 1
-        assert held == [False]
+        assert builder.run_cycle(["v8"], lambda: False) == 4
+        # Four builds and the look that finds nothing left, all under the lock.
+        assert held == [False] * 5
         assert peer.try_acquire()
+
+    def test_a_cycle_drains_what_is_known(self, builder):
+        """A roll is many commits; one per half hour spread it over a day."""
+        assert builder.run_cycle(["v8"], lambda: False) == 4
+        assert builder.bus.keys("v8") == K(101, 102, 103, 104)
+        assert builder.run_cycle(["v8"], lambda: False) == 0
+
+    def test_the_lock_is_held_across_a_batch_of_zero(self, builder):
+        """batch = 0: hold until the known work is built, so a peer box
+        waiting on the bus gets the whole roll at once."""
+        acquires = []
+        real = builder.lock.acquire
+        builder.lock.acquire = lambda *a, **k: (acquires.append(1), real(*a, **k))[1]
+        assert builder.run_cycle(["v8"], lambda: False) == 4
+        assert len(acquires) == 1
+
+    def test_a_batch_hands_the_machine_on_between_jobs(self, builder):
+        builder.cfg.build.batch = 2
+        acquires = []
+        real = builder.lock.acquire
+        builder.lock.acquire = lambda *a, **k: (acquires.append(1), real(*a, **k))[1]
+        assert builder.run_cycle(["v8"], lambda: False) == 4
+        # Two holds of two jobs, and one more to find there is nothing left:
+        # the same look an old cycle took to learn it was up to date.
+        assert len(acquires) == 3
+
+    def test_engines_take_turns(self, builder):
+        """One engine's backlog must not starve another's."""
+        from dataclasses import replace
+
+        builder.cfg.engines["v8b"] = replace(builder.cfg.engines["v8"], name="v8b")
+        builder.cfg.build.start_from["v8b"] = K1(100)
+        order = []
+        real = builder.build_one
+        builder.build_one = lambda name: (order.append(name), real(name))[1]
+        assert builder.run_cycle(["v8", "v8b"], lambda: False) == 8
+        # Each engine's turn comes after the other's, until both are done.
+        assert order[:8] == ["v8", "v8b"] * 4
+
+    def test_a_cycle_is_bounded(self, builder, monkeypatch):
+        monkeypatch.setattr("slipstream.builder.MAX_JOBS_PER_CYCLE", 2)
+        assert builder.run_cycle(["v8"], lambda: False) == 2
+        assert builder.run_cycle(["v8"], lambda: False) == 2
+        assert builder.bus.keys("v8") == K(101, 102, 103, 104)
+
+    def test_a_failure_ends_the_engines_turns_for_the_cycle(self, builder):
+        """An infrastructure failure retried back to back is the same outage
+        hit again; the next cycle is when to look."""
+        builder.failures = [BuildStepError("sync", 1)]
+        assert builder.run_cycle(["v8"], lambda: False) == 0
+        assert len(builder.built) == 1
+        assert builder.run_cycle(["v8"], lambda: False) == 4
+
+    def test_each_engine_fetches_once_per_cycle(self, builder, monkeypatch):
+        fetched = []
+        monkeypatch.setattr(
+            builder.collector,
+            "head_commit_id",
+            lambda name, fetch=True: fetched.append((name, fetch)) or 999,
+        )
+        builder.run_cycle(["v8"], lambda: False)
+        assert fetched == [("v8", True)]
 
     def test_a_fetch_failure_skips_the_engine(self, builder, monkeypatch):
         from slipstream.collector import FetchError
@@ -642,6 +705,18 @@ class TestCycle:
     def test_a_stop_request_ends_the_cycle(self, builder):
         assert builder.run_cycle(["v8"], lambda: True) == 0
         assert builder.bus.keys("v8") == K()
+
+    def test_a_stop_request_ends_a_drain_after_the_current_job(self, builder):
+        stop = [False]
+        real = builder.build_one
+
+        def one_then_stop(name):
+            stop[0] = True
+            return real(name)
+
+        builder.build_one = one_then_stop
+        assert builder.run_cycle(["v8"], lambda: stop[0]) == 1
+        assert not builder.lock.held
 
 
 class TestReportedFrontier:

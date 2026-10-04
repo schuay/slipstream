@@ -233,6 +233,29 @@ class TestLocalFacts:
     def test_a_free_lock_says_so(self, env):
         report, _ = _status(env)
         assert report.lock_holder is None
+        assert report.lock_waiters == []
+
+    def test_the_queue_is_listed_behind_the_holder(self, env):
+        import threading
+
+        env.collector.lock.role = "watch"
+        env.collector.lock.try_acquire()
+        waiter = MachineLock("build", env.tmp_path / "machine.lock")
+        t = threading.Thread(
+            target=lambda: (waiter.acquire(wait=True, job="v8 101"), waiter.release())
+        )
+        t.start()
+        deadline = time.monotonic() + 5
+        while not env.collector.lock.waiters() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        report, _ = _status(env)
+        env.collector.lock.release()
+        t.join(timeout=5)
+        assert len(report.lock_waiters) == 1
+        assert "build" in report.lock_waiters[0] and "v8 101" in report.lock_waiters[0]
+        lines = []
+        render(report, lines.append)
+        assert any(line.startswith("  1. build") for line in lines)
 
 
 class TestEnvironmentDivergence:

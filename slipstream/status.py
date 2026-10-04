@@ -68,6 +68,7 @@ class BusStatus:
     engines: list[EngineStatus] = field(default_factory=list)
     free_gb: float = 0.0
     lock_holder: str | None = None
+    lock_waiters: list[str] = field(default_factory=list)
     paused_until: float | None = None
 
 
@@ -138,8 +139,10 @@ def collect_status(
         probe = probe.parent
     report.free_gb = shutil.disk_usage(probe).free / GB
     report.paused_until = paused_until()
-    holder = MachineLock("status").probe()
+    lock = MachineLock("status")
+    holder = lock.probe()
     report.lock_holder = str(holder) if holder else None
+    report.lock_waiters = [str(w) for w in lock.waiters()]
 
     for name in names:
         st = EngineStatus(engine=name)
@@ -235,6 +238,8 @@ def render(report: BusStatus, echo) -> None:
         echo(f"machine lock: held by {report.lock_holder}")
     else:
         echo("machine lock: free")
+    for i, waiter in enumerate(report.lock_waiters, 1):
+        echo(f"  {i}. {waiter}")
 
     for st in report.engines:
         echo("")

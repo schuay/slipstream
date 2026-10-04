@@ -5,9 +5,9 @@
 
 A consumer holds a cursor per (source, engine): the key of the last entry it
 finished with. Each cycle drains rather than handling one entry, since only
-a real bench costs hours and the machine lock and the handoff delay apply per
-bench, not per entry. Without that, a cursor reset two hundred entries back
-would take two hundred cycles to walk back up through the already-done ones.
+a real bench costs hours and the machine lock is taken per bench, not per
+entry. Without that, a cursor reset two hundred entries back would take two
+hundred cycles to walk back up through the already-done ones.
 
 Provisioning is deliberately identical to the builder's: the run root is an
 unpacked archive rather than a checkout, and nothing downstream knows the
@@ -52,6 +52,9 @@ GB = 1_000_000_000
 STALL_BACKOFF = 4
 STALL_BACKOFF_CAP_SECS = 6 * 3600
 DEFAULT_INTERVAL_SECS = 1800.0
+# The batch is re-listed after every bench, so a builder that keeps publishing
+# would otherwise keep one cycle going forever, past every state refresh.
+MAX_BENCHES_PER_CYCLE = 50
 
 
 class DrainResult(NamedTuple):
@@ -404,7 +407,7 @@ class BusConsumer:
         # commit per backoff instead of the whole backlog in one pass.
         limit = self.cfg.bench.max_consecutive_failures
         consecutive_failures = limit - 1 if stalled else 0
-        while not should_stop():
+        while not should_stop() and benched < MAX_BENCHES_PER_CYCLE:
             try:
                 batch = handle.keys_above(engine_name, cursor)
             except TRANSPORT_ERRORS as e:
@@ -483,6 +486,7 @@ class BusConsumer:
                     self.set_cursor(source, engine_name, cursor)
                     continue
                 entry = fresh
+                self.collector.lock.set_job(f"{engine_name} {key}")
                 state.in_flight = {
                     "commit_id": key.commit_id,
                     "embedder_id": key.embedder_id,

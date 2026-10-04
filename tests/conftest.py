@@ -23,12 +23,15 @@ def isolated_machine_lock(tmp_path_factory, monkeypatch):
     """Keep every test off the real ~/.cache/slipstream lock and pause file.
 
     The lock is per machine by design, so nothing points it at a temp path in
-    production; the defaults are read at call time so a test can.
+    production; the defaults are read at call time so a test can. The CLI
+    also moves itself into a process group of its own, which a pytest worker
+    must not do.
     """
     locks = tmp_path_factory.mktemp("locks")
     monkeypatch.setenv("XDG_CACHE_HOME", str(locks))
     monkeypatch.setattr(lock_mod, "MACHINE_LOCK", locks / "machine.lock")
     monkeypatch.setattr(lock_mod, "PAUSE_FILE", locks / "pause")
+    monkeypatch.setattr(lock_mod, "own_process_group", lambda: None)
 
 
 @pytest.fixture

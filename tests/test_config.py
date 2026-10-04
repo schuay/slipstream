@@ -430,6 +430,17 @@ class TestBuildAndBenchConfig:
         with pytest.raises(ValueError, match="positive"):
             load_config(_write(tmp_path, f"{section}\n{line}\n"))
 
+    def test_batch_defaults_to_draining(self, tmp_path):
+        assert load_config(_write(tmp_path, "")).build.batch == 0
+
+    def test_batch_value(self, tmp_path):
+        assert load_config(_write(tmp_path, "[build]\nbatch = 3\n")).build.batch == 3
+
+    @pytest.mark.parametrize("line", ["batch = -1", "batch = true", "batch = 1.5"])
+    def test_batch_must_be_a_whole_number(self, tmp_path, line):
+        with pytest.raises(ValueError, match="whole number"):
+            load_config(_write(tmp_path, f"[build]\n{line}\n"))
+
 
 def _bench_box(tmp_path, run_section):
     """A config that measures: engines and suites both configured."""

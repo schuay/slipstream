@@ -534,12 +534,17 @@ class BenchCollector:
 
         return BenchOutcome(configs_ok, configs_total, score_total)
 
-    def _take_machine_lock(self, should_stop: Callable[[], bool]) -> bool:
+    def _take_machine_lock(
+        self, should_stop: Callable[[], bool], job: str = ""
+    ) -> bool:
         """Acquire for one commit. False means a shutdown was requested."""
         if self.dry_run:
             return True
         return self.lock.acquire(
-            should_stop, wait=self.wait_for_lock, log=lambda m: self._log(f"  {m}")
+            should_stop,
+            wait=self.wait_for_lock,
+            log=lambda m: self._log(f"  {m}"),
+            job=job,
         )
 
     def bench_at_root(self, engine, commit, run_root, runs, provenance=None):
@@ -837,7 +842,7 @@ class BenchCollector:
 
             # The build and every run of this commit happen under one hold, so
             # a peer's build cannot land between two of its runs.
-            if not self._take_machine_lock(should_stop):
+            if not self._take_machine_lock(should_stop, f"{engine_name} {key}"):
                 break
             try:
                 t0 = time.time()
