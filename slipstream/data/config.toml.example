@@ -122,10 +122,10 @@ suite = "js3"
 # # refresh = true    # aggregate once per delivery cycle, including idle cycles
 # # Staging is in transition between two table designs (see spanner.py).
 # # write names what a push writes: "both" (default), "legacy" or "samples";
-# # aggregate_from names what refresh reads: "legacy" (default) or "samples".
+# # aggregate_from names what refresh reads: "samples" (default) or "legacy".
 # # Reading a design that is not written is rejected.
 # # write = "both"
-# # aggregate_from = "legacy"
+# # aggregate_from = "samples"
 #
 # A machine without Spanner access appends each push to a spool log:
 #

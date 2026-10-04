@@ -58,8 +58,8 @@ class PushTarget:
     spanner: "project/instance/database" of the perf database. ``refresh``
     aggregates once per delivery cycle, including idle cycles. ``write``
     names the staging design(s) a push writes and ``aggregate_from`` the one
-    refresh reads; the defaults write both and read the previous one, which
-    is the first step of the transition (see spanner.py).
+    refresh reads; the defaults write both and read the current design, so
+    the previous one keeps every row for a rollback (see spanner.py).
     """
 
     spool_dir: Path | None = None
@@ -67,7 +67,7 @@ class PushTarget:
     spanner: str | None = None
     refresh: bool = True
     write: str = "both"
-    aggregate_from: str = "legacy"
+    aggregate_from: str = "samples"
 
 
 @dataclass
@@ -952,7 +952,7 @@ def _parse_target(t: dict) -> PushTarget:
         )
     parse_spanner_spec(t["spanner"])
     write = t.get("write", "both")
-    aggregate_from = t.get("aggregate_from", "legacy")
+    aggregate_from = t.get("aggregate_from", "samples")
     try:
         check_modes(write, aggregate_from)
     except ValueError as e:

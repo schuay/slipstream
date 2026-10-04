@@ -744,8 +744,8 @@ class TestPushCsv:
     def _db(self, extra=()):
         return FakeDb([ALL_TABLES, *extra])
 
-    def test_stages_both_designs_then_aggregates_from_legacy(self):
-        db = self._db([[], [(T0,)], []])
+    def test_stages_both_designs_then_aggregates_from_samples(self):
+        db = self._db([[_dirty(bot="bot1", commit=100)], []])
         out = spanner.push_csv(db, "bot1", _csv({}, {"run": "2"}))
         assert out == "2 rows staged for bot1, aggregated"
         assert db.of("write") == [
@@ -755,16 +755,18 @@ class TestPushCsv:
         assert up[2] == spanner.IMPORT_COLUMNS and len(up[3]) == 2
         assert len(db.of("upsert", "samples")[0][3]) == 2
         assert db.of("pdml") == []
-        # The legacy watermark was written: that was the path aggregated.
-        assert db.calls[-1][2][0] == spanner.WATERMARK_KEY
-
-    def test_aggregates_from_samples_when_told(self):
-        db = self._db([[_dirty(bot="bot1", commit=100)], []])
-        out = spanner.push_csv(db, "bot1", _csv({}), aggregate_from="samples")
-        assert out == "1 rows staged for bot1, aggregated"
+        # The dirty groups were drained: that was the path aggregated.
         assert any("FROM samples s" in q[1] for q in db.of("query"))
         assert not any("imported_at" in q[1] for q in db.of("query"))
         assert db.calls[-1][1].startswith("DELETE FROM dirty_groups")
+
+    def test_aggregates_from_legacy_when_told(self):
+        db = self._db([[], [(T0,)], []])
+        out = spanner.push_csv(db, "bot1", _csv({}), aggregate_from="legacy")
+        assert out == "1 rows staged for bot1, aggregated"
+        assert not any("dirty_groups" in q[1] for q in db.of("query"))
+        # The legacy watermark was written: that was the path aggregated.
+        assert db.calls[-1][2][0] == spanner.WATERMARK_KEY
 
     def test_incompatible_modes_are_rejected_before_any_io(self):
         db = self._db()
@@ -788,7 +790,7 @@ class TestPushCsv:
     def test_rebuild_wipes_before_staging(self):
         db = self._db([[], [(None,)]])
         out = spanner.push_csv(db, "b", _csv({}), rebuild=True)
-        assert "(rebuild)" in out and "staging is empty" in out
+        assert "(rebuild)" in out and "no dirty groups" in out
         kinds = [c[0] for c in db.calls]
         assert kinds.index("pdml") < kinds.index("write")
         assert db.of("pdml")[0][2] == {"bot": "b"}

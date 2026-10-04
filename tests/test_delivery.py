@@ -574,9 +574,10 @@ class MarkerDb(FakeDb):
 
 
 def test_same_bot_different_payload_cannot_clear_exact_partial_marker(monkeypatch):
+    # The meta markers and the watermark are the legacy refresh path's.
     db = MarkerDb()
     monkeypatch.setattr("slipstream.spanner.connect", lambda spec, **kw: db)
-    session = SpannerSession(PushTarget(spanner="p/i/d"))
+    session = SpannerSession(PushTarget(spanner="p/i/d", aggregate_from="legacy"))
     original = Batch.remote("remote", "bot", 1, _csv({}, {"run": "2"}))
     db.partial = True
     with pytest.raises(RuntimeError):
@@ -599,7 +600,7 @@ def test_legacy_markers_require_explicit_reconciliation(monkeypatch):
     db = MarkerDb()
     db.markers["slipstream_incomplete_import:bot"] = "staging"
     monkeypatch.setattr("slipstream.spanner.connect", lambda spec, **kw: db)
-    session = SpannerSession(PushTarget(spanner="p/i/d"))
+    session = SpannerSession(PushTarget(spanner="p/i/d", aggregate_from="legacy"))
     session.stage(Batch.remote("remote", "bot", 1, _csv({})), "new")
     assert "incomplete" in session.refresh()
     session.reconcile_legacy("bot")

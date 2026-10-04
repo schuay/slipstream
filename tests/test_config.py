@@ -150,8 +150,8 @@ class TestRelayConfig:
         (t,) = cfg.push.targets
         assert (t.spanner, t.refresh, t.spool_dir) == ("p/i/d", False, None)
         # The transition defaults: write both designs, aggregate from the
-        # previous one.
-        assert (t.write, t.aggregate_from) == ("both", "legacy")
+        # current one; the previous table keeps every row for a rollback.
+        assert (t.write, t.aggregate_from) == ("both", "samples")
 
     @pytest.mark.parametrize(
         "write, aggregate_from",

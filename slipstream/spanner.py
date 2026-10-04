@@ -1120,7 +1120,7 @@ def push_csv(
     rebuild: bool = False,
     refresh_agg: bool = True,
     write: str = "both",
-    aggregate_from: str = "legacy",
+    aggregate_from: str = "samples",
 ) -> str:
     """Stage the CSV rows for ``bot`` and aggregate. Returns a summary line."""
     check_modes(write, aggregate_from)
