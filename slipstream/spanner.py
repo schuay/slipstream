@@ -3,15 +3,25 @@
 
 """Push export CSVs into the perf Spanner database and aggregate them.
 
-The database feeds other perf frontends, so the table shapes in
-``data/spanner_schema.sql`` (including the stored trace_id on benchmarks)
-are fixed; the indexes are slipstream's own. Rows land in the
-``slipstream`` staging table with an ``imported_at`` stamp; ``refresh``
-then re-aggregates only the (bot, benchmark, commit) groups that gained
-rows since the watermark in ``meta`` into ``benchmarks``. Both steps are
-idempotent: staging rows are upserted on their primary key and aggregates
-are recomputed over the full run set of a group, so a replayed push
-converges to the same state.
+The database feeds other perf frontends through ``benchmarks``, whose shape
+in ``data/spanner_schema.sql`` (including the stored trace_id) is fixed. The
+staging side is slipstream's own and is in transition between two designs,
+both described in the DDL file:
+
+* ``samples`` + ``commits`` + ``dirty_groups`` + ``imports``: a push writes
+  its samples, the commit they belong to and the groups it touched in one
+  commit; ``refresh`` drains ``dirty_groups``, re-aggregating each group
+  over its full run set, and deletes only what it read.
+* ``slipstream`` + ``meta``: the previous design, where a watermark over
+  ``imported_at`` finds what changed.
+
+A push target says which to write (``write``: legacy, both, samples) and
+which to aggregate from (``aggregate_from``: legacy, samples). The frontend
+labels, and with them trace_id, come out identical from both paths; the
+functions that derive them are pinned by tests against the live values.
+Both paths are idempotent: staging rows are upserted on their primary key
+and aggregates are recomputed over the full run set of a group, so a
+replayed push converges to the same state.
 
 All Spanner I/O goes through :class:`SpannerDb` so the mapping and SQL can
 be tested against a recording fake.
@@ -29,17 +39,37 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from importlib.resources import files as pkg_files
 from pathlib import Path
+from typing import NamedTuple
 
-from .config import parse_spanner_spec
+from .config import (  # noqa: F401  (WRITE_MODES, AGGREGATE_SOURCES re-exported)
+    AGGREGATE_SOURCES,
+    WRITE_MODES,
+    check_modes,
+    parse_spanner_spec,
+)
 
 IMPORT_TABLE = "slipstream"
 AGG_TABLE = "benchmarks"
 META_TABLE = "meta"
+SAMPLES_TABLE = "samples"
+COMMITS_TABLE = "commits"
+DIRTY_TABLE = "dirty_groups"
+IMPORTS_TABLE = "imports"
+STAGING_TABLES = (SAMPLES_TABLE, COMMITS_TABLE, DIRTY_TABLE, IMPORTS_TABLE)
 WATERMARK_KEY = "slipstream_last_imported_at"
 INCOMPLETE_PREFIX = "slipstream_incomplete_import:"
 # Indexes refresh() hints; declared in data/spanner_schema.sql.
 IMPORTED_AT_INDEX = "slipstream_imported_at_idx"
 GROUP_INDEX = "slipstream_group_idx"
+
+# What a push target may be told to write (WRITE_MODES) and to aggregate
+# from (AGGREGATE_SOURCES) is defined with the target in config.py, so the
+# config can validate the pair; see check_modes.
+
+# The value the client library turns into the commit timestamp of the
+# mutation, for columns declared with allow_commit_timestamp. Spelled out so
+# the mapping needs no google import.
+COMMIT_TIMESTAMP = "spanner.commit_timestamp()"
 
 # google-cloud-spanner switches for multiplexed sessions, per transaction type.
 _MULTIPLEXED_SESSION_ENV = (
@@ -78,6 +108,46 @@ AGG_COLUMNS = [
     "stdev",
     "count",
 ]
+SAMPLE_COLUMNS = [
+    "bot",
+    "suite",
+    "engine",
+    "variant",
+    "embedder_number",
+    "commit_number",
+    "test",
+    "metric",
+    "run",
+    "value",
+    "measured_at",
+    "imported_at",
+]
+COMMIT_COLUMNS = [
+    "engine",
+    "embedder_number",
+    "commit_number",
+    "git_hash",
+    "commit_time",
+    "title",
+    "embedder_hash",
+    "embedder_title",
+]
+DIRTY_COLUMNS = [
+    "bot",
+    "suite",
+    "engine",
+    "variant",
+    "embedder_number",
+    "commit_number",
+    "dirtied_at",
+]
+
+# Secondary indexes per table, for the mutation budget of a write: each row
+# costs about one mutation per column for the table and the same again per
+# index. benchmarks also has a stored generated column, counted as an index.
+_INDEXES = {IMPORT_TABLE: 2, AGG_TABLE: 2}
+# Each commit is limited to 80k mutations; aim for half.
+_MUTATION_BUDGET = 40_000
 
 # Suite names as the frontends know them.
 _BENCHMARK_ALIASES = {
@@ -167,22 +237,35 @@ class SpannerDb:
         )
 
     def upsert(self, table: str, columns: list[str], rows: list[tuple]) -> None:
-        # Each commit is limited to 80k mutations. A row costs about one per
-        # column for the table plus the same again per secondary index it
-        # touches; benchmarks has two indexes and a stored generated column,
-        # so budget three times the column count and aim for half the limit.
-        chunk = max(500, 40_000 // (max(1, len(columns)) * 3))
-        for i in range(0, len(rows), chunk):
+        self.write([(table, columns, rows)])
+
+    def write(self, groups: list[tuple[str, list[str], list[tuple]]]) -> None:
+        """Upsert rows into several tables, chunked, each chunk one commit.
+
+        Chunk k of every group goes into the same commit, so lists that are
+        parallel (one old-design and one new-design row per record) stay
+        together on disk: a push that dies between chunks leaves no record
+        in one table without the other. Small groups (the commit, the dirty
+        groups) are exhausted by the first chunk.
+        """
+        groups = [(t, c, r) for t, c, r in groups if r]
+        if not groups:
+            return
+        cost = sum(len(c) * (1 + _INDEXES.get(t, 0)) for t, c, _ in groups)
+        chunk = max(100, _MUTATION_BUDGET // cost)
+        longest = max(len(r) for _, _, r in groups)
+        for i in range(0, longest, chunk):
             started = time.monotonic()
+            parts = [(t, c, r[i : i + chunk]) for t, c, r in groups if r[i : i + chunk]]
             self._log(
-                f"write start table={table} chunk={i // chunk + 1} rows={len(rows[i : i + chunk])}"
+                f"write start chunk={i // chunk + 1} "
+                + " ".join(f"{t}={len(r)}" for t, _, r in parts)
             )
             with self._database.batch() as batch:
-                batch.insert_or_update(
-                    table=table, columns=columns, values=rows[i : i + chunk]
-                )
+                for table, columns, rows in parts:
+                    batch.insert_or_update(table=table, columns=columns, values=rows)
             self._log(
-                f"write complete table={table} elapsed={time.monotonic() - started:.3f}s"
+                f"write complete chunk={i // chunk + 1} elapsed={time.monotonic() - started:.3f}s"
             )
 
     def close(self) -> None:
@@ -280,7 +363,7 @@ def ensure_schema(db) -> None:
             "SELECT table_name FROM INFORMATION_SCHEMA.TABLES WHERE table_schema = ''"
         )
     }
-    if {IMPORT_TABLE, AGG_TABLE, META_TABLE} <= have:
+    if {IMPORT_TABLE, AGG_TABLE, META_TABLE, *STAGING_TABLES} <= have:
         return
     for stmt in schema_statements():
         db.execute(stmt)
@@ -312,7 +395,7 @@ def index_drift(db) -> tuple[list[str], list[str], list[str]]:
             "SELECT index_name, index_state FROM INFORMATION_SCHEMA.INDEXES"
             " WHERE table_schema = '' AND index_type = 'INDEX'"
             " AND table_name IN UNNEST(%s)",
-            [[IMPORT_TABLE, AGG_TABLE, META_TABLE]],
+            [[IMPORT_TABLE, AGG_TABLE, META_TABLE, *STAGING_TABLES]],
         )
     }
     missing = [n for n in declared if n not in live]
@@ -323,9 +406,41 @@ def index_drift(db) -> tuple[list[str], list[str], list[str]]:
 
 # --- Staging rows ---
 
+# What the frontends see. benchmarks keys on (bot, benchmark, test, submetric,
+# variant, commit_number) and stores a trace_id hashed from those labels, so
+# the two functions below must keep producing today's labels for every
+# existing series: the export CSV carries the suite short name and flags the
+# exporter has prefixed with the engine ("v8_default"), the previous ingest
+# stored "jetstream3.slipstream" and "v8 (v8_default)" and refresh reduced
+# the variant back to "v8_default" in SQL. The new tables store "js3", "v8"
+# and "default" and derive the same labels here. Pinned by tests against the
+# live DISTINCT values.
+
+
+def frontend_benchmark(suite: str) -> str:
+    return _BENCHMARK_ALIASES.get(suite, suite)
+
+
+def frontend_variant(engine: str, variant: str) -> str:
+    return f"{engine}_{variant}"
+
+
+def variant_of(engine: str, flags: str) -> str:
+    """The run's own flags, with the engine prefix the exporter adds removed.
+
+    Push's _export_rows writes flags as "<engine>_<flags>" so variants of
+    different engines stay distinct in a table without an engine column.
+    The new one has that column; the prefix would say it twice. Anything
+    else is not a slipstream export and is refused rather than guessed.
+    """
+    prefix = f"{engine}_"
+    if not engine or not flags.startswith(prefix):
+        raise ValueError(f"flags {flags!r} do not start with the engine {engine!r}")
+    return flags[len(prefix) :]
+
 
 def variant_label(engine: str, flags: str) -> str:
-    """Raw variant as stored in the staging table.
+    """Raw variant as stored in the previous staging table.
 
     Kept exactly as the previous ingest wrote it (the export has already
     prefixed flags with the engine, so the default variant of v8 reads
@@ -339,14 +454,59 @@ def variant_label(engine: str, flags: str) -> str:
     return f"{engine} ({flags})"
 
 
+# The previous design's strings, and what they encode. Total over the live
+# table on 2026-10-04; the backfill refuses anything outside it. Each entry
+# round-trips: frontend_variant(*LEGACY_VARIANTS[v]) is what refresh's SQL
+# made of v, and frontend_benchmark(LEGACY_BENCHMARKS[b]) == b.
+LEGACY_VARIANTS = {
+    "v8 (v8_default)": ("v8", "default"),
+    "v8 (v8_per_line_item)": ("v8", "per_line_item"),
+    "v8 (v8_turbolev_future)": ("v8", "turbolev_future"),
+    "jsc (jsc_default)": ("jsc", "default"),
+    "jsc (jsc_per_line_item)": ("jsc", "per_line_item"),
+}
+LEGACY_BENCHMARKS = {
+    "jetstream2.slipstream": "js2",
+    "jetstream3.slipstream": "js3",
+}
+
+
+def legacy_identity(variant: str, benchmark: str) -> tuple[str, str, str]:
+    """(engine, variant, suite) of a previous-design row; total or an error."""
+    try:
+        engine, clean = LEGACY_VARIANTS[variant]
+        return engine, clean, LEGACY_BENCHMARKS[benchmark]
+    except KeyError as e:
+        raise ValueError(f"no pinned mapping for legacy value {e.args[0]!r}") from e
+
+
+def _commit_time(text) -> datetime | None:
+    # Shared by both designs' rows so that commits.commit_time is exactly
+    # what the previous design stored, and the aggregates agree.
+    text = str(text).strip()
+    return datetime.fromtimestamp(int(text), tz=timezone.utc) if text else None
+
+
+def _measured_at(text) -> datetime | None:
+    # The store keeps 0 for "unknown"; that is NULL, not 1970.
+    text = str(text).strip()
+    return (
+        datetime.fromtimestamp(int(text), tz=timezone.utc)
+        if text and int(text) > 0
+        else None
+    )
+
+
 def rows_from_csv(csv_text: str, bot: str, imported_at: datetime) -> list[tuple]:
-    """Map export CSV rows to staging rows in IMPORT_COLUMNS order."""
-    reader = csv.DictReader(io.StringIO(csv_text), skipinitialspace=True)
+    """Map export CSV rows to previous-design rows in IMPORT_COLUMNS order."""
+    return rows_from_records(records_from_csv(csv_text), bot, imported_at)
+
+
+def records_from_csv(csv_text: str) -> list[tuple]:
     from .delivery_batch import COLUMNS
 
-    return rows_from_records(
-        [tuple(r.get(c, "") for c in COLUMNS) for r in reader], bot, imported_at
-    )
+    reader = csv.DictReader(io.StringIO(csv_text), skipinitialspace=True)
+    return [tuple(r.get(c, "") for c in COLUMNS) for r in reader]
 
 
 def rows_from_records(records, bot: str, imported_at: datetime) -> list[tuple]:
@@ -356,19 +516,17 @@ def rows_from_records(records, bot: str, imported_at: datetime) -> list[tuple]:
     for record in records:
         r = dict(zip(COLUMNS, record))
         suite = r["suite"].strip()
-        ts = str(r.get("commit_timestamp", "")).strip()
-        commit_time = datetime.fromtimestamp(int(ts), tz=timezone.utc) if ts else None
         rows.append(
             (
                 bot,
-                _BENCHMARK_ALIASES.get(suite, suite),
+                frontend_benchmark(suite),
                 r["benchmark"].strip(),
                 r["metric"].strip(),
                 variant_label(r["engine"].strip(), r["flags"].strip()),
                 r["platform"].strip(),
                 int(str(r["commit_id"])),
                 int(str(r["run"])),
-                commit_time,
+                _commit_time(r.get("commit_timestamp", "")),
                 r.get("git_hash", "").strip() or None,
                 float(r["score"]),
                 imported_at,
@@ -377,35 +535,164 @@ def rows_from_records(records, bot: str, imported_at: datetime) -> list[tuple]:
     return rows
 
 
+class Staging(NamedTuple):
+    """One push's rows for the current design, in column order."""
+
+    samples: list[tuple]
+    commits: list[tuple]
+    dirty: list[tuple]
+
+
+def staging_rows(records, bot: str) -> Staging:
+    """Map export CSV records to samples, their commits and dirty groups.
+
+    The export carries no embedder: everything delivery reads is embedder 0
+    (see CommitStore.export_scores), and the perf database has no coordinate
+    for anything else yet. Timestamps that are commit timestamps carry the
+    sentinel; the commit's title comes along, the embedder columns stay
+    NULL until the export has them.
+    """
+    from .delivery_batch import COLUMNS
+
+    samples = []
+    commits: dict[tuple, tuple] = {}
+    dirty: dict[tuple, tuple] = {}
+    for record in records:
+        r = dict(zip(COLUMNS, record))
+        engine = r["engine"].strip()
+        variant = variant_of(engine, r["flags"].strip())
+        suite = r["suite"].strip()
+        commit = int(str(r["commit_id"]))
+        group = (bot, suite, engine, variant, 0, commit)
+        samples.append(
+            (
+                *group,
+                r["benchmark"].strip(),
+                r["metric"].strip(),
+                int(str(r["run"])),
+                float(r["score"]),
+                _measured_at(r.get("timestamp", "")),
+                COMMIT_TIMESTAMP,
+            )
+        )
+        commits.setdefault(
+            (engine, 0, commit),
+            (
+                engine,
+                0,
+                commit,
+                r.get("git_hash", "").strip() or None,
+                _commit_time(r.get("commit_timestamp", "")),
+                r.get("commit_title", "").strip() or None,
+                None,
+                None,
+            ),
+        )
+        dirty.setdefault(group, (*group, COMMIT_TIMESTAMP))
+    return Staging(samples, list(commits.values()), list(dirty.values()))
+
+
 def current_timestamp(db) -> datetime:
     """Return Spanner's clock for ordering imports across clients."""
     return _to_utc(db.query("SELECT CURRENT_TIMESTAMP()")[0][0])
 
 
-def wipe_bot(db, bot: str) -> int:
-    return db.partitioned_dml(
-        f"DELETE FROM {IMPORT_TABLE} WHERE bot = @bot", {"bot": bot}
-    )
+def _check_write(write: str) -> None:
+    if write not in WRITE_MODES:
+        raise ValueError(f"write must be one of {WRITE_MODES}, not {write!r}")
 
 
-def rebuild_bot(db, bot: str) -> int:
+def staging_groups(db, records, bot: str, *, write: str = "both") -> list[tuple]:
+    """One push's rows per staging table, as :meth:`SpannerDb.write` takes them.
+
+    Mapping happens here, before anything is written, so a record that
+    does not map costs nothing. Note the timestamp of the previous-design
+    rows is read from the database at mapping time.
+    """
+    _check_write(write)
+    records = list(records)
+    if not records:
+        return []
+    groups = []
+    if write != "samples":
+        groups.append(
+            (
+                IMPORT_TABLE,
+                IMPORT_COLUMNS,
+                rows_from_records(records, bot, current_timestamp(db)),
+            )
+        )
+    if write != "legacy":
+        staged = staging_rows(records, bot)
+        groups += [
+            (SAMPLES_TABLE, SAMPLE_COLUMNS, staged.samples),
+            (COMMITS_TABLE, COMMIT_COLUMNS, staged.commits),
+            (DIRTY_TABLE, DIRTY_COLUMNS, staged.dirty),
+        ]
+    return groups
+
+
+def stage_records(db, records, bot: str, *, write: str = "both") -> int:
+    """Upsert one push's records into the staging tables ``write`` names.
+
+    With both designs written, each chunk carries its records' rows for
+    both in one commit (see :meth:`SpannerDb.write`), so there is never a
+    sample without its previous-design row or the other way round.
+    """
+    records = list(records)
+    db.write(staging_groups(db, records, bot, write=write))
+    return len(records)
+
+
+def wipe_bot(db, bot: str, *, write: str = "both") -> int:
+    """Delete a bot's staging rows; returns how many previous-design rows went.
+
+    commits stays: it is per engine, and another bot may have measured the
+    same commit.
+    """
+    _check_write(write)
+    count = 0
+    if write != "samples":
+        count = db.partitioned_dml(
+            f"DELETE FROM {IMPORT_TABLE} WHERE bot = @bot", {"bot": bot}
+        )
+    if write != "legacy":
+        count = max(
+            count,
+            db.partitioned_dml(
+                f"DELETE FROM {SAMPLES_TABLE} WHERE bot = @bot", {"bot": bot}
+            ),
+        )
+        db.partitioned_dml(f"DELETE FROM {DIRTY_TABLE} WHERE bot = @bot", {"bot": bot})
+    return count
+
+
+def rebuild_bot(db, bot: str, *, write: str = "both") -> int:
     """Explicit destructive repair, including obsolete aggregate score keys."""
-    count = wipe_bot(db, bot)
+    count = wipe_bot(db, bot, write=write)
     db.partitioned_dml(
         f"DELETE FROM {AGG_TABLE} WHERE bot = @bot AND source = 'slipstream'",
         {"bot": bot},
     )
     # After the explicit full wipe, old imports for this bot contain no partial
     # raw rows. Preserve other bots' markers and the global refresh watermark.
-    db.partitioned_dml(
-        f"DELETE FROM {META_TABLE} WHERE key = @legacy OR "
-        "(STARTS_WITH(key, @prefix) AND STARTS_WITH(value, @bot))",
-        {
-            "legacy": INCOMPLETE_PREFIX + bot,
-            "prefix": INCOMPLETE_PREFIX + "attempt:",
-            "bot": f"{len(bot)}:{bot}:",
-        },
-    )
+    if write != "samples":
+        db.partitioned_dml(
+            f"DELETE FROM {META_TABLE} WHERE key = @legacy OR "
+            "(STARTS_WITH(key, @prefix) AND STARTS_WITH(value, @bot))",
+            {
+                "legacy": INCOMPLETE_PREFIX + bot,
+                "prefix": INCOMPLETE_PREFIX + "attempt:",
+                "bot": f"{len(bot)}:{bot}:",
+            },
+        )
+    if write != "legacy":
+        # Finished imports stay as the ledger; an open one is what the wipe
+        # just made moot.
+        db.partitioned_dml(
+            f"DELETE FROM {IMPORTS_TABLE} WHERE bot = @bot AND finished_at IS NULL",
+            {"bot": bot},
+        )
     return count
 
 
@@ -500,8 +787,13 @@ def _geomean_totals(rows: list[tuple]) -> list[tuple]:
         bot, benchmark, variant, commit = key
 
         def geo(col, floor=None):
+            # fsum is exactly rounded, so the result does not depend on the
+            # order the line items came out of SQL or on the Python version
+            # (plain sum is naive before 3.12 and compensated after); the two
+            # staging designs return items in different orders, and a Total
+            # must not differ by an ulp between them.
             vals = [r[col] if floor is None else max(r[col], floor) for r in items]
-            return math.exp(sum(math.log(v) for v in vals) / len(vals))
+            return math.exp(math.fsum(math.log(v) for v in vals) / len(vals))
 
         times = [r[6] for r in items if r[6] is not None]
         hashes = [r[7] for r in items if r[7] is not None]
@@ -526,14 +818,33 @@ def _geomean_totals(rows: list[tuple]) -> list[tuple]:
     return out
 
 
-def refresh(db) -> str | None:
+def refresh(db, *, source: str = "legacy") -> str | None:
     """Aggregate staging into benchmarks. Returns None when it ran, else why not.
+
+    ``source`` names the staging design to read: the previous one with its
+    watermark (:func:`_refresh_legacy`) or the current one with its dirty
+    groups (:func:`_refresh_samples`). Both recompute each affected group
+    over its full run set, so a group aggregated by either path lands the
+    same, and both leave their change-tracking state alone until the
+    aggregates are written, so a failed run is retried next time.
+    """
+    if source not in AGGREGATE_SOURCES:
+        raise ValueError(
+            f"aggregate_from must be one of {AGGREGATE_SOURCES}, not {source!r}"
+        )
+    if source == "samples":
+        return _refresh_samples(db)
+    return _refresh_legacy(db)
+
+
+def _refresh_legacy(db) -> str | None:
+    """The watermark path over the previous staging table.
 
     Every (bot, benchmark, commit) group with a row newer than the watermark
     in ``meta`` is recomputed over its full run set: line items (every test
     but Overall, variants cleaned) and test 'Total' from Overall/Total-Score,
     or for JS2 groups without one, the geomean of the line items. The
-    watermark advances last, so a failed run is retried next time.
+    watermark advances last.
 
     Reads stay proportional to the new rows: the changed groups come off
     the imported_at index, and each (bot, benchmark) pair is then read
@@ -600,32 +911,188 @@ def refresh(db) -> str | None:
     return None
 
 
+# The same aggregation over the current design. The group prefix (bot,
+# suite, engine, variant, embedder) is a parameter, so what the SQL groups
+# by is just the commit and the test; the frontend labels are derived in
+# Python from the prefix. commit identity comes from commits; LEFT JOIN so a
+# sample never disappears from its aggregate, it at worst lacks a time and
+# hash as the previous design allowed. Filter and statistics are those of
+# _AGG_SELECT, which is what makes the two paths agree.
+_SAMPLES_AGG_SELECT = f"""
+    SELECT
+        s.commit_number, IF(s.test = 'Overall', 'Total', s.test) AS test,
+        MIN(c.commit_time), MIN(c.git_hash),
+        AVG(s.value), MIN(s.value), MAX(s.value),
+        COALESCE(STDDEV_SAMP(s.value), 0.0), COUNT(*)
+    FROM {SAMPLES_TABLE} s
+    LEFT JOIN {COMMITS_TABLE} c
+      ON c.engine = s.engine AND c.embedder_number = s.embedder_number
+     AND c.commit_number = s.commit_number
+    WHERE s.bot = %s AND s.suite = %s AND s.engine = %s AND s.variant = %s
+      AND s.embedder_number = %s
+      AND ((s.test != 'Overall' AND s.metric IN ('Total-Score', 'Score', ''))
+           OR (s.test = 'Overall' AND s.metric = 'Total-Score'))
+      {{where}}
+    GROUP BY s.commit_number, IF(s.test = 'Overall', 'Total', s.test)
+"""
+
+
+def aggregate_samples(
+    db,
+    bot: str,
+    suite: str,
+    engine: str,
+    variant: str,
+    embedder: int,
+    commits: list[int] | None = None,
+) -> list[tuple]:
+    """benchmarks rows (AGG_COLUMNS order) for one group prefix from samples.
+
+    ``commits`` restricts to those commit numbers; None means every commit
+    of the prefix, which is what a full re-aggregation or a validator wants.
+    The JS2 geomean totals are not included: callers add
+    :func:`_geomean_totals` over the complete row set, as refresh does.
+    """
+    params: list = [bot, suite, engine, variant, embedder]
+    where = ""
+    if commits is not None:
+        where = "AND s.commit_number IN UNNEST(%s)"
+        params.append(sorted(commits))
+    benchmark = frontend_benchmark(suite)
+    label = frontend_variant(engine, variant)
+    rows = []
+    for commit, test, commit_time, git_hash, *stats in db.query(
+        _SAMPLES_AGG_SELECT.format(where=where), params
+    ):
+        rows.append(
+            _clean(
+                (
+                    bot,
+                    benchmark,
+                    test,
+                    "",
+                    label,
+                    commit,
+                    commit_time,
+                    git_hash,
+                    "slipstream",
+                    *stats,
+                )
+            )
+        )
+    return rows
+
+
+def _refresh_samples(db) -> str | None:
+    """The dirty-group path over the current staging tables.
+
+    Every group in ``dirty_groups`` is recomputed over its full run set and
+    the dirty rows are deleted last, by timestamp rather than by key: the
+    read was a strong snapshot, so every row with dirtied_at no later than
+    the newest one read was in it, and a group dirtied again by a push that
+    committed after the snapshot carries a later timestamp and survives for
+    the next refresh. A failed refresh leaves everything dirty.
+
+    benchmarks has no column for an embedder, so a dirty group outside
+    embedder 0 cannot be represented there; push never writes one, and
+    rather than aggregate something half-described or skip it silently,
+    refresh stops until an operator looks.
+    """
+    incomplete = db.query(
+        f"SELECT attempt FROM {IMPORTS_TABLE} WHERE finished_at IS NULL LIMIT 1"
+    )
+    if incomplete:
+        return (
+            f"an import is incomplete (attempt {incomplete[0][0]});"
+            " shared-target refresh blocked"
+        )
+    dirty = db.query(f"SELECT {', '.join(DIRTY_COLUMNS)} FROM {DIRTY_TABLE}")
+    if not dirty:
+        return "no dirty groups since the last refresh"
+    outside = [r for r in dirty if r[4] != 0]
+    if outside:
+        return (
+            f"{len(outside)} dirty groups are outside embedder 0"
+            f" (first: {outside[0][:6]}); benchmarks has no column for that"
+        )
+    cutoff = max(r[6] for r in dirty)
+    prefixes: dict[tuple, list[int]] = defaultdict(list)
+    for *prefix, commit, _ in dirty:
+        prefixes[tuple(prefix)].append(commit)
+    rows = []
+    for prefix, nums in sorted(prefixes.items()):
+        rows += aggregate_samples(db, *prefix, commits=nums)
+    rows += _geomean_totals(rows)
+    if rows:
+        db.upsert(AGG_TABLE, AGG_COLUMNS, rows)
+    db.execute(f"DELETE FROM {DIRTY_TABLE} WHERE dirtied_at <= %s", [cutoff])
+    return None
+
+
 # --- Entry point used by push targets ---
 
 
-def stage_rows(db, rows: list[tuple]) -> int:
-    """Upsert mapped rows into staging; returns the row count."""
-    if rows:
-        db.upsert(IMPORT_TABLE, IMPORT_COLUMNS, rows)
-    return len(rows)
+class ImportHandle(NamedTuple):
+    """What :func:`begin_import` recorded, for :func:`finish_import` to close.
 
-
-def begin_import(db, bot: str, attempt: str, digest: str) -> str:
-    """Only the exact interrupted attempt may clear its own import marker.
-
-    Legacy per-bot markers deliberately remain until explicit reconciliation.
+    ``marker`` is the previous design's meta key, ``ledger`` says whether an
+    imports row is open; either may be absent depending on the write mode.
     """
-    key = f"{INCOMPLETE_PREFIX}attempt:{attempt}"
-    db.execute(
-        f"INSERT OR UPDATE INTO {META_TABLE} (key, value) VALUES (%s, %s)",
-        [key, f"{len(bot)}:{bot}:{digest}"],
-    )
-    return key
+
+    attempt: str
+    marker: str | None
+    ledger: bool
 
 
-def finish_import(db, key: str) -> None:
-    """Clear the marker only after every staging chunk committed."""
-    db.execute(f"DELETE FROM {META_TABLE} WHERE key = %s", [key])
+def begin_import(
+    db, bot: str, attempt: str, digest: str, *, write: str = "both"
+) -> ImportHandle:
+    """Record that ``attempt`` is staging, before its first chunk commits.
+
+    Both designs block refresh while a record is open. The previous one
+    keys a meta row by attempt, so only the exact interrupted attempt
+    clears its own marker (legacy per-bot markers deliberately remain until
+    explicit reconciliation). The current one opens an imports row; a
+    retry of the attempt reopens it, finished_at and all, so an attempt
+    that died between its last chunk and the receipt is open again until
+    it finishes once more.
+    """
+    _check_write(write)
+    marker = None
+    if write != "samples":
+        marker = f"{INCOMPLETE_PREFIX}attempt:{attempt}"
+        db.execute(
+            f"INSERT OR UPDATE INTO {META_TABLE} (key, value) VALUES (%s, %s)",
+            [marker, f"{len(bot)}:{bot}:{digest}"],
+        )
+    ledger = write != "legacy"
+    if ledger:
+        db.execute(
+            f"INSERT OR UPDATE INTO {IMPORTS_TABLE}"
+            " (attempt, bot, digest, started_at, finished_at, row_count)"
+            " VALUES (%s, %s, %s, PENDING_COMMIT_TIMESTAMP(), NULL, NULL)",
+            [attempt, bot, digest],
+        )
+    return ImportHandle(attempt, marker, ledger)
+
+
+def finish_import(db, handle: ImportHandle | str, rows: int | None = None) -> None:
+    """Close the record only after every staging chunk committed.
+
+    A bare string is a meta key, for clearing a previous-design marker on
+    its own (see reconcile_legacy). ``rows`` goes into the ledger.
+    """
+    if isinstance(handle, str):
+        handle = ImportHandle("", handle, False)
+    if handle.marker is not None:
+        db.execute(f"DELETE FROM {META_TABLE} WHERE key = %s", [handle.marker])
+    if handle.ledger:
+        db.execute(
+            f"UPDATE {IMPORTS_TABLE}"
+            " SET finished_at = PENDING_COMMIT_TIMESTAMP(), row_count = %s"
+            " WHERE attempt = %s",
+            [rows, handle.attempt],
+        )
 
 
 def summary_line(
@@ -646,25 +1113,36 @@ def summary_line(
 
 
 def push_csv(
-    db, bot: str, csv_text: str, *, rebuild: bool = False, refresh_agg: bool = True
+    db,
+    bot: str,
+    csv_text: str,
+    *,
+    rebuild: bool = False,
+    refresh_agg: bool = True,
+    write: str = "both",
+    aggregate_from: str = "legacy",
 ) -> str:
     """Stage the CSV rows for ``bot`` and aggregate. Returns a summary line."""
+    check_modes(write, aggregate_from)
     ensure_schema(db)
     # Mapping first: a CSV that fails to parse must not cost the bot its
     # staged rows on a rebuild.
-    rows = rows_from_csv(csv_text, bot, current_timestamp(db))
+    records = records_from_csv(csv_text)
+    groups = staging_groups(db, records, bot, write=write)
     if rebuild:
-        wipe_bot(db, bot)
+        wipe_bot(db, bot, write=write)
     from .durability import identity_digest
 
     digest = identity_digest(csv_text)
-    marker = begin_import(db, bot, identity_digest(bot + ":" + digest), digest)
-    n_rows = stage_rows(db, rows)
-    finish_import(db, marker)
+    handle = begin_import(
+        db, bot, identity_digest(bot + ":" + digest), digest, write=write
+    )
+    db.write(groups)
+    finish_import(db, handle, len(records))
     return summary_line(
         bot,
-        n_rows,
+        len(records),
         rebuild=rebuild,
-        skipped=refresh(db) if refresh_agg else None,
+        skipped=refresh(db, source=aggregate_from) if refresh_agg else None,
         refreshed=refresh_agg,
     )

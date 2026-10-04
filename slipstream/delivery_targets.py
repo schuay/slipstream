@@ -77,12 +77,16 @@ class SpannerSession:
     def stage(self, batch, attempt):
         from . import spanner
 
-        rows = spanner.rows_from_records(
-            batch.rows, batch.bot, spanner.current_timestamp(self.db)
+        write = self.target.write
+        # Map before opening the import record: a batch that does not map
+        # leaves nothing behind to block refresh.
+        groups = spanner.staging_groups(self.db, batch.rows, batch.bot, write=write)
+        handle = spanner.begin_import(
+            self.db, batch.bot, attempt, batch.digest, write=write
         )
-        marker = spanner.begin_import(self.db, batch.bot, attempt, batch.digest)
-        count = spanner.stage_rows(self.db, rows)
-        spanner.finish_import(self.db, marker)
+        self.db.write(groups)
+        count = len(batch.rows)
+        spanner.finish_import(self.db, handle, count)
         self.log(f"staged bot={batch.bot} attempt={attempt} rows={count}")
         return Receipt(self.identity, attempt, batch.digest)
 
@@ -91,12 +95,12 @@ class SpannerSession:
 
         if not self.target.refresh:
             return "refresh=false; staging only"
-        return spanner.refresh(self.db)
+        return spanner.refresh(self.db, source=self.target.aggregate_from)
 
     def wipe(self, bot):
         from . import spanner
 
-        return spanner.rebuild_bot(self.db, bot)
+        return spanner.rebuild_bot(self.db, bot, write=self.target.write)
 
     def reconcile_legacy(self, bot):
         from . import spanner

@@ -149,6 +149,57 @@ class TestRelayConfig:
         )
         (t,) = cfg.push.targets
         assert (t.spanner, t.refresh, t.spool_dir) == ("p/i/d", False, None)
+        # The transition defaults: write both designs, aggregate from the
+        # previous one.
+        assert (t.write, t.aggregate_from) == ("both", "legacy")
+
+    @pytest.mark.parametrize(
+        "write, aggregate_from",
+        [
+            ("legacy", "legacy"),
+            ("both", "legacy"),
+            ("both", "samples"),
+            ("samples", "samples"),
+        ],
+    )
+    def test_staging_modes(self, tmp_path, write, aggregate_from):
+        cfg = load_config(
+            _write(
+                tmp_path,
+                '[push]\nbot_name = "m"\n[[push.targets]]\nspanner = "p/i/d"\n'
+                f'write = "{write}"\naggregate_from = "{aggregate_from}"\n',
+            )
+        )
+        (t,) = cfg.push.targets
+        assert (t.write, t.aggregate_from) == (write, aggregate_from)
+
+    @pytest.mark.parametrize(
+        "lines, message",
+        [
+            ('write = "legacy"\naggregate_from = "samples"', "does not write"),
+            ('write = "samples"\naggregate_from = "legacy"', "does not write"),
+            ('write = "all"', "write must be one of"),
+            ('aggregate_from = "both"', "aggregate_from must be one of"),
+        ],
+    )
+    def test_incompatible_or_unknown_modes_are_rejected(self, tmp_path, lines, message):
+        with pytest.raises(ValueError, match=message):
+            load_config(
+                _write(
+                    tmp_path,
+                    f'[push]\nbot_name = "m"\n[[push.targets]]\nspanner = "p/i/d"\n{lines}\n',
+                )
+            )
+
+    @pytest.mark.parametrize("key", ["write", "aggregate_from"])
+    def test_modes_only_for_spanner(self, tmp_path, key):
+        with pytest.raises(ValueError, match=f"{key} applies to spanner"):
+            load_config(
+                _write(
+                    tmp_path,
+                    f'[push]\nbot_name = "m"\n[[push.targets]]\nspool_dir = "o"\n{key} = "legacy"\n',
+                )
+            )
 
     def test_bad_spanner_spec_rejected_at_load(self, tmp_path):
         with pytest.raises(ValueError, match="project/instance/database"):

@@ -205,14 +205,16 @@ class TestDeliveryAdmin:
 
         class Db:
             def query(self, *args):
-                return [("slipstream",), ("benchmarks",), ("meta",)]
+                from tests.test_spanner import ALL_TABLES
+
+                return ALL_TABLES
 
             def close(self):
                 wiped.append("closed")
 
         monkeypatch.setattr(spanner, "connect", lambda spec, **kw: Db())
         monkeypatch.setattr(
-            spanner, "rebuild_bot", lambda db, bot: wiped.append(bot) or 3
+            spanner, "rebuild_bot", lambda db, bot, **kw: wiped.append(bot) or 3
         )
         cfg = self._cfg(tmp_path, 'spanner = "p/i/d"')
         res = self._run(cfg, ["--rebuild", "b2"], monkeypatch)

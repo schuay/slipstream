@@ -22,7 +22,7 @@ from slipstream.push import parse_seq, spool_append
 from slipstream.relay import read_cursor
 from slipstream.store import StoreError
 from tests.test_push import VALID, _seed
-from tests.test_spanner import FakeDb, T0, _csv
+from tests.test_spanner import ALL_TABLES, FakeDb, T0, _csv
 
 
 class MemorySpool:
@@ -544,7 +544,7 @@ class MarkerDb(FakeDb):
 
             return [(name, "READ_WRITE") for name in spanner.declared_indexes()]
         if "INFORMATION_SCHEMA" in sql:
-            return [("slipstream",), ("benchmarks",), ("meta",)]
+            return ALL_TABLES
         if "STARTS_WITH(key" in sql:
             return [(k,) for k in self.markers][:1]
         if "MAX(imported_at)" in sql:
@@ -651,7 +651,8 @@ def test_one_session_accepts_multiple_bot_identities_and_refreshes_once(
     )
     assert cycle(c) == 2
     assert len(opened) == 1
-    assert {call[3][0][0] for call in db.of("upsert")} == {"bot", "other"}
+    assert {call[3][0][0] for call in db.of("upsert", "slipstream")} == {"bot", "other"}
+    assert {call[3][0][0] for call in db.of("upsert", "samples")} == {"bot", "other"}
     assert db.calls[-1] == ("close",)
 
 

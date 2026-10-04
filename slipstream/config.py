@@ -22,6 +22,32 @@ def parse_spanner_spec(spec: str) -> tuple[str, str, str]:
     return parts[0], parts[1], parts[2]
 
 
+# The perf database's staging side is in transition between two designs
+# (see spanner.py). A target says which to write and which refresh reads.
+WRITE_MODES = ("legacy", "both", "samples")
+AGGREGATE_SOURCES = ("legacy", "samples")
+
+
+def check_modes(write: str, aggregate_from: str) -> None:
+    """Reject a write/aggregate pair that reads a design nothing writes.
+
+    Aggregating from a table that is no longer written would stage every
+    push into one place and look for it in another; the push would appear
+    to succeed and the frontends would never see it.
+    """
+    if write not in WRITE_MODES:
+        raise ValueError(f"write must be one of {WRITE_MODES}, not {write!r}")
+    if aggregate_from not in AGGREGATE_SOURCES:
+        raise ValueError(
+            f"aggregate_from must be one of {AGGREGATE_SOURCES}, not {aggregate_from!r}"
+        )
+    if write != "both" and write != aggregate_from:
+        raise ValueError(
+            f"aggregate_from = {aggregate_from!r} reads tables that"
+            f" write = {write!r} does not write"
+        )
+
+
 @dataclass
 class PushTarget:
     """Where an export CSV goes. Exactly one of spool_dir, spanner.
@@ -30,13 +56,18 @@ class PushTarget:
     with access to the real target to collect with ``slipstream deliver``.
     ``retain_days`` bounds how long entries are kept.
     spanner: "project/instance/database" of the perf database. ``refresh``
-    aggregates once per delivery cycle, including idle cycles.
+    aggregates once per delivery cycle, including idle cycles. ``write``
+    names the staging design(s) a push writes and ``aggregate_from`` the one
+    refresh reads; the defaults write both and read the previous one, which
+    is the first step of the transition (see spanner.py).
     """
 
     spool_dir: Path | None = None
     retain_days: int = 90
     spanner: str | None = None
     refresh: bool = True
+    write: str = "both"
+    aggregate_from: str = "legacy"
 
 
 @dataclass
@@ -895,14 +926,17 @@ def _parse_target(t: dict) -> PushTarget:
             "directly, or to a spool_dir for a machine that can"
         )
     _reject_unknown(
-        t, ("spool_dir", "retain_days", "spanner", "refresh"), "[[push.targets]]"
+        t,
+        ("spool_dir", "retain_days", "spanner", "refresh", "write", "aggregate_from"),
+        "[[push.targets]]",
     )
     kinds = [k for k in ("spool_dir", "spanner") if k in t]
     if len(kinds) != 1:
         raise ValueError("[[push.targets]] needs exactly one of spool_dir, spanner")
     kind = kinds[0]
-    if kind != "spanner" and "refresh" in t:
-        raise ValueError("[[push.targets]] refresh applies to spanner targets only")
+    for key in ("refresh", "write", "aggregate_from"):
+        if kind != "spanner" and key in t:
+            raise ValueError(f"[[push.targets]] {key} applies to spanner targets only")
     if kind != "spool_dir" and "retain_days" in t:
         raise ValueError("[[push.targets]] retain_days applies to spool targets only")
     if kind == "spool_dir":
@@ -917,7 +951,18 @@ def _parse_target(t: dict) -> PushTarget:
             spool_dir=Path(t["spool_dir"]).expanduser(), retain_days=retain_days
         )
     parse_spanner_spec(t["spanner"])
-    return PushTarget(spanner=t["spanner"], refresh=t.get("refresh", True))
+    write = t.get("write", "both")
+    aggregate_from = t.get("aggregate_from", "legacy")
+    try:
+        check_modes(write, aggregate_from)
+    except ValueError as e:
+        raise ValueError(f"[[push.targets]] {e}") from e
+    return PushTarget(
+        spanner=t["spanner"],
+        refresh=t.get("refresh", True),
+        write=write,
+        aggregate_from=aggregate_from,
+    )
 
 
 def validate_delivery_identities(push, sources):

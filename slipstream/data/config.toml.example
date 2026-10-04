@@ -120,6 +120,12 @@ suite = "js3"
 # [[push.targets]]
 # spanner = "project/instance/database"
 # # refresh = true    # aggregate once per delivery cycle, including idle cycles
+# # Staging is in transition between two table designs (see spanner.py).
+# # write names what a push writes: "both" (default), "legacy" or "samples";
+# # aggregate_from names what refresh reads: "legacy" (default) or "samples".
+# # Reading a design that is not written is rejected.
+# # write = "both"
+# # aggregate_from = "legacy"
 #
 # A machine without Spanner access appends each push to a spool log:
 #

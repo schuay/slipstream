@@ -3,10 +3,86 @@
 
 -- Spanner schema (GoogleSQL). This is the authoritative DDL for the tables
 -- slipstream pushes into; index changes are applied to the live database by
--- hand to match it. The database feeds other perf frontends, so the tables,
--- including the stored trace_id, must not change shape; indexes are
--- slipstream's to change.
+-- hand to match it. The database feeds other perf frontends through
+-- benchmarks, so that table, including its stored trace_id, must not change
+-- shape; the staging side is slipstream's own.
+--
+-- Staging is in transition. samples, commits, dirty_groups and imports are
+-- the current design: the key of samples is the aggregation group followed
+-- by what varies within it, commit identity lives once in commits, and a
+-- push leaves the groups it touched in dirty_groups for refresh to drain.
+-- slipstream and meta are the previous design, still written alongside
+-- while the new tables prove themselves; see the push target's "write" and
+-- "aggregate_from" settings.
 
+-- One commit of one engine, possibly measured inside an embedder (chrome
+-- around V8, Safari around JSC). Written by push in the same commit as its
+-- samples; never deleted, since it is per engine rather than per bot. The
+-- one place that links an inner commit to the outer one it ran inside.
+CREATE TABLE IF NOT EXISTS commits (
+    engine          STRING(MAX) NOT NULL,
+    embedder_number INT64       NOT NULL,
+    commit_number   INT64       NOT NULL,
+    git_hash        STRING(MAX),
+    commit_time     TIMESTAMP,
+    title           STRING(MAX),
+    embedder_hash   STRING(MAX),
+    embedder_title  STRING(MAX)
+) PRIMARY KEY (engine, embedder_number, commit_number);
+
+-- One measured value. Refresh of a group and a bot's rebuild are prefix
+-- range scans on the base table, so there is no secondary index. suite is
+-- the short name ("js3", no alias), test is named as in benchmarks ("Air",
+-- "Overall"), and variant is the run's own flags string ("default"); the
+-- frontend labels are derived at refresh time, see frontend_benchmark and
+-- frontend_variant in spanner.py. measured_at is the bench's own clock, NULL
+-- when unknown; imported_at is a commit timestamp kept for audit, not for
+-- change detection.
+CREATE TABLE IF NOT EXISTS samples (
+    bot             STRING(MAX) NOT NULL,
+    suite           STRING(MAX) NOT NULL,
+    engine          STRING(MAX) NOT NULL,
+    variant         STRING(MAX) NOT NULL,
+    embedder_number INT64       NOT NULL,
+    commit_number   INT64       NOT NULL,
+    test            STRING(MAX) NOT NULL,
+    metric          STRING(MAX) NOT NULL,
+    run             INT64       NOT NULL,
+    value           FLOAT64     NOT NULL,
+    measured_at     TIMESTAMP,
+    imported_at     TIMESTAMP   NOT NULL OPTIONS (allow_commit_timestamp = true)
+) PRIMARY KEY (bot, suite, engine, variant, embedder_number, commit_number, test, metric, run);
+
+-- Groups that gained samples and have not been re-aggregated since. Written
+-- in the same commit as the samples; refresh reads them, aggregates, and
+-- deletes only rows no newer than what it read.
+CREATE TABLE IF NOT EXISTS dirty_groups (
+    bot             STRING(MAX) NOT NULL,
+    suite           STRING(MAX) NOT NULL,
+    engine          STRING(MAX) NOT NULL,
+    variant         STRING(MAX) NOT NULL,
+    embedder_number INT64       NOT NULL,
+    commit_number   INT64       NOT NULL,
+    dirtied_at      TIMESTAMP   NOT NULL OPTIONS (allow_commit_timestamp = true)
+) PRIMARY KEY (bot, suite, engine, variant, embedder_number, commit_number);
+
+-- One push attempt, from its first chunk to its last. A row without
+-- finished_at is an interrupted import, and refresh waits for it to be
+-- retried. Also the push ledger.
+CREATE TABLE IF NOT EXISTS imports (
+    attempt     STRING(MAX) NOT NULL,
+    bot         STRING(MAX) NOT NULL,
+    digest      STRING(MAX) NOT NULL,
+    started_at  TIMESTAMP   NOT NULL OPTIONS (allow_commit_timestamp = true),
+    finished_at TIMESTAMP   OPTIONS (allow_commit_timestamp = true),
+    row_count   INT64
+) PRIMARY KEY (attempt);
+
+-- Previous staging design: group identity is encoded in the variant string
+-- ("v8 (v8_default)") and the aliased benchmark name, change detection is a
+-- watermark over imported_at in meta, and two indexes reorder the table for
+-- aggregation. Kept and written to until the tables above have proven
+-- themselves; then dropped together with its indexes and meta.
 CREATE TABLE IF NOT EXISTS slipstream (
     bot           STRING(MAX) NOT NULL,
     benchmark     STRING(MAX) NOT NULL,

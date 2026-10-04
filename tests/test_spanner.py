@@ -29,7 +29,7 @@ class FakeDb:
 
     def query(self, sql, params=None):
         self.calls.append(("query", " ".join(sql.split()), params))
-        if "STARTS_WITH(key" in sql:
+        if "STARTS_WITH(key" in sql or "finished_at IS NULL" in sql:
             return []
         if "CURRENT_TIMESTAMP" in sql:
             return [(T0,)]
@@ -43,6 +43,13 @@ class FakeDb:
     def upsert(self, table, columns, rows):
         self.calls.append(("upsert", table, columns, rows))
 
+    def write(self, groups):
+        # As in SpannerDb, one call writes several tables; recorded both as
+        # the grouping and as one upsert per table.
+        self.calls.append(("write", [t for t, _, _ in groups]))
+        for table, columns, rows in groups:
+            self.upsert(table, columns, rows)
+
     def partitioned_dml(self, sql, params):
         self.calls.append(("pdml", sql, params))
         return 0
@@ -50,8 +57,15 @@ class FakeDb:
     def close(self):
         self.calls.append(("close",))
 
-    def of(self, kind):
-        return [c for c in self.calls if c[0] == kind]
+    def of(self, kind, table=None):
+        return [
+            c for c in self.calls if c[0] == kind and (table is None or c[1] == table)
+        ]
+
+
+ALL_TABLES = [
+    (t,) for t in ("slipstream", "benchmarks", "meta", *spanner.STAGING_TABLES)
+]
 
 
 def _csv(*rows):
@@ -89,6 +103,39 @@ class TestRowMapping:
         assert spanner.variant_label("v8", "default") == "v8"
         assert spanner.variant_label("", "x") == "x"
 
+    def test_both_designs_derive_the_same_frontend_labels(self):
+        # benchmarks keys and trace_id hash on these labels, so for every
+        # legacy value in the live table the new path must land on exactly
+        # what the legacy SQL (REGEXP_EXTRACT of the parenthesised part)
+        # made of it.
+        import re
+
+        for legacy, (engine, variant) in spanner.LEGACY_VARIANTS.items():
+            expect = re.search(r"\((.+)\)", legacy).group(1)
+            assert spanner.frontend_variant(engine, variant) == expect
+            # And a fresh export of that variant maps to the same pair.
+            flags = f"{engine}_{variant}"
+            assert spanner.variant_label(engine, flags) == legacy
+            assert spanner.variant_of(engine, flags) == variant
+        for legacy, suite in spanner.LEGACY_BENCHMARKS.items():
+            assert spanner.frontend_benchmark(suite) == legacy
+        assert spanner.legacy_identity("v8 (v8_default)", "jetstream2.slipstream") == (
+            "v8",
+            "default",
+            "js2",
+        )
+        with pytest.raises(ValueError, match="no pinned mapping"):
+            spanner.legacy_identity("v8", "jetstream2.slipstream")
+        with pytest.raises(ValueError, match="no pinned mapping"):
+            spanner.legacy_identity("v8 (v8_default)", "speedometer3.1.slipstream")
+
+    def test_variant_of_refuses_flags_without_the_engine_prefix(self):
+        assert spanner.variant_of("v8", "v8_default") == "default"
+        assert spanner.variant_of("jsc", "jsc_per_line_item") == "per_line_item"
+        for engine, flags in (("v8", "default"), ("v8", "jsc_default"), ("", "x")):
+            with pytest.raises(ValueError, match="do not start with the engine"):
+                spanner.variant_of(engine, flags)
+
     def test_row_shape(self):
         (row,) = spanner.rows_from_csv(_csv({}), "bot1", T0)
         assert dict(zip(spanner.IMPORT_COLUMNS, row)) == {
@@ -106,6 +153,66 @@ class TestRowMapping:
             "imported_at": T0,
         }
 
+    def test_staging_rows_shape(self):
+        records = spanner.records_from_csv(
+            _csv(
+                {"timestamp": "1700000100"},
+                {"run": "2"},
+                {"commit_id": "101", "git_hash": "def", "benchmark": "Overall"},
+                {"suite": "js2"},
+            )
+        )
+        staged = spanner.staging_rows(records, "bot1")
+        assert len(staged.samples) == 4
+        assert dict(zip(spanner.SAMPLE_COLUMNS, staged.samples[0])) == {
+            "bot": "bot1",
+            "suite": "js3",
+            "engine": "v8",
+            "variant": "default",
+            "embedder_number": 0,
+            "commit_number": 100,
+            "test": "bench-a",
+            "metric": "Total-Score",
+            "run": 1,
+            "value": 1.5,
+            "measured_at": datetime.fromtimestamp(1700000100, tz=timezone.utc),
+            "imported_at": spanner.COMMIT_TIMESTAMP,
+        }
+        # A zero bench timestamp is unknown, not 1970.
+        assert staged.samples[1][10] is None
+        # One commits row per (engine, embedder, commit), from the first
+        # record that names it; embedder columns stay NULL.
+        assert [dict(zip(spanner.COMMIT_COLUMNS, c)) for c in staged.commits] == [
+            {
+                "engine": "v8",
+                "embedder_number": 0,
+                "commit_number": n,
+                "git_hash": h,
+                "commit_time": datetime.fromtimestamp(1700000000, tz=timezone.utc),
+                "title": "t",
+                "embedder_hash": None,
+                "embedder_title": None,
+            }
+            for n, h in ((100, "abc"), (101, "def"))
+        ]
+        # One dirty row per group, stamped at commit time.
+        assert staged.dirty == [
+            ("bot1", "js3", "v8", "default", 0, 100, spanner.COMMIT_TIMESTAMP),
+            ("bot1", "js3", "v8", "default", 0, 101, spanner.COMMIT_TIMESTAMP),
+            ("bot1", "js2", "v8", "default", 0, 100, spanner.COMMIT_TIMESTAMP),
+        ]
+
+    def test_commit_time_is_derived_identically_for_both_designs(self):
+        # Including the previous design's quirk that a zero commit timestamp
+        # is 1970, not NULL: commits.commit_time must equal what is stored.
+        records = spanner.records_from_csv(
+            _csv({}, {"commit_id": "101", "commit_timestamp": "0"})
+        )
+        legacy = spanner.rows_from_records(records, "b", T0)
+        staged = spanner.staging_rows(records, "b")
+        assert [r[8] for r in legacy] == [c[4] for c in staged.commits]
+        assert staged.commits[1][4] == datetime(1970, 1, 1, tzinfo=timezone.utc)
+
     def test_unknown_suite_passes_through(self):
         (row,) = spanner.rows_from_csv(_csv({"suite": "sp3"}), "b", T0)
         assert row[1] == "speedometer3.1.slipstream"
@@ -122,16 +229,36 @@ class TestRowMapping:
 
 class TestSchema:
     def test_ddl_only_when_a_table_is_missing(self):
-        db = FakeDb([[("slipstream",), ("benchmarks",), ("meta",)]])
+        db = FakeDb([ALL_TABLES])
         spanner.ensure_schema(db)
         assert db.of("execute") == []
 
-        db = FakeDb([[("slipstream",)]])
+        # The previous design's tables alone are no longer enough.
+        db = FakeDb([[("slipstream",), ("benchmarks",), ("meta",)]])
         spanner.ensure_schema(db)
         ddl = [c[1] for c in db.of("execute")]
-        assert len(ddl) == len(spanner.schema_statements()) == 7
+        assert len(ddl) == len(spanner.schema_statements()) == 11
         assert any("trace_id INT64 NOT NULL AS (FARM_FINGERPRINT" in s for s in ddl)
         assert all(not s.startswith("--") for s in ddl)
+        assert all("--" not in s for s in ddl), "inline comments break statements"
+        created = [s.split()[5] for s in ddl if s.startswith("CREATE TABLE")]
+        assert created == [
+            "commits",
+            "samples",
+            "dirty_groups",
+            "imports",
+            "slipstream",
+            "benchmarks",
+            "meta",
+        ]
+
+    def test_samples_key_is_the_group_then_what_varies_in_it(self):
+        (samples,) = [
+            s for s in spanner.schema_statements() if "TABLE IF NOT EXISTS samples" in s
+        ]
+        key = samples.split("PRIMARY KEY")[1].strip(" ();").replace(" ", "").split(",")
+        assert key == spanner.DIRTY_COLUMNS[:-1] + ["test", "metric", "run"]
+        assert "allow_commit_timestamp = true" in samples
 
     def test_declared_indexes(self):
         idx = spanner.declared_indexes()
@@ -285,18 +412,371 @@ class TestGeomeanTotals:
         (total,) = spanner._geomean_totals(rows)
         assert total[4:6] == ("w", 3) and total[9] == pytest.approx(3.0)
 
+    def test_the_total_does_not_depend_on_line_item_order(self):
+        # A left-to-right float sum of these logs lands on a different ulp
+        # forward and reversed (checked on 3.11, whose sum() is naive); the
+        # two staging designs return items in different orders, and both
+        # may run on such a Python.
+        means = [
+            714.275, 1632.916, 1110.181, 1811.958, 1877.348, 197.054,
+            39.997, 2512.489, 778.432, 703.376, 2986.937, 1411.055,
+        ]  # fmt: skip
+        rows = [_item(f"t{i}", m) for i, m in enumerate(means)]
+        (forward,) = spanner._geomean_totals(rows)
+        (backward,) = spanner._geomean_totals(rows[::-1])
+        (shuffled,) = spanner._geomean_totals(rows[5:] + rows[:5])
+        assert forward == backward == shuffled
+
+
+class TestStagingGroups:
+    def test_both_designs_in_one_write_call(self):
+        db = FakeDb()
+        n = spanner.stage_records(
+            db, spanner.records_from_csv(_csv({}, {"run": "2"})), "b"
+        )
+        assert n == 2
+        assert db.of("write") == [
+            ("write", ["slipstream", "samples", "commits", "dirty_groups"])
+        ]
+        assert [len(c[3]) for c in db.of("upsert")] == [2, 2, 1, 1]
+        assert db.of("upsert", "slipstream")[0][2] == spanner.IMPORT_COLUMNS
+        assert db.of("upsert", "samples")[0][2] == spanner.SAMPLE_COLUMNS
+
+    def test_write_modes_select_the_tables(self):
+        records = spanner.records_from_csv(_csv({}))
+        for write, tables in (
+            ("legacy", ["slipstream"]),
+            ("samples", ["samples", "commits", "dirty_groups"]),
+        ):
+            db = FakeDb()
+            spanner.stage_records(db, records, "b", write=write)
+            assert db.of("write") == [("write", tables)]
+        # legacy rows need the database clock; samples carry the commit
+        # timestamp sentinel and need no round trip.
+        db = FakeDb()
+        spanner.stage_records(db, records, "b", write="samples")
+        assert db.of("query") == []
+        with pytest.raises(ValueError, match="write must be one of"):
+            spanner.stage_records(FakeDb(), records, "b", write="all")
+
+    def test_nothing_is_written_for_no_records(self):
+        db = FakeDb()
+        assert spanner.stage_records(db, [], "b") == 0
+        assert db.of("upsert") == [] and db.of("query") == []
+
+    def test_a_record_that_does_not_map_writes_nothing(self):
+        db = FakeDb()
+        records = spanner.records_from_csv(_csv({}, {"flags": "default"}))
+        with pytest.raises(ValueError, match="do not start with the engine"):
+            spanner.stage_records(db, records, "b")
+        assert db.of("write") == []
+
+
+class TestWriteChunks:
+    """SpannerDb.write without a connection: only the batching logic."""
+
+    def _db(self):
+        db = object.__new__(spanner.SpannerDb)
+        commits = []
+
+        class Batch:
+            def __init__(self):
+                self.parts = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                commits.append(self.parts)
+
+            def insert_or_update(self, table, columns, values):
+                self.parts.append((table, len(values)))
+
+        class Database:
+            def batch(self):
+                return Batch()
+
+        db._database = Database()
+        return db, commits
+
+    def test_parallel_groups_share_commits_chunk_by_chunk(self, monkeypatch):
+        monkeypatch.setattr(spanner, "_MUTATION_BUDGET", 100)
+        db, commits = self._db()
+        # slipstream costs 12*3, samples 12, commits 8, dirty 7: 63 per
+        # record, under the floor of 100 records per chunk.
+        rows = lambda n: [(i,) for i in range(n)]  # noqa: E731
+        db.write(
+            [
+                ("slipstream", spanner.IMPORT_COLUMNS, rows(250)),
+                ("samples", spanner.SAMPLE_COLUMNS, rows(250)),
+                ("commits", spanner.COMMIT_COLUMNS, rows(3)),
+                ("dirty_groups", spanner.DIRTY_COLUMNS, rows(3)),
+            ]
+        )
+        assert commits == [
+            [
+                ("slipstream", 100),
+                ("samples", 100),
+                ("commits", 3),
+                ("dirty_groups", 3),
+            ],
+            [("slipstream", 100), ("samples", 100)],
+            [("slipstream", 50), ("samples", 50)],
+        ]
+
+    def test_chunk_size_follows_the_mutation_cost(self):
+        db, commits = self._db()
+        # benchmarks: 14 columns x (1 + 2 indexes) = 42 per row -> 952 rows.
+        db.write([("benchmarks", spanner.AGG_COLUMNS, [(i,) for i in range(1000)])])
+        assert [p[0][1] for p in commits] == [952, 48]
+        # Empty groups are dropped; nothing at all means no commit.
+        db.write([("x", ["a"], [])])
+        assert len(commits) == 2
+
+
+class TestImportLedger:
+    def test_both_records_open_before_and_close_after_the_write(self):
+        db = FakeDb()
+        handle = spanner.begin_import(db, "bot", "a1", "d1")
+        assert handle == spanner.ImportHandle(
+            "a1", "slipstream_incomplete_import:attempt:a1", True
+        )
+        spanner.finish_import(db, handle, 7)
+        ex = db.of("execute")
+        assert [e[1].split()[0:3] for e in ex] == [
+            ["INSERT", "OR", "UPDATE"],
+            ["INSERT", "OR", "UPDATE"],
+            ["DELETE", "FROM", "meta"],
+            ["UPDATE", "imports", "SET"],
+        ]
+        assert ex[0][2] == [handle.marker, "3:bot:d1"]
+        assert "PENDING_COMMIT_TIMESTAMP(), NULL, NULL" in ex[1][1]
+        assert ex[1][2] == ["a1", "bot", "d1"]
+        assert "finished_at = PENDING_COMMIT_TIMESTAMP()" in ex[3][1]
+        assert ex[3][2] == [7, "a1"]
+
+    def test_each_mode_keeps_only_its_own_record(self):
+        db = FakeDb()
+        handle = spanner.begin_import(db, "bot", "a1", "d1", write="legacy")
+        spanner.finish_import(db, handle)
+        assert handle.ledger is False and handle.marker is not None
+        assert all("imports" not in e[1] for e in db.of("execute"))
+        db = FakeDb()
+        handle = spanner.begin_import(db, "bot", "a1", "d1", write="samples")
+        spanner.finish_import(db, handle)
+        assert handle.ledger is True and handle.marker is None
+        assert all("meta" not in e[1] for e in db.of("execute"))
+
+    def test_a_bare_key_clears_a_legacy_marker_only(self):
+        db = FakeDb()
+        spanner.finish_import(db, "slipstream_incomplete_import:bot")
+        assert db.of("execute") == [
+            (
+                "execute",
+                "DELETE FROM meta WHERE key = %s",
+                ["slipstream_incomplete_import:bot"],
+            )
+        ]
+
+
+class TestRebuild:
+    def _tables(self, db):
+        return [c[1].split()[2] for c in db.of("pdml")]
+
+    def test_both_wipes_every_staging_table_but_commits(self):
+        db = FakeDb()
+        spanner.rebuild_bot(db, "bot")
+        assert self._tables(db) == [
+            "slipstream",
+            "samples",
+            "dirty_groups",
+            "benchmarks",
+            "meta",
+            "imports",
+        ]
+        assert all(c[2]["bot"] == "bot" for c in db.of("pdml") if "meta" not in c[1])
+        (imports,) = [c for c in db.of("pdml") if "imports" in c[1]]
+        assert "finished_at IS NULL" in imports[1]
+
+    def test_legacy_and_samples_modes(self):
+        db = FakeDb()
+        spanner.rebuild_bot(db, "bot", write="legacy")
+        assert self._tables(db) == ["slipstream", "benchmarks", "meta"]
+        db = FakeDb()
+        spanner.rebuild_bot(db, "bot", write="samples")
+        assert self._tables(db) == ["samples", "dirty_groups", "benchmarks", "imports"]
+
+
+def _dirty(
+    bot="b", suite="js3", engine="v8", variant="default", embedder=0, commit=1, at=T0
+):
+    return (bot, suite, engine, variant, embedder, commit, at)
+
+
+class TestRefreshSamples:
+    def test_unknown_source_is_rejected_before_any_io(self):
+        db = FakeDb()
+        with pytest.raises(ValueError, match="aggregate_from must be one of"):
+            spanner.refresh(db, source="both")
+        assert db.calls == []
+
+    def test_nothing_dirty(self):
+        db = FakeDb([[]])
+        assert (
+            spanner.refresh(db, source="samples")
+            == "no dirty groups since the last refresh"
+        )
+        assert db.of("upsert") == [] and db.of("execute") == []
+        # The dirty read follows the open-import check and nothing else:
+        # no index check, no watermark.
+        assert [q[1] for q in db.of("query")] == [
+            "SELECT attempt FROM imports WHERE finished_at IS NULL LIMIT 1",
+            f"SELECT {', '.join(spanner.DIRTY_COLUMNS)} FROM dirty_groups",
+        ]
+
+    def test_open_import_blocks(self):
+        db = FakeDb()
+        db.query = lambda sql, params=None: (
+            [("a9",)] if "finished_at IS NULL" in sql else []
+        )
+        out = spanner.refresh(db, source="samples")
+        assert "incomplete" in out and "a9" in out
+
+    def test_groups_outside_embedder_zero_stop_the_refresh(self):
+        db = FakeDb([[_dirty(), _dirty(embedder=7, commit=2)]])
+        out = spanner.refresh(db, source="samples")
+        assert (
+            "outside embedder 0" in out and "('b', 'js3', 'v8', 'default', 7, 2)" in out
+        )
+        assert db.of("upsert") == [] and db.of("execute") == []
+
+    def test_one_query_per_prefix_then_upsert_then_delete_up_to_the_cutoff(self):
+        later = datetime(2026, 9, 5, 12, 0, 1, tzinfo=timezone.utc)
+        dirty = [
+            _dirty(commit=3),
+            _dirty(suite="js2", commit=1, at=later),
+            _dirty(commit=1),
+            _dirty(bot="a", variant="per_line_item", commit=9),
+        ]
+
+        def agg(commit, test, mean):
+            return (commit, test, T0, "h", mean, mean, mean, 0.0, 1)
+
+        db = FakeDb(
+            [
+                dirty,
+                [agg(9, "x", 1.0)],  # a / js3 / v8 / per_line_item
+                [agg(1, "x", 2.0), agg(1, "y", 8.0)],  # b / js2 (no Total)
+                [agg(1, "Total", 5.0), agg(3, "x", 7.0)],  # b / js3
+            ]
+        )
+        assert spanner.refresh(db, source="samples") is None
+        aggs = [q for q in db.of("query") if "FROM samples s" in q[1]]
+        assert [q[2] for q in aggs] == [
+            ["a", "js3", "v8", "per_line_item", 0, [9]],
+            ["b", "js2", "v8", "default", 0, [1]],
+            ["b", "js3", "v8", "default", 0, [1, 3]],
+        ]
+        assert all("IN UNNEST(%s)" in q[1] for q in aggs)
+        (up,) = db.of("upsert")
+        assert up[1:3] == ("benchmarks", spanner.AGG_COLUMNS)
+        rows = {r[:6]: r for r in up[3]}
+        # Labels are the frontend ones, and the JS2 group got its geomean.
+        assert set(rows) == {
+            ("a", "jetstream3.slipstream", "x", "", "v8_per_line_item", 9),
+            ("b", "jetstream2.slipstream", "x", "", "v8_default", 1),
+            ("b", "jetstream2.slipstream", "y", "", "v8_default", 1),
+            ("b", "jetstream2.slipstream", "Total", "", "v8_default", 1),
+            ("b", "jetstream3.slipstream", "Total", "", "v8_default", 1),
+            ("b", "jetstream3.slipstream", "x", "", "v8_default", 3),
+        }
+        assert rows[("a", "jetstream3.slipstream", "x", "", "v8_per_line_item", 9)][6:] == (
+            T0, "h", "slipstream", 1.0, 1.0, 1.0, 0.0, 1,
+        )  # fmt: skip
+        assert rows[("b", "jetstream2.slipstream", "Total", "", "v8_default", 1)][
+            9
+        ] == (pytest.approx(4.0))
+        # The delete comes last and is bounded by the newest dirtied_at read,
+        # not by the key set, so a group dirtied again meanwhile survives.
+        assert db.calls[-1] == (
+            "execute",
+            "DELETE FROM dirty_groups WHERE dirtied_at <= %s",
+            [later],
+        )
+        assert db.calls.index(up) < len(db.calls) - 1
+
+    def test_sql_shape(self):
+        db = FakeDb([[_dirty()], []])
+        spanner.refresh(db, source="samples")
+        (agg,) = [q[1] for q in db.of("query") if "FROM samples s" in q[1]]
+        # Same filter and statistics as the previous design's query.
+        assert "IF(s.test = 'Overall', 'Total', s.test) AS test" in agg
+        assert "s.test != 'Overall' AND s.metric IN ('Total-Score', 'Score', '')" in agg
+        assert "s.test = 'Overall' AND s.metric = 'Total-Score'" in agg
+        assert "COALESCE(STDDEV_SAMP(s.value), 0.0), COUNT(*)" in agg
+        assert "LEFT JOIN commits c" in agg
+        assert "MIN(c.commit_time), MIN(c.git_hash)" in agg
+        assert (
+            "GROUP BY s.commit_number, IF(s.test = 'Overall', 'Total', s.test)" in agg
+        )
+        assert "FROM benchmarks" not in agg and "FROM slipstream" not in agg
+
+    def test_nan_becomes_null(self):
+        db = FakeDb([[_dirty()], [(1, "x", T0, "h", 1.0, 1.0, 1.0, float("nan"), 1)]])
+        spanner.refresh(db, source="samples")
+        assert db.of("upsert")[0][3][0][12] is None
+
+    def test_failed_upsert_leaves_the_dirty_rows(self):
+        db = FakeDb([[_dirty()], [(1, "x", T0, "h", 1.0, 1.0, 1.0, 0.0, 1)]])
+        db.upsert = lambda *a: (_ for _ in ()).throw(RuntimeError("boom"))
+        with pytest.raises(RuntimeError):
+            spanner.refresh(db, source="samples")
+        assert db.of("execute") == []
+
+    def test_whole_prefix_when_no_commits_are_given(self):
+        db = FakeDb([[]])
+        assert spanner.aggregate_samples(db, "b", "js3", "v8", "default", 0) == []
+        (q,) = db.of("query")
+        assert "UNNEST" not in q[1] and q[2] == ["b", "js3", "v8", "default", 0]
+
 
 class TestPushCsv:
     def _db(self, extra=()):
-        return FakeDb([[("slipstream",), ("benchmarks",), ("meta",)], *extra])
+        return FakeDb([ALL_TABLES, *extra])
 
-    def test_stages_then_aggregates(self):
+    def test_stages_both_designs_then_aggregates_from_legacy(self):
         db = self._db([[], [(T0,)], []])
         out = spanner.push_csv(db, "bot1", _csv({}, {"run": "2"}))
         assert out == "2 rows staged for bot1, aggregated"
-        (up,) = db.of("upsert")
-        assert up[1] == "slipstream" and up[2] == spanner.IMPORT_COLUMNS
-        assert len(up[3]) == 2 and db.of("pdml") == []
+        assert db.of("write") == [
+            ("write", ["slipstream", "samples", "commits", "dirty_groups"])
+        ]
+        (up,) = db.of("upsert", "slipstream")
+        assert up[2] == spanner.IMPORT_COLUMNS and len(up[3]) == 2
+        assert len(db.of("upsert", "samples")[0][3]) == 2
+        assert db.of("pdml") == []
+        # The legacy watermark was written: that was the path aggregated.
+        assert db.calls[-1][2][0] == spanner.WATERMARK_KEY
+
+    def test_aggregates_from_samples_when_told(self):
+        db = self._db([[_dirty(bot="bot1", commit=100)], []])
+        out = spanner.push_csv(db, "bot1", _csv({}), aggregate_from="samples")
+        assert out == "1 rows staged for bot1, aggregated"
+        assert any("FROM samples s" in q[1] for q in db.of("query"))
+        assert not any("imported_at" in q[1] for q in db.of("query"))
+        assert db.calls[-1][1].startswith("DELETE FROM dirty_groups")
+
+    def test_incompatible_modes_are_rejected_before_any_io(self):
+        db = self._db()
+        with pytest.raises(ValueError, match="does not write"):
+            spanner.push_csv(
+                db, "b", _csv({}), write="legacy", aggregate_from="samples"
+            )
+        with pytest.raises(ValueError, match="does not write"):
+            spanner.push_csv(
+                db, "b", _csv({}), write="samples", aggregate_from="legacy"
+            )
+        assert db.calls == []
 
     def test_no_refresh(self):
         db = self._db()
@@ -310,8 +790,14 @@ class TestPushCsv:
         out = spanner.push_csv(db, "b", _csv({}), rebuild=True)
         assert "(rebuild)" in out and "staging is empty" in out
         kinds = [c[0] for c in db.calls]
-        assert kinds.index("pdml") < kinds.index("upsert")
+        assert kinds.index("pdml") < kinds.index("write")
         assert db.of("pdml")[0][2] == {"bot": "b"}
+
+    def test_a_csv_that_does_not_map_costs_a_rebuild_nothing(self):
+        db = self._db()
+        with pytest.raises(ValueError):
+            spanner.push_csv(db, "b", _csv({"flags": "nope"}), rebuild=True)
+        assert db.of("pdml") == [] and db.of("write") == [] and db.of("execute") == []
 
 
 class _Api:
