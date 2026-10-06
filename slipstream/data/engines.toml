@@ -151,10 +151,9 @@ run_set = [
     "WebKitBuild/Release/com.apple.WebKit.GPU.xpc",
     "WebKitBuild/Release/com.apple.WebKit.WebContent.EnhancedSecurity.xpc",
 ]
-pre_build_patches = [
-    "Source/JavaScriptCore/Configurations/Base.xcconfig",
-    "Source/WTF/Configurations/Base.xcconfig",
-]
+# GCC_TREAT_WARNINGS_AS_ERRORS=NO is already passed on the command line.
+# Patching shared xcconfig files on every checkout needlessly invalidates
+# Xcode's build inputs.
 
 # Safari Technology Preview around the WebKit build jsc produced. It has no
 # source and nothing to compile: each safari entry is a jsc entry's blobs

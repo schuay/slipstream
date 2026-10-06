@@ -624,6 +624,56 @@ class TestGnGenRecovery:
         assert len(runs) == 2
 
 
+class TestIncrementalBuildState:
+    def test_checkout_preserves_state_and_unchanged_inputs(self, config, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+
+        def git(*args):
+            return subprocess.check_output(["git", *args], cwd=src, text=True).strip()
+
+        git("init")
+        git("config", "user.email", "test@example.com")
+        git("config", "user.name", "Test")
+        (src / "shared.xcconfig").write_text("unchanged configuration\n")
+        (src / "source.cpp").write_text("first\n")
+        git("add", ".")
+        git("commit", "-m", "first")
+        first = git("rev-parse", "HEAD")
+        (src / "source.cpp").write_text("second\n")
+        git("commit", "-am", "second")
+        second = git("rev-parse", "HEAD")
+        git("checkout", first)
+        os.utime(src / "shared.xcconfig", ns=(1_000_000_000, 1_000_000_000))
+        git("update-index", "--refresh")
+        state = src / "WebKit.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+        state.parent.mkdir(parents=True)
+        state.write_text("cached package resolution")
+        output = src / "WebKitBuild/cached.o"
+        output.parent.mkdir()
+        output.write_bytes(b"cached object")
+        (src / "source.cpp").write_text("temporary pin/patch\n")
+        engine = EngineConfig("jsc", src, "true", "jsc", "")
+        assert BenchCollector(config).build_at(engine, second) is None
+        assert (src / "source.cpp").read_text() == "second\n"
+        assert (src / "shared.xcconfig").stat().st_mtime_ns == 1_000_000_000
+        assert state.read_text() == "cached package resolution"
+        assert output.read_bytes() == b"cached object"
+        assert BenchCollector(config).build_at(engine, second) is None
+        assert (src / "shared.xcconfig").stat().st_mtime_ns == 1_000_000_000
+
+    def test_patch_does_not_touch_already_patched_file(self, config, tmp_path):
+        path = tmp_path / "Base.xcconfig"
+        path.write_text("GCC_TREAT_WARNINGS_AS_ERRORS = NO\n")
+        os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+        engine = EngineConfig(
+            "jsc", tmp_path, "true", "jsc", "",
+            pre_build_patches=["Base.xcconfig"],
+        )
+        BenchCollector(config)._apply_pre_build_patches(engine)
+        assert path.stat().st_mtime_ns == 1_000_000_000
+
+
 class TestPinStep:
     """An embedded engine's build writes the inner revision into the deps
     file before sync, so that sync is what moves the inner checkout."""
@@ -665,9 +715,7 @@ class TestPinStep:
             is None
         )
         assert runs == [
-            "git reset --hard",
-            "git clean -fd",
-            "git checkout roll",
+            "git checkout --force roll",
             "gclient setdep --deps-file=DEPS -r src/v8@v8sha",
             "gclient sync",
             "gn gen out",  # after sync, which is what moves build/ and the toolchain

@@ -336,12 +336,12 @@ class BenchCollector:
             path = src / rel_path
             if path.exists():
                 text = path.read_text()
-                path.write_text(
-                    text.replace(
-                        "GCC_TREAT_WARNINGS_AS_ERRORS = YES",
-                        "GCC_TREAT_WARNINGS_AS_ERRORS = NO",
-                    )
+                patched = text.replace(
+                    "GCC_TREAT_WARNINGS_AS_ERRORS = YES",
+                    "GCC_TREAT_WARNINGS_AS_ERRORS = NO",
                 )
+                if patched != text:
+                    path.write_text(patched)
 
     @staticmethod
     def _normalize_gn_args(text: str) -> list[str]:
@@ -423,14 +423,16 @@ class BenchCollector:
 
         ``pins`` maps gclient dep paths to the revisions this build wants
         under the checkout, written into the deps file before sync so that
-        sync is what moves them; the reset at the start of the next build
+        sync is what moves them; the checkout at the start of the next build
         takes the edit back out.
         """
         src = engine.require_src_dir()
         steps: list[tuple[str, str, bool]] = [
-            ("reset", "git reset --hard", False),
-            ("clean", "git clean -fd", False),
-            ("checkout", f"git checkout {commit_hash}", False),
+            # Move directly to the target revision, discarding tracked edits
+            # from patches/pins without an intermediate reset. Keep untracked
+            # build and package-manager state; clean -fd deletes Xcode's
+            # xcshareddata/swiftpm even though WebKitBuild itself is ignored.
+            ("checkout", f"git checkout --force {commit_hash}", False),
         ]
         for kind, cmd, caffeinate in steps:
             res = self._run(cmd + self._quiet(log), cwd=src, caffeinate=caffeinate)
