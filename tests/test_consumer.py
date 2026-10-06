@@ -374,6 +374,9 @@ class TestBenchState:
         assert state.bot == setup.cfg.bot_name
         assert state.status_counts == {"ok": 2}
         assert state.env["harness"] == {"js3": "abc1234"}
+        assert state.env["suite_cfg_hash"] == setup.collector.suite_cfg_hashes(
+            setup.cfg.engines["v8"]
+        )
         assert state.env["since"] > 0
 
     def test_lag_counts_unbenched_entries(self, setup, monkeypatch):

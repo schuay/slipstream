@@ -67,6 +67,14 @@ dir = "~/JetStream2"
 [benchmarks.js3]
 dir = "~/src/JetStream"
 
+# Speedometer 3 runs only in a browser (chrome, safari), so it needs no
+# shell and a [[run]] pairing it with v8 or jsc is refused. The checkout is
+# https://github.com/WebKit/Speedometer at release/3.1; main is 4.0 alpha.
+# One run is one page load with the page's own 10 iterations; each suite's
+# mean time goes in as Total-Time and Speedometer's Score as Overall.
+# [benchmarks.sp3]
+# dir = "~/src/Speedometer"
+
 # What this machine measures of every commit. Nothing runs that is not listed
 # here: the matrix is a choice about what is worth an hour of bot time, so a
 # flag worth running on one suite need not be run on the others.
@@ -108,6 +116,10 @@ suite = "js2"
 [[run]]
 engine = "jsc"
 suite = "js3"
+
+# [[run]]
+# engine = "chrome"
+# suite = "sp3"
 
 # [push]
 # bot_name = "my-machine-local"   # must match the top-level bot_name

@@ -15,6 +15,7 @@ from slipstream.runners import (
     ShellRunner,
     geomean_overall,
     runner_for,
+    suite_cfg_hash,
 )
 
 
@@ -220,6 +221,69 @@ class TestRunnerProvenance:
         assert (
             ChromiumRunner(**self.kw).cfg_hash() == ChromiumRunner(**self.kw).cfg_hash()
         )
+
+    # The exact values, so that a change to how an engine is driven or a
+    # suite is read shows up here first. Changing a value below is the
+    # deliberate act of saying "runs from now on are a new series"; update
+    # it together with the change that moved it, never on its own.
+    RUNNER_HASHES = {
+        "shell": "sha256:fdb9b01694d1f8052ba10fab1323d49e2d18efdecc040d325067d5c93513cd8b",
+        "chromium": "sha256:b186c8202a74696dfbae27dbb7cdc830ba1ee4ecba88edd9a81f1984cf59a027",
+        "safari": "sha256:e0fb2fae8195c645471ccc50cf91da9e164c0faf8744abadf4e2c53a73468b9a",
+    }
+    SUITE_HASHES = {
+        "js2": "sha256:c8c206b3c459a43f8f7305b13be726b06b65cab2b7c7176a9d647acffcd14c14",
+        "js3": "sha256:d8ad52ef09321611b173790a448042039dc1307feaef4275a4d57787736647a9",
+        "sp3": "sha256:f9818f60cf71ff8644dbf3fa8d99e904c4124aa72f9a8de3bb21f26b9244b685",
+    }
+
+    @pytest.mark.parametrize("runtime", sorted(RUNNER_HASHES))
+    def test_the_runner_hashes_are_the_known_ones(self, runtime):
+        assert runner_for(runtime, **self.kw).cfg_hash() == self.RUNNER_HASHES[runtime]
+
+    @pytest.fixture
+    def suites(self, tmp_path):
+        cfg = tmp_path / "config.toml"
+        cfg.write_text(
+            f'out_dir = "{tmp_path}"\n'
+            + "".join(
+                f'[benchmarks.{s}]\ndir = "{tmp_path}"\n' for s in self.SUITE_HASHES
+            )
+        )
+        return load_config(cfg).benchmarks
+
+    @pytest.mark.parametrize("suite", sorted(SUITE_HASHES))
+    def test_the_suite_hashes_are_the_known_ones(self, suites, suite):
+        assert suite_cfg_hash(suites[suite]) == self.SUITE_HASHES[suite]
+
+    def test_the_injected_scripts_bytes_are_in_its_suites_hash(
+        self, suites, monkeypatch
+    ):
+        """An edit to sp3-report.mjs changes what the page reports, and
+        nothing else; the hash follows the bytes, and only sp3's."""
+        from slipstream.config import BenchmarkConfig
+
+        monkeypatch.setattr(
+            BenchmarkConfig,
+            "inject_bytes",
+            lambda self: b"// edited\n" if self.inject else b"",
+        )
+        assert suite_cfg_hash(suites["sp3"]) != self.SUITE_HASHES["sp3"]
+        assert suite_cfg_hash(suites["js3"]) == self.SUITE_HASHES["js3"]
+
+    def test_the_parser_version_is_in_the_hash(self, suites, monkeypatch):
+        from slipstream.runners import report
+
+        monkeypatch.setitem(report.PARSER_VERSIONS, "speedometer", "2")
+        assert suite_cfg_hash(suites["sp3"]) != self.SUITE_HASHES["sp3"]
+        assert suite_cfg_hash(suites["js3"]) == self.SUITE_HASHES["js3"]
+
+    def test_a_suites_dir_and_timeout_are_not_in_its_hash(self, suites):
+        from dataclasses import replace
+
+        sp3 = suites["sp3"]
+        moved = replace(sp3, dir=sp3.dir / "elsewhere", timeout="1h")
+        assert suite_cfg_hash(moved) == self.SUITE_HASHES["sp3"]
 
     def test_a_shell_binary_has_no_host_app(self, tmp_path):
         assert ShellRunner(**self.kw).host_env(_engine(), tmp_path) == {}

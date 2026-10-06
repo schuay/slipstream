@@ -1,9 +1,9 @@
 # slipstream
 
 Slipstream measures JavaScript engine performance commit by commit. It builds
-V8 or JavaScriptCore at each commit, runs JetStream2 or JetStream3, stores
-every raw score in SQLite, and delivers the series to the perf database, where
-the analysis lives.
+V8 or JavaScriptCore at each commit, runs JetStream2, JetStream3 or
+Speedometer 3, stores every raw score in SQLite, and delivers the series to
+the perf database, where the analysis lives.
 
 It is built for unattended operation: a `watch` daemon benchmarks new commits as
 they land, and two machines can split the work, one building and both measuring
@@ -77,9 +77,18 @@ separately to send them onward.
 backfill history for a `[[run]]` entry added after the fact.
 
 Chrome runs use `--headless=new` (Chromium 112 or newer), without opening a
-browser window or requiring a display. Headless mode changes the browser's
-rendering environment; compare scores against a headed baseline before joining
-the two into one performance series.
+browser window or requiring a display, with a 1500x1000 window, the viewport
+crossbench gives it. Headless mode changes the browser's rendering
+environment; compare scores against a headed baseline before joining the two
+into one performance series.
+
+Speedometer 3 (`sp3`) runs in a browser only; a `[[run]]` pairing it with a
+shell engine is refused. A run is one page load with Speedometer's own ten
+iterations. Each suite's mean time is stored as `Total-Time` (milliseconds,
+lower is better) and Speedometer's `Score` as `Overall`'s `Total-Score`, the
+same numbers crossbench reports. The page cannot report on its own, so the
+local server appends a small module to `index.html` that POSTs the metrics
+back; the checkout is never modified.
 
 ## Two machines
 

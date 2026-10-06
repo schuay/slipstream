@@ -542,8 +542,34 @@ class TestLocalProvenance:
         assert row["source"] == "local" and row["runs"] == 3
         assert row["build_cfg_hash"].startswith("sha256:")
         assert row["runner_cfg_hash"].startswith("sha256:")
+        assert json.loads(row["suite_cfg_hash"]) == c.suite_cfg_hashes(
+            config.engines["v8"]
+        )
         assert row["host_env"] == "{}"
         assert c.store.run_env_source_counts("v8") == {"local": 1}
+
+    def test_each_suite_the_engine_runs_has_its_own_hash(self, config, tmp_path):
+        """The runner's hash says how the engine is driven; a suite's says
+        how its page is driven and read. Both are per (engine, commit) in
+        run_env, the suites' as a dict so one suite's change names itself."""
+        from slipstream.collector import BenchCollector
+        from slipstream.config import EngineConfig
+        from slipstream.runners import suite_cfg_hash
+
+        v8 = EngineConfig(
+            name="v8",
+            src_dir=None,
+            build_cmd="true",
+            binary_path="out/d8",
+            id_regex=r"#([0-9]+)",
+        )
+        config.engines["v8"] = v8
+        c = BenchCollector(config)
+        assert c.suite_cfg_hashes(v8) == {
+            "js3": suite_cfg_hash(config.benchmarks["js3"])
+        }
+        env = c.local_provenance(v8, 1)
+        assert json.loads(env["suite_cfg_hash"]) == c.suite_cfg_hashes(v8)
 
     def test_the_runners_side_is_recorded_beside_the_builds(
         self, config, tmp_path, monkeypatch
@@ -667,7 +693,11 @@ class TestIncrementalBuildState:
         path.write_text("GCC_TREAT_WARNINGS_AS_ERRORS = NO\n")
         os.utime(path, ns=(1_000_000_000, 1_000_000_000))
         engine = EngineConfig(
-            "jsc", tmp_path, "true", "jsc", "",
+            "jsc",
+            tmp_path,
+            "true",
+            "jsc",
+            "",
             pre_build_patches=["Base.xcconfig"],
         )
         BenchCollector(config)._apply_pre_build_patches(engine)

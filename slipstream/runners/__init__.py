@@ -3,7 +3,15 @@
 
 from __future__ import annotations
 
-from .base import Log, Progress, RunRequest, RunResult, Runner, geomean_overall
+from .base import (
+    Log,
+    Progress,
+    RunRequest,
+    RunResult,
+    Runner,
+    geomean_overall,
+    suite_cfg_hash,
+)
 from .browser import BrowserRunner, Command, Verdict
 from .chromium import ChromiumRunner
 from .safari import SafariRunner
@@ -25,6 +33,7 @@ __all__ = [
     "Verdict",
     "geomean_overall",
     "runner_for",
+    "suite_cfg_hash",
 ]
 
 

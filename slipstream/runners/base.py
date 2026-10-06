@@ -91,6 +91,35 @@ def cfg_digest(kind: str, *parts: str) -> str:
     return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
 
 
+def suite_cfg_hash(bench: BenchmarkConfig) -> str:
+    """How a suite is driven and read, beside the runner's ``cfg_hash`` for
+    how its engine is: the page and query a browser is sent to, the script
+    appended to the page (its bytes, not its name), the parser and its
+    version, the metric renames, the shell's cli and regexes, the names the
+    run must report. Every input is data the config or the package carries,
+    so an edit to any of it moves the hash without anyone remembering to.
+    Recorded per suite in ``run_env.suite_cfg_hash``. ``dir`` and ``timeout``
+    are not in it: neither changes a number."""
+    import hashlib
+    import json
+
+    from .report import PARSER_VERSIONS
+
+    return cfg_digest(
+        f"suite:{bench.name}",
+        f"page={bench.page}",
+        f"query={bench.query}",
+        f"report_format={bench.report_format}/{PARSER_VERSIONS[bench.report_format]}",
+        "report_metrics=" + json.dumps(bench.report_metrics, sort_keys=True),
+        "inject=" + hashlib.sha256(bench.inject_bytes()).hexdigest(),
+        f"cli={bench.cli or ''}",
+        f"run_mode={bench.run_mode}",
+        f"score_regex={bench.score_regex or ''}",
+        f"suite_score_regex={bench.suite_score_regex or ''}",
+        "names=" + "\n".join(bench.names),
+    )
+
+
 def geomean_overall(scores: list[Score], run: int) -> list[Score]:
     """Synthesise ``Overall Total-Score`` as the geomean of every benchmark's.
 

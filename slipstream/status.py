@@ -102,6 +102,7 @@ def local_env(cfg: Config, collector, engine: str | None = None) -> dict:
             f"{c.suite}/{c.variant}" for c in collector.run_configs(cfg.engines[engine])
         ]
         env["runner_cfg_hash"] = collector._runner(cfg.engines[engine]).cfg_hash()
+        env["suite_cfg_hash"] = collector.suite_cfg_hashes(cfg.engines[engine])
     return env
 
 
@@ -109,12 +110,23 @@ def compare_env(local: dict, remote: dict) -> list[str]:
     """Which shared inputs the two boxes disagree on.
 
     run_configs is compared as a set because the two boxes build it from their
-    own engine lists; the rest are compared as read.
+    own engine lists; suite_cfg_hash per suite, naming the suite, because one
+    suite's protocol changing is one series' problem; the rest are compared
+    as read.
     """
     out = []
     for key in ("slipstream_version", "os_version", "harness", "runner_cfg_hash"):
         if key in remote and remote[key] != local.get(key):
             out.append(f"{key}: here {local.get(key)!r}, there {remote[key]!r}")
+    if "suite_cfg_hash" in remote:
+        mine = local.get("suite_cfg_hash") or {}
+        theirs = remote["suite_cfg_hash"] or {}
+        for suite in sorted(set(mine) & set(theirs)):
+            if mine[suite] != theirs[suite]:
+                out.append(
+                    f"suite_cfg_hash[{suite}]: here {mine[suite]!r}, "
+                    f"there {theirs[suite]!r}"
+                )
     if "run_configs" in remote and "run_configs" in local:
         missing = set(remote["run_configs"]) - set(local["run_configs"])
         extra = set(local["run_configs"]) - set(remote["run_configs"])

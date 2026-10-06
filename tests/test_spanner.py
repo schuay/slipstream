@@ -436,7 +436,11 @@ class TestRefresh:
         (agg,) = [c[1] for c in db.of("query") if "GROUP BY s.bot" in c[1]]
         assert "IF(s.test = 'Overall', 'Total', s.test) AS test" in agg
         assert "REGEXP_EXTRACT(s.variant" in agg
-        assert "s.test != 'Overall' AND s.metric IN ('Total-Score', 'Score', '')" in agg
+        assert (
+            "s.test != 'Overall' AND s.metric IN "
+            "('Total-Score', 'Total-Time', 'Score', '')" in agg
+        )
+        assert "IF(s.metric = 'Total-Time', 'Time', '') AS submetric" in agg
         assert "s.test = 'Overall' AND s.metric = 'Total-Score'" in agg
         assert "FROM benchmarks" not in agg
 
@@ -798,7 +802,7 @@ class TestRefreshSamples:
 
     def test_an_embedded_group_lands_in_benchmarks_v2_only(self):
         def agg(commit, test, mean, ehash):
-            return (commit, test, T0, "h", ehash, mean, mean, mean, 0.0, 1)
+            return (commit, test, "", T0, "h", ehash, mean, mean, mean, 0.0, 1)
 
         db = FakeDb(
             [
@@ -834,7 +838,7 @@ class TestRefreshSamples:
         ]
 
         def agg(commit, test, mean):
-            return (commit, test, T0, "h", None, mean, mean, mean, 0.0, 1)
+            return (commit, test, "", T0, "h", None, mean, mean, mean, 0.0, 1)
 
         db = FakeDb(
             [
@@ -889,7 +893,11 @@ class TestRefreshSamples:
         (agg,) = [q[1] for q in db.of("query") if "FROM samples s" in q[1]]
         # Same filter and statistics as the previous design's query.
         assert "IF(s.test = 'Overall', 'Total', s.test) AS test" in agg
-        assert "s.test != 'Overall' AND s.metric IN ('Total-Score', 'Score', '')" in agg
+        assert (
+            "s.test != 'Overall' AND s.metric IN "
+            "('Total-Score', 'Total-Time', 'Score', '')" in agg
+        )
+        assert "IF(s.metric = 'Total-Time', 'Time', '') AS submetric" in agg
         assert "s.test = 'Overall' AND s.metric = 'Total-Score'" in agg
         assert "COALESCE(STDDEV_SAMP(s.value), 0.0), COUNT(*)" in agg
         assert "LEFT JOIN commits c" in agg
@@ -901,13 +909,13 @@ class TestRefreshSamples:
 
     def test_nan_becomes_null(self):
         db = FakeDb(
-            [[_dirty()], [(1, "x", T0, "h", None, 1.0, 1.0, 1.0, float("nan"), 1)]]
+            [[_dirty()], [(1, "x", "", T0, "h", None, 1.0, 1.0, 1.0, float("nan"), 1)]]
         )
         spanner.refresh(db, source="samples")
         assert db.of("upsert")[0][3][0][12] is None
 
     def test_failed_upsert_leaves_the_dirty_rows(self):
-        db = FakeDb([[_dirty()], [(1, "x", T0, "h", None, 1.0, 1.0, 1.0, 0.0, 1)]])
+        db = FakeDb([[_dirty()], [(1, "x", "", T0, "h", None, 1.0, 1.0, 1.0, 0.0, 1)]])
         db.write = lambda *a: (_ for _ in ()).throw(RuntimeError("boom"))
         with pytest.raises(RuntimeError):
             spanner.refresh(db, source="samples")

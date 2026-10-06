@@ -1,6 +1,20 @@
 # Copyright 2026 The slipstream developers
 # SPDX-License-Identifier: MIT
 
+# A suite has two ways of being driven, and declares the ones it supports.
+#
+# Shell: `cli` is the script a d8 or jsc is given, and `score_regex` /
+# `suite_score_regex` read its stdout. A suite without `cli` has no shell
+# mode, and a [[run]] pairing it with a shell engine is a config error.
+#
+# Browser: the suite directory is served over loopback and the browser is
+# pointed at `page` with `query`; the page POSTs its results to /report and
+# `report_format` names the parser. A suite whose page cannot report on its
+# own names an `inject` script, bundled with slipstream, which the server
+# appends to `page` as a module. All of these are hashed into the suite's
+# provenance (suite_cfg_hash), so a change to any of them is visible per
+# suite in run_env.
+
 [js2]
 cli = "cli.js"
 run_mode = "suite"
@@ -8,6 +22,9 @@ names_file = "js2_names.txt"
 timeout = "15m"
 score_regex = '^([A-Za-z0-9.-]+) (Stdlib-Score|Tests-Score|Total-Score|Startup-Score|Average-Score|Worst-Case-Score|Run-Time-Score): ([0-9.]+)$'
 suite_score_regex = '^\s+([A-Za-z]+-Score):\s+([0-9.]+)$'
+page = "index.html"
+query = "report=true"
+report_format = "jetstream"
 # JetStreamDriver.js names the sub-scores First/Worst/Average (default
 # benchmarks), Stdlib/MainRun (WSL) and Startup/Runtime (wasm) in its report,
 # and prints four of them under other names in the shell. JetStream 3 prints
@@ -24,3 +41,21 @@ run_mode = "suite"
 names_file = "js3_names.txt"
 timeout = "15m"
 score_regex = '^([A-Za-z0-9-]+)\s+([A-Za-z0-9-]+-Score|Score)\s+([0-9.]+)\s+pts$'
+page = "index.html"
+query = "report=true"
+report_format = "jetstream"
+
+# Speedometer 3.1 (the release/3.1 branch of WebKit/Speedometer). Browser
+# only. Speedometer has no report protocol, so sp3-report.mjs is injected to
+# POST benchmarkClient's metrics; ?startAutomatically starts the run and the
+# page's iterationCount default of 10 is kept, as crossbench keeps it. The
+# names are the 20 suites enabled by default, the same set on release/3.1
+# and main. Ten iterations of twenty suites take one to three minutes on
+# Apple Silicon; the timeout leaves room for safari.
+[sp3]
+names_file = "sp3_names.txt"
+timeout = "15m"
+page = "index.html"
+query = "startAutomatically=true"
+inject = "sp3-report.mjs"
+report_format = "speedometer"

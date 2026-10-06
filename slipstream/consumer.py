@@ -651,6 +651,7 @@ class BusConsumer:
                 f"{c.suite}/{c.variant}" for c in self.collector.run_configs(engine)
             ],
             "runner_cfg_hash": self.collector._runner(engine).cfg_hash(),
+            "suite_cfg_hash": self.collector.suite_cfg_hashes(engine),
             "harness": self.collector.harness_revs(),
         }
         # `since` is when these values took effect, so a divergence report can

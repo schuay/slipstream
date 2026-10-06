@@ -493,6 +493,63 @@ class TestBuildAndBenchConfig:
             load_config(_write(tmp_path, f"[build]\n{line}\n"))
 
 
+class TestSpeedometerConfig:
+    def _cfg(self, tmp_path, runs='[[run]]\nengine = "chrome"\nsuite = "sp3"\n'):
+        return _write(
+            tmp_path,
+            "[engines.v8]\n[engines.chrome]\n"
+            f'[benchmarks.sp3]\ndir = "{tmp_path}"\n'
+            f'[benchmarks.js3]\ndir = "{tmp_path}"\n'
+            f"{runs}",
+        )
+
+    def test_the_bundled_defaults_describe_a_browser_only_suite(self, tmp_path):
+        sp3 = load_config(self._cfg(tmp_path)).benchmarks["sp3"]
+        assert sp3.cli is None and not sp3.has_shell
+        assert sp3.page == "index.html"
+        assert sp3.query == "startAutomatically=true"
+        assert sp3.inject == "sp3-report.mjs"
+        assert sp3.report_format == "speedometer"
+        assert sp3.report_metrics == {}
+        assert sp3.timeout_seconds == 900
+        assert len(sp3.names) == 21 and sp3.names[-1] == "Overall"
+        assert "TodoMVC-React-Complex-DOM" in sp3.names
+        assert b"didFinishLastIteration" in sp3.inject_bytes()
+
+    def test_jetstream_keeps_its_shell_and_its_report_protocol(self, tmp_path):
+        js3 = load_config(self._cfg(tmp_path)).benchmarks["js3"]
+        assert js3.has_shell and js3.cli == "cli.js"
+        assert (js3.page, js3.query) == ("index.html", "report=true")
+        assert js3.inject is None and js3.report_format == "jetstream"
+        assert js3.inject_bytes() == b""
+
+    def test_a_shell_engine_cannot_run_it(self, tmp_path):
+        with pytest.raises(ValueError, match="has no shell mode"):
+            load_config(self._cfg(tmp_path, '[[run]]\nengine = "v8"\nsuite = "sp3"\n'))
+
+    def test_a_browser_engine_can(self, tmp_path):
+        cfg = load_config(
+            self._cfg(tmp_path, '[[run]]\nengine = "chrome"\nsuite = "sp3"\n')
+        )
+        assert [(r.engine, r.suite) for r in cfg.runs] == [("chrome", "sp3")]
+
+    def test_an_unknown_report_format_is_rejected(self, tmp_path):
+        from slipstream.config import BenchmarkConfig
+
+        with pytest.raises(ValueError, match="report_format"):
+            BenchmarkConfig(
+                name="x", dir=tmp_path, names=[], timeout="1s", report_format="csv"
+            )
+
+    def test_an_inject_must_be_bundled(self, tmp_path):
+        from slipstream.config import BenchmarkConfig
+
+        with pytest.raises(ValueError, match="inject"):
+            BenchmarkConfig(
+                name="x", dir=tmp_path, names=[], timeout="1s", inject="nope.mjs"
+            )
+
+
 def _bench_box(tmp_path, run_section):
     """A config that measures: engines and suites both configured."""
     p = tmp_path / "config.toml"
@@ -615,7 +672,7 @@ class TestStrictKeys:
 
     def test_a_suite_slipstream_does_not_know(self, tmp_path):
         with pytest.raises(ValueError, match="not a suite"):
-            load_config(_write(tmp_path, '[benchmarks.sp3]\ndir = "~/sp3"\n'))
+            load_config(_write(tmp_path, '[benchmarks.octane]\ndir = "~/octane"\n'))
 
     def test_an_engine_key_typo(self, tmp_path):
         with pytest.raises(ValueError, match=r"unknown keys \['srcdir'\]"):

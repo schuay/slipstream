@@ -23,7 +23,7 @@ from . import host
 from .config import Config, EngineConfig, RunSpec
 from .lock import MachineLock
 from .models import CommitKey
-from .runners import RunRequest, RunResult, Runner, runner_for
+from .runners import RunRequest, RunResult, Runner, runner_for, suite_cfg_hash
 from .store import CommitIdCollision, CommitStore
 
 console = Console()
@@ -654,6 +654,8 @@ class BenchCollector:
         ``host_env`` is what the run went through on this machine that is
         neither -- for a browser, the application around the engine and the
         launcher that started it -- and needs the run root to read it.
+        ``suite_cfg_hash`` is the suites' side of the same question, one
+        hash per suite this engine ran.
         """
         from . import __version__
         from .builder import build_cfg_hash
@@ -673,6 +675,7 @@ class BenchCollector:
             "toolchain": identity["toolchain"],
             "build_cfg_hash": build_cfg_hash(engine),
             "runner_cfg_hash": runner.cfg_hash(),
+            "suite_cfg_hash": json.dumps(self.suite_cfg_hashes(engine), sort_keys=True),
             "host_env": json.dumps(host_env, sort_keys=True),
             "slipstream_version": __version__,
         }
@@ -684,6 +687,16 @@ class BenchCollector:
         records, and the cross-box divergence check all come through here.
         """
         return [r for r in self.cfg.runs if r.engine == engine.name]
+
+    def suite_cfg_hashes(self, engine: EngineConfig) -> dict[str, str]:
+        """``suite -> suite_cfg_hash`` for the suites this engine runs: how
+        each is driven and read, which is per suite where ``runner_cfg_hash``
+        is per engine. A change to one suite's protocol shows on that suite
+        and no other."""
+        return {
+            suite: suite_cfg_hash(self.cfg.benchmarks[suite])
+            for suite in sorted({c.suite for c in self.run_configs(engine)})
+        }
 
     def harness_revs(self) -> dict[str, str]:
         """Each benchmark suite's checked-out revision.

@@ -303,6 +303,21 @@ class TestCompareEnv:
         (line,) = compare_env(local, {"runner_cfg_hash": "sha256:b"})
         assert line.startswith("runner_cfg_hash: here 'sha256:a', there 'sha256:b'")
 
+    def test_how_a_suite_is_driven_is_compared_per_suite(self):
+        """One suite's protocol changing is one series' problem, so the
+        line names the suite; a suite only one box runs is not a
+        divergence, the run_configs line covers that."""
+        local = {"suite_cfg_hash": {"js3": "sha256:a", "sp3": "sha256:s"}}
+        assert compare_env(local, {"suite_cfg_hash": {"js3": "sha256:a"}}) == []
+        assert compare_env(local, {"suite_cfg_hash": {"js2": "sha256:z"}}) == []
+        (line,) = compare_env(
+            local, {"suite_cfg_hash": {"js3": "sha256:a", "sp3": "sha256:t"}}
+        )
+        assert line == "suite_cfg_hash[sp3]: here 'sha256:s', there 'sha256:t'"
+        # A box from before the key existed has nothing to disagree with.
+        assert compare_env({}, {"suite_cfg_hash": {"js3": "sha256:a"}}) == []
+        assert compare_env(local, {"suite_cfg_hash": None}) == []
+
 
 def test_render_produces_lines(env):
     env.publish(100)

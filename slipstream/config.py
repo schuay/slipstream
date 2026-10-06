@@ -318,29 +318,69 @@ class BenchProcessConfig:
 
 @dataclass
 class BenchmarkConfig:
-    """A suite: where it is, how its shell cli is invoked and read, and how
-    its browser report maps onto the shell's metric names.
+    """A suite: where it is, and how each kind of engine drives it.
 
-    A browser run reports JSON with a ``Score`` per benchmark and named
-    sub-scores; the shell prints ``Total-Score`` and ``<name>-Score``. That
-    rule is applied by the runner; ``report_metrics`` lists only the
-    sub-scores a suite prints under a different name, so the browser and
-    shell series of one suite share metric names.
+    Shell: ``cli`` is the script a d8 or jsc is given, and ``score_regex`` /
+    ``suite_score_regex`` read its stdout. A suite without ``cli`` has no
+    shell mode (Speedometer), and ``load_config`` refuses to pair it with a
+    shell engine.
+
+    Browser: the suite directory is served over loopback and the browser is
+    pointed at ``page`` with ``query``; the page POSTs its results to
+    ``/report``, and ``report_format`` names the parser. A suite whose page
+    cannot report on its own names an ``inject`` script, bundled with
+    slipstream, that the server appends to ``page``.
+
+    A browser run of JetStream reports JSON with a ``Score`` per benchmark
+    and named sub-scores; the shell prints ``Total-Score`` and
+    ``<name>-Score``. That rule is applied by the parser; ``report_metrics``
+    lists only the sub-scores a suite prints under a different name, so the
+    browser and shell series of one suite share metric names.
     """
 
     name: str
     dir: Path
-    cli: str
     names: list[str]
-    score_regex: str
+    cli: str | None = None
+    score_regex: str | None = None
     timeout: str = "10m"
     run_mode: str = "suite"
     suite_score_regex: str | None = None
     report_metrics: dict[str, str] = field(default_factory=dict)
+    page: str = "index.html"
+    query: str = "report=true"
+    inject: str | None = None
+    report_format: str = "jetstream"
+
+    def __post_init__(self):
+        if self.report_format not in REPORT_FORMATS:
+            raise ValueError(
+                f"suite {self.name}: report_format must be one of "
+                f"{list(REPORT_FORMATS)}: {self.report_format!r}"
+            )
+        if self.inject is not None and not (_DATA / self.inject).is_file():
+            raise ValueError(
+                f"suite {self.name}: inject names {self.inject!r}, which is not "
+                f"bundled with slipstream"
+            )
+
+    @property
+    def has_shell(self) -> bool:
+        return self.cli is not None
 
     @property
     def timeout_seconds(self) -> float:
         return parse_duration(self.timeout)
+
+    def inject_bytes(self) -> bytes:
+        """The injected script as shipped; empty when the suite has none."""
+        if self.inject is None:
+            return b""
+        return (_DATA / self.inject).read_bytes()
+
+
+# The parsers a browser report can go to; see runners/report.py.
+REPORT_FORMATS = ("jetstream", "speedometer")
 
 
 _DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smh]?)\s*$")
@@ -582,13 +622,17 @@ def load_config(user_config_path: Path | None = None) -> Config:
         benchmarks[name] = BenchmarkConfig(
             name=name,
             dir=Path(user_bench["dir"]).expanduser(),
-            cli=defaults["cli"],
             names=names,
-            score_regex=defaults["score_regex"],
+            cli=defaults.get("cli"),
+            score_regex=defaults.get("score_regex"),
             timeout=defaults.get("timeout", "10m"),
             run_mode=defaults.get("run_mode", "suite"),
             suite_score_regex=defaults.get("suite_score_regex"),
             report_metrics=dict(defaults.get("report_metrics", {})),
+            page=defaults.get("page", "index.html"),
+            query=defaults.get("query", "report=true"),
+            inject=defaults.get("inject"),
+            report_format=defaults.get("report_format", "jetstream"),
         )
 
     runs = _parse_runs(user.get("run", []), engines, benchmarks, path)
@@ -737,6 +781,14 @@ def _parse_runs(entries, engines, benchmarks, path: Path) -> list[RunSpec]:
                 f"{where}: suite {suite!r} is not configured; add "
                 f"[benchmarks.{suite}] with a dir "
                 f"(configured: {sorted(benchmarks) or 'none'})"
+            )
+        if engines[engine].runtime == "shell" and not benchmarks[suite].has_shell:
+            # A shell would be handed no script and print nothing; the
+            # commit would be marked failed on every run, which reads as a
+            # broken engine rather than a matrix entry that cannot exist.
+            raise ValueError(
+                f"{where}: suite {suite!r} has no shell mode, and {engine!r} is "
+                f"a shell engine; run it on a browser engine (chrome, safari)"
             )
 
         flags = entry.get("flags", [])

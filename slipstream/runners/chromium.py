@@ -25,8 +25,15 @@ from .browser import BrowserRunner, Command
 # not). --enable-benchmarking is still benchmarking mode: no updater,
 # metrics, Chrome Labs, model downloads. The background pair keeps the
 # page at full speed if the window is ever not in front.
+#
+# The window size is crossbench's default viewport. Headless's own default
+# is 800x600, which is exactly Speedometer's workload frame with no room
+# for the page around it; a clipped frame changes the layout and paint
+# being measured. JetStream does not care, but it gets the same window
+# so that one chrome launch serves both suites.
 CHROMIUM_FLAGS = (
     "--headless=new",
+    "--window-size=1500,1000",
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-search-engine-choice-screen",

@@ -783,19 +783,28 @@ def _clean(row) -> tuple:
 # One pass over staging yields both the line items and the suite total:
 # Overall/Total-Score becomes test 'Total'. Staging has no line item named
 # 'Total', so the two never share a group.
+#
+# A line item's headline number is its Total-Score (JetStream, higher is
+# better) or its Total-Time (Speedometer, milliseconds, lower is better).
+# The aggregate tells them apart in submetric, '' for a score and 'Time'
+# for a time: submetric is in trace_id, so a time and a score of one test
+# are two traces, and every row written before times existed keeps its
+# id. The frontends read the unit and the direction off that one column.
+_LINE_ITEM_METRICS = "('Total-Score', 'Total-Time', 'Score', '')"
+_SUBMETRIC_EXPR = "IF(s.metric = 'Total-Time', 'Time', '')"
 _AGG_SELECT = f"""
     SELECT
         s.bot, s.benchmark, IF(s.test = 'Overall', 'Total', s.test) AS test,
-        '' AS submetric, {_VARIANT_EXPR} AS variant, s.commit_number,
+        {_SUBMETRIC_EXPR} AS submetric, {_VARIANT_EXPR} AS variant, s.commit_number,
         MIN(s.commit_time), MIN(s.git_hash), 'slipstream' AS source,
         AVG(s.val), MIN(s.val), MAX(s.val),
         COALESCE(STDDEV_SAMP(s.val), 0.0), COUNT(*)
     FROM {{source}}
-    WHERE ((s.test != 'Overall' AND s.metric IN ('Total-Score', 'Score', ''))
+    WHERE ((s.test != 'Overall' AND s.metric IN {_LINE_ITEM_METRICS})
            OR (s.test = 'Overall' AND s.metric = 'Total-Score'))
       {{where}}
     GROUP BY s.bot, s.benchmark, IF(s.test = 'Overall', 'Total', s.test),
-        {_VARIANT_EXPR}, s.commit_number
+        {_SUBMETRIC_EXPR}, {_VARIANT_EXPR}, s.commit_number
 """
 
 # JS2 groups without a harness total get the geomean of their line items. Only
@@ -993,6 +1002,7 @@ def _refresh_legacy(db, into: str = "both") -> str | None:
 _SAMPLES_AGG_SELECT = f"""
     SELECT
         s.commit_number, IF(s.test = 'Overall', 'Total', s.test) AS test,
+        {_SUBMETRIC_EXPR} AS submetric,
         MIN(c.commit_time), MIN(c.git_hash), MIN(c.embedder_hash),
         AVG(s.value), MIN(s.value), MAX(s.value),
         COALESCE(STDDEV_SAMP(s.value), 0.0), COUNT(*)
@@ -1002,10 +1012,11 @@ _SAMPLES_AGG_SELECT = f"""
      AND c.commit_number = s.commit_number
     WHERE s.bot = %s AND s.suite = %s AND s.engine = %s AND s.variant = %s
       AND s.embedder_number = %s
-      AND ((s.test != 'Overall' AND s.metric IN ('Total-Score', 'Score', ''))
+      AND ((s.test != 'Overall' AND s.metric IN {_LINE_ITEM_METRICS})
            OR (s.test = 'Overall' AND s.metric = 'Total-Score'))
       {{where}}
-    GROUP BY s.commit_number, IF(s.test = 'Overall', 'Total', s.test)
+    GROUP BY s.commit_number, IF(s.test = 'Overall', 'Total', s.test),
+        {_SUBMETRIC_EXPR}
 """
 
 
@@ -1033,16 +1044,22 @@ def aggregate_samples(
     benchmark = frontend_benchmark(suite)
     label = frontend_variant(engine, variant)
     rows = []
-    for commit, test, commit_time, git_hash, embedder_hash, *stats in db.query(
-        _SAMPLES_AGG_SELECT.format(where=where), params
-    ):
+    for (
+        commit,
+        test,
+        submetric,
+        commit_time,
+        git_hash,
+        embedder_hash,
+        *stats,
+    ) in db.query(_SAMPLES_AGG_SELECT.format(where=where), params):
         rows.append(
             _clean(
                 (
                     bot,
                     benchmark,
                     test,
-                    "",
+                    submetric,
                     label,
                     commit,
                     commit_time,

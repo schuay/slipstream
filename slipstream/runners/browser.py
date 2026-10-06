@@ -5,11 +5,14 @@
 
 What differs between browsers is how one is started -- argv, environment,
 what to clean up afterwards -- and a subclass says that in ``command`` and
-``cleanup``. The run itself is here: serve the suite, start the browser at
-``index.html?report=true``, wait for the page's ``POST /report`` or for the
-browser to die or the suite's timeout to pass, tear the browser down, and
-turn the report into scores. Any of timeout, early exit, an unreadable
-report or a report missing benchmarks fails the config, never the commit.
+``cleanup``. What differs between suites is the page, its query string,
+whether a reporter script is appended to it and which parser reads the
+report, and the suite's config says that. The run itself is here: serve
+the suite, start the browser at the suite's page, wait for the page's
+``POST /report`` or for the browser to die or the suite's timeout to pass,
+tear the browser down, and turn the report into scores. Any of timeout,
+early exit, an unreadable report or a report missing benchmarks fails the
+config, never the commit.
 """
 
 from __future__ import annotations
@@ -26,10 +29,9 @@ from rich.markup import escape
 
 from ..config import EngineConfig
 from .base import Log, Progress, RunRequest, RunResult, cfg_digest, geomean_overall
-from .report import ReportError, parse_report
+from .report import TOTAL_METRICS, ReportError, parse_for
 from .server import BenchServer
 
-PAGE = "index.html"
 POLL_SECONDS = 0.5
 GRACE_SECONDS = 5.0
 # How long after the page's first request the early provenance check runs:
@@ -71,15 +73,13 @@ class BrowserRunner:
 
     def conventions(self) -> tuple[str, ...]:
         """What every run of this browser gets, for ``cfg_hash``: the fixed
-        flags, the launch mechanism. Not the ``[[run]]`` flags."""
+        flags, the launch mechanism. Not the ``[[run]]`` flags, which are
+        the variant, and not the page, which is the suite's
+        (``suite_cfg_hash``)."""
         raise NotImplementedError
 
     def cfg_hash(self) -> str:
-        return cfg_digest(
-            self.runtime,
-            f"GET {PAGE}?report=true; POST /report",
-            *self.conventions(),
-        )
+        return cfg_digest(self.runtime, "POST /report", *self.conventions())
 
     def host_env(self, engine: EngineConfig, run_root: Path) -> dict[str, str]:
         return {}
@@ -115,14 +115,18 @@ class BrowserRunner:
 
     def run(self, req: RunRequest) -> RunResult:
         label = f"{req.spec.suite} ({req.spec.variant})"
+        bench = req.bench
         stderr_file = req.artifact("stderr", "txt")
         problem = self.precondition(req)
         if problem:
             self._fail(label, problem)
             stderr_file.write_text(f"not launched: {problem}\n")
             return RunResult(False, [])
-        with BenchServer(req.bench.dir) as server, open(stderr_file, "w") as err_f:
-            url = server.url(PAGE, report="true")
+        with (
+            BenchServer(bench.dir, page=bench.page, inject=bench.inject) as server,
+            open(stderr_file, "w") as err_f,
+        ):
+            url = server.page_url(bench.page, bench.query)
             cmd = self.command(req, url)
             err_f.write(f"$ {shlex.join(cmd.argv)}\n")
             err_f.flush()
@@ -142,7 +146,7 @@ class BrowserRunner:
                 return RunResult(False, [])
             try:
                 body = self._await_report(
-                    server, proc, req.bench.timeout_seconds, label, req, err_f
+                    server, proc, bench.timeout_seconds, label, req, err_f
                 )
                 if body is not None and not self._verified(req, proc, label, err_f):
                     body = None
@@ -157,19 +161,23 @@ class BrowserRunner:
         req.artifact("report", "json").write_bytes(body)
 
         try:
-            scores = parse_report(
+            scores = parse_for(bench.report_format)(
                 body,
                 req.spec.suite,
                 req.spec.variant,
                 req.run,
-                req.bench.report_metrics,
+                bench.report_metrics,
             )
         except ReportError as exc:
             self._fail(label, str(exc))
             return RunResult(False, [])
 
-        expected = {n for n in req.bench.names if n != "Overall"}
-        reported = {s.benchmark for s in scores if s.metric == "Total-Score"}
+        expected = {n for n in bench.names if n != "Overall"}
+        reported = {
+            s.benchmark
+            for s in scores
+            if s.metric in TOTAL_METRICS and s.benchmark != "Overall"
+        }
         if reported != expected:
             missing = sorted(expected - reported)
             extra = sorted(reported - expected)
@@ -180,7 +188,10 @@ class BrowserRunner:
                 + (f"; unexpected {extra}" if extra else ""),
             )
             return RunResult(False, scores)
-        scores.extend(geomean_overall(scores, req.run))
+        # A report that carries the suite's own overall (Speedometer's
+        # Score) keeps it; JetStream's carries only the per-test numbers.
+        if not any(s.benchmark == "Overall" for s in scores):
+            scores.extend(geomean_overall(scores, req.run))
         return RunResult(True, scores)
 
     def _await_report(

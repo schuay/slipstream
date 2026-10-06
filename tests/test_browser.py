@@ -15,7 +15,13 @@ import pytest
 from slipstream.config import BenchmarkConfig, RunSpec, load_config, parse_duration
 from slipstream.models import Score
 from slipstream.runners import BenchServer, BrowserRunner, Command, RunRequest
-from slipstream.runners.report import ReportError, parse_report
+from slipstream.runners.report import (
+    ReportError,
+    parse_for,
+    parse_report,
+    parse_speedometer,
+)
+from slipstream.runners.server import inject_tag, injected
 from test_runners import _engine
 
 FAKE_BROWSER = Path(__file__).with_name("fake_browser.py")
@@ -86,6 +92,76 @@ class TestParseReport:
             parse_report(body, "js2", "default", 1, {})
 
 
+def _sp3_metric(mean, unit="ms"):
+    return {"unit": unit, "mean": mean, "delta": 0, "sum": mean, "values": [mean]}
+
+
+def _sp3_report(score=20.0, **suites):
+    """What sp3-report.mjs posts: benchmarkClient.metrics, flattened the
+    way Speedometer flattens it, with the nested and per-iteration
+    entries a real run also has."""
+    metrics = {}
+    for name, mean in suites.items():
+        metrics[name] = _sp3_metric(mean)
+        metrics[f"{name}/Adding100Items"] = _sp3_metric(mean / 2)
+        metrics[f"{name}/Adding100Items/sync"] = _sp3_metric(mean / 4)
+    metrics["Iteration-0-Total"] = _sp3_metric(sum(suites.values()))
+    metrics["Geomean"] = _sp3_metric(50.0)
+    metrics["Score"] = _sp3_metric(score, unit="score")
+    return {"metrics": metrics}
+
+
+class TestParseSpeedometer:
+    def test_a_suites_mean_is_its_time_and_score_is_the_overall(self):
+        body = json.dumps(_sp3_report(20.0, Charts=100.0, Editors=200.0)).encode()
+        scores = parse_speedometer(body, "sp3", "default", 1, {})
+        assert scores == [
+            Score("sp3", "default", "Charts", "Total-Time", 1, 100.0),
+            Score("sp3", "default", "Editors", "Total-Time", 1, 200.0),
+            Score("sp3", "default", "Overall", "Total-Score", 1, 20.0),
+        ]
+
+    def test_only_what_crossbench_keeps_is_kept(self):
+        """Steps, Iteration-N-Total and Geomean are left out; the perf
+        database wants the same traces crossbench's runs produce."""
+        body = json.dumps(_sp3_report(20.0, Charts=100.0)).encode()
+        kept = {
+            (s.benchmark, s.metric) for s in parse_speedometer(body, "sp3", "", 1, {})
+        }
+        assert kept == {("Charts", "Total-Time"), ("Overall", "Total-Score")}
+
+    def test_a_suite_that_never_ran_has_no_time(self):
+        doc = _sp3_report(20.0, Charts=100.0)
+        doc["metrics"]["Editors"] = _sp3_metric(float("nan"))
+        doc["metrics"]["Mail"] = _sp3_metric(None)
+        scores = parse_speedometer(json.dumps(doc).encode(), "sp3", "", 1, {})
+        assert [s.benchmark for s in scores] == ["Charts", "Overall"]
+
+    def test_the_pages_error_is_the_message(self):
+        body = json.dumps({"error": {"message": "boom", "stack": "at x"}}).encode()
+        with pytest.raises(ReportError, match="the page reported an error: boom"):
+            parse_speedometer(body, "sp3", "", 1, {})
+
+    def test_a_report_without_the_overall_is_not_a_report(self):
+        doc = _sp3_report(20.0, Charts=100.0)
+        del doc["metrics"]["Score"]
+        with pytest.raises(ReportError, match="no Score"):
+            parse_speedometer(json.dumps(doc).encode(), "sp3", "", 1, {})
+
+    @pytest.mark.parametrize(
+        "body", [b"not json", b"[]", b"{}", b'{"metrics": {}}', b'{"metrics": 1}']
+    )
+    def test_anything_else_is_an_error(self, body):
+        with pytest.raises(ReportError):
+            parse_speedometer(body, "sp3", "", 1, {})
+
+    def test_the_format_picks_the_parser(self):
+        assert parse_for("jetstream") is parse_report
+        assert parse_for("speedometer") is parse_speedometer
+        with pytest.raises(ValueError, match="no parser"):
+            parse_for("octane")
+
+
 class TestBenchServer:
     def test_serves_the_suite_with_the_types_a_browser_needs(self, tmp_path):
         (tmp_path / "index.html").write_text("<html>")
@@ -115,6 +191,52 @@ class TestBenchServer:
                 urllib.request.urlopen(req)
             assert exc.value.code == 404
             assert server.report is None
+
+    def test_page_url_spells_the_query_as_the_suite_does(self, tmp_path):
+        with BenchServer(tmp_path) as server:
+            assert server.page_url("index.html", "startAutomatically=true").endswith(
+                "/index.html?startAutomatically=true"
+            )
+            assert server.page_url("index.html", "").endswith("/index.html")
+
+    def test_the_inject_script_is_appended_to_the_page_only(self, tmp_path):
+        """The suite's checkout is served as is, except that the one page
+        the browser is sent to gets the module tag before </body>; the
+        script itself comes from the package, not the checkout."""
+        from importlib.resources import files
+
+        page = b"<html><body><h1>hi</h1>\n</body></html>\n"
+        (tmp_path / "index.html").write_bytes(page)
+        (tmp_path / "other.html").write_bytes(page)
+        with BenchServer(tmp_path, inject="sp3-report.mjs") as server:
+            with urllib.request.urlopen(server.url("index.html")) as r:
+                html = r.read()
+                assert r.headers["Content-Type"] == "text/html"
+            with urllib.request.urlopen(server.url("other.html")) as r:
+                assert r.read() == page
+            with urllib.request.urlopen(server.url("__slipstream/sp3-report.mjs")) as r:
+                assert r.headers["Content-Type"] == "text/javascript"
+                script = r.read()
+        tag = inject_tag("sp3-report.mjs")
+        assert html.count(tag) == 1
+        assert html.index(tag) < html.index(b"</body>")
+        assert html.replace(tag + b"\n", b"") == page
+        assert (
+            script == files("slipstream.data").joinpath("sp3-report.mjs").read_bytes()
+        )
+        assert b"didFinishLastIteration" in script and b"/report" in script
+
+    def test_a_page_without_a_body_tag_still_gets_the_script(self):
+        assert injected(b"<p>x</p>", "s.mjs").endswith(inject_tag("s.mjs") + b"\n")
+
+    def test_without_an_inject_nothing_is_rewritten(self, tmp_path):
+        (tmp_path / "index.html").write_bytes(b"<body></body>")
+        with BenchServer(tmp_path) as server:
+            with urllib.request.urlopen(server.url("index.html")) as r:
+                assert r.read() == b"<body></body>"
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                urllib.request.urlopen(server.url("__slipstream/sp3-report.mjs"))
+            assert exc.value.code == 404
 
 
 class _FakeBrowser(BrowserRunner):
@@ -170,6 +292,23 @@ def req(tmp_path, monkeypatch):
         run=1,
         res_dir=res,
     )
+
+
+@pytest.fixture
+def sp3_req(req):
+    """The same request for a Speedometer run: no shell, a page the server
+    appends the reporter to, and the overall coming from the page."""
+    bench = BenchmarkConfig(
+        name="sp3",
+        dir=req.bench.dir,
+        names=["Charts", "Editors", "Overall"],
+        timeout="0.3s",
+        query="startAutomatically=true",
+        inject="sp3-report.mjs",
+        report_format="speedometer",
+    )
+    spec = RunSpec(engine="chrome", suite="sp3", variant="default")
+    return RunRequest(**{**req.__dict__, "bench": bench, "spec": spec})
 
 
 def _gone(pid):
@@ -267,6 +406,36 @@ class TestBrowserRunner:
         assert proc.returncode == -signal.SIGKILL
 
 
+class TestSpeedometerRun:
+    def test_the_page_is_fetched_with_the_reporter_and_its_overall_kept(self, sp3_req):
+        runner = _FakeBrowser(report=_sp3_report(20.0, Charts=100.0, Editors=200.0))
+        result = runner.run(sp3_req)
+        assert result.ok, runner.logged
+        by_key = {(s.benchmark, s.metric): s.score for s in result.scores}
+        assert by_key == {
+            ("Charts", "Total-Time"): 100.0,
+            ("Editors", "Total-Time"): 200.0,
+            # Speedometer's own Score, not a geomean of the times above.
+            ("Overall", "Total-Score"): 20.0,
+        }
+        stderr = sp3_req.artifact("stderr", "txt").read_text()
+        assert "GET /index.html?startAutomatically=true" in stderr
+        assert "GET /__slipstream/sp3-report.mjs" in stderr
+        assert "POST /report" in stderr
+
+    def test_the_pages_error_fails_the_config(self, sp3_req):
+        runner = _FakeBrowser(report={"error": {"message": "boom", "stack": ""}})
+        result = runner.run(sp3_req)
+        assert not result.ok and result.scores == []
+        assert any("the page reported an error: boom" in m for m in runner.logged)
+
+    def test_a_suite_the_page_did_not_time_is_missing(self, sp3_req):
+        runner = _FakeBrowser(report=_sp3_report(20.0, Charts=100.0))
+        result = runner.run(sp3_req)
+        assert not result.ok
+        assert any("missing ['Editors']" in m for m in runner.logged)
+
+
 class TestConfig:
     def test_js2_renames_and_js3_does_not(self, tmp_path):
         for s in ("js2", "js3"):
@@ -345,6 +514,14 @@ class TestChromiumRunner:
 
         assert "--disable-field-trial-config" in CHROMIUM_FLAGS
         assert "--enable-benchmarking" in CHROMIUM_FLAGS
+
+    def test_headless_has_the_viewport_crossbench_gives_it(self):
+        """Speedometer does layout; a headless window of some default
+        size would measure something else than crossbench's 1500x1000."""
+        from slipstream.runners.chromium import CHROMIUM_FLAGS
+
+        assert "--headless=new" in CHROMIUM_FLAGS
+        assert "--window-size=1500,1000" in CHROMIUM_FLAGS
 
     def test_cleanup_without_a_command_is_fine(self, req):
         self._runner().cleanup(req)

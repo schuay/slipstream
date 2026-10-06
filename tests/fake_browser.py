@@ -7,18 +7,23 @@ environment says. ``FAKE_BROWSER`` is ``report`` (POST ``FAKE_REPORT`` to
 ``exit`` (die before reporting) or ``hang`` (never report)."""
 
 import os
+import re
 import sys
 import time
 import urllib.request
 
 url = sys.argv[-1]
 mode = os.environ.get("FAKE_BROWSER", "report")
+origin = url.split("/index.html")[0]
 
-urllib.request.urlopen(url).read()
+page = urllib.request.urlopen(url).read()
+# A browser fetches the page's module scripts; the one slipstream appends
+# is the only one a fake page has.
+for src in re.findall(rb'src="(/__slipstream/[^"]+)"', page):
+    urllib.request.urlopen(origin + src.decode()).read()
 if mode == "exit":
     sys.exit(3)
 if mode == "report":
-    origin = url.split("/index.html")[0]
     body = os.environ["FAKE_REPORT"].encode()
     urllib.request.urlopen(
         urllib.request.Request(origin + "/report", data=body, method="POST")
