@@ -113,6 +113,10 @@ class BenchServer(ThreadingHTTPServer):
     the script to append, and the one page it is appended to."""
 
     daemon_threads = True
+    # TCPServer's default backlog is only five. Bursts of workload scripts
+    # can overflow it on macOS, resetting connections before their GETs ever
+    # reach the handler and leaving benchmark applications partly loaded.
+    request_queue_size = 128
 
     def __init__(
         self, root: Path, *, page: str = "index.html", inject: str | None = None

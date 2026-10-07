@@ -234,7 +234,7 @@ class TestRunnerProvenance:
     SUITE_HASHES = {
         "js2": "sha256:c8c206b3c459a43f8f7305b13be726b06b65cab2b7c7176a9d647acffcd14c14",
         "js3": "sha256:d8ad52ef09321611b173790a448042039dc1307feaef4275a4d57787736647a9",
-        "sp3": "sha256:f9818f60cf71ff8644dbf3fa8d99e904c4124aa72f9a8de3bb21f26b9244b685",
+        "sp3": "sha256:0140727a710fb747fd56259e58758c28ded078598674baf6e7e6b65c038ba4ac",
     }
 
     @pytest.mark.parametrize("runtime", sorted(RUNNER_HASHES))

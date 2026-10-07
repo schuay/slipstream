@@ -19,15 +19,27 @@
 // by ?startAutomatically on the URL, not from here.
 
 const REPORT_PATH = "/report";
+let reported = false;
 
 function post(body) {
+    if (reported)
+        return;
+    reported = true;
     return fetch(REPORT_PATH, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-        keepalive: true,
     }).catch((e) => console.error("slipstream: report failed", e));
 }
+
+// Exceptions in the runner's animation-frame callbacks do not reach
+// handleError. Report the original error before finalization masks it.
+globalThis.addEventListener("error", (event) => {
+    post({ error: describe(event.error ?? event.message) });
+});
+globalThis.addEventListener("unhandledrejection", (event) => {
+    post({ error: describe(event.reason) });
+});
 
 function describe(error) {
     return {

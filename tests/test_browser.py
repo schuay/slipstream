@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
 import sys
 import urllib.request
 from pathlib import Path
@@ -163,6 +164,21 @@ class TestParseSpeedometer:
 
 
 class TestBenchServer:
+    def test_queues_a_burst_of_browser_connections(self, tmp_path):
+        # Pause accepting to reproduce a browser's burst of parallel assets.
+        # The old five-connection backlog drops connections on macOS.
+        server = BenchServer(tmp_path)
+        clients = []
+        try:
+            for _ in range(16):
+                clients.append(
+                    socket.create_connection(("127.0.0.1", server.port), timeout=1)
+                )
+        finally:
+            for client in clients:
+                client.close()
+            server.server_close()
+
     def test_serves_the_suite_with_the_types_a_browser_needs(self, tmp_path):
         (tmp_path / "index.html").write_text("<html>")
         (tmp_path / "m.wasm").write_bytes(b"\0asm")
