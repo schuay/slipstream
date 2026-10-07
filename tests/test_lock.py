@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import signal
@@ -576,7 +577,7 @@ class TestAcquireIsAtomic:
         import fcntl as _fcntl
 
         def enolck(fd, op):
-            raise OSError(37, "No locks available")
+            raise OSError(errno.ENOLCK, "No locks available")
 
         monkeypatch.setattr(_fcntl, "flock", enolck)
         a = MachineLock("watch", lock_path)

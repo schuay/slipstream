@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import io
 import subprocess
 import tarfile
 import time
@@ -549,10 +550,11 @@ class TestPackaging:
 
         out = tmp_path / "unpacked"
         out.mkdir()
-        subprocess.run(
-            ["tar", "--use-compress-program=zstd", "-xf", str(dest), "-C", str(out)],
-            check=True,
-        )
+        raw = subprocess.run(
+            ["zstd", "-dc", str(dest)], capture_output=True, check=True
+        ).stdout
+        with tarfile.open(fileobj=io.BytesIO(raw)) as archive:
+            archive.extractall(out, filter="data")
         assert (out / "out" / "d8").read_bytes() == b"\x7fELF fake"
         assert (out / "out" / "lib" / "icu.dat").read_bytes() == b"data"
         # Symlinks are preserved, not followed: dereferencing a framework
