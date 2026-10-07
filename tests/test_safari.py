@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -47,6 +48,9 @@ def req(tmp_path, monkeypatch):
     import slipstream.runners.browser as browser
 
     monkeypatch.setattr(browser, "POLL_SECONDS", 0.02)
+    monkeypatch.setattr(safari_mod, "QUIET_SECONDS", 0.01)
+    monkeypatch.setattr(safari_mod, "POLL_SECONDS", 0.002)
+    monkeypatch.setattr(safari_mod, "GRACE_SECONDS", 0.05)
     suite = tmp_path / "suite"
     suite.mkdir()
     (suite / "index.html").write_text("<html>")
@@ -125,6 +129,10 @@ class _Runner(SafariRunner):
     def processes(self):
         return list(self.host.procs) if self.host and self.host.live else []
 
+    def _signal_process(self, pid, name, sig):
+        if self.host:
+            self.host.procs = [p for p in self.host.procs if p != (pid, name)]
+
     def loaded_images(self, pid):
         return list(self.host.images.get(pid, [])) if self.host else []
 
@@ -178,15 +186,13 @@ class TestPrecondition:
             "/x/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
         ],
     )
-    def test_anything_of_safaris_blocks_the_launch(self, req, name):
+    def test_stale_safari_processes_are_drained_before_launch(self, req, name):
         host = _Host(req.run_root, 1)
         host.procs = [(4242, name)]
         runner = _Runner(host)
-        problem = runner.precondition(req)
-        assert problem and "(4242)" in problem and "quit it" in problem
-        result = runner.run(req)
-        assert not result.ok
-        assert req.artifact("stderr", "txt").read_text().startswith("not launched:")
+        assert runner.precondition(req) is None
+        assert host.procs == []
+        assert any("SIGTERM" in line and "(4242)" in line for line in runner.logged)
 
     def test_a_quiet_machine_passes(self, req):
         host = _Host(req.run_root, 1)
@@ -311,6 +317,13 @@ class TestRun:
         host.content(sleeper.pid)
         runner = _Runner(host)
         assert runner.verify(req, launcher).ok
+
+        def signal_process(pid, name, sig):
+            assert pid in (launcher.pid, sleeper.pid)
+            safari_mod._kill(pid, sig)
+            runner.host.procs = [p for p in runner.host.procs if p != (pid, name)]
+
+        runner._signal_process = signal_process
         runner.terminate(launcher)
         assert launcher.poll() is not None
         try:
@@ -319,3 +332,155 @@ class TestRun:
             sleeper.kill()
             pytest.fail("the content process outlived terminate()")
         assert runner._content_pids == []
+
+
+class TestRecovery:
+    def test_a_process_ignoring_term_is_killed(self, req):
+        host = _Host(req.run_root, 4242)
+        runner = _Runner(host)
+        signals = []
+
+        def signal_process(pid, name, sig):
+            signals.append(sig)
+            if sig == signal.SIGKILL:
+                host.procs.clear()
+
+        runner._signal_process = signal_process
+        assert runner.precondition(req) is None
+        assert signals == [signal.SIGTERM, signal.SIGKILL]
+
+    def test_a_late_helper_resets_the_quiet_wait(self, req):
+        host = _Host(req.run_root, 4242)
+        runner = _Runner(host)
+        scans = 0
+
+        def processes():
+            nonlocal scans
+            scans += 1
+            if scans == 3:
+                host.content(4243)
+            return list(host.procs)
+
+        runner.processes = processes
+        assert runner.precondition(req) is None
+        assert host.procs == []
+        assert any("(4243)" in line for line in runner.logged)
+
+    def test_cleanup_also_runs_when_provenance_failed(self, req):
+        host = _Host(req.run_root, 4242)
+        host.content(4243, jsc_dir="/System/Library/Frameworks")
+        runner = _Runner(host)
+        host.images[4242] = []
+        assert not runner.verify(req, _Proc(4242)).ok
+        assert runner._content_pids == []
+        # The fake launcher already exited; neither it nor its group can
+        # account for launchd's WebContent process.
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        runner.terminate(proc)
+        assert host.procs == []
+        assert any("(4243)" in line for line in runner.logged)
+
+    def test_unkillable_process_blocks_launch_with_bounded_recovery(self, req):
+        host = _Host(req.run_root, 4242)
+        runner = _Runner(host)
+        runner._signal_process = lambda *args: None
+        start = time.monotonic()
+        result = runner.run(req)
+        assert not result.ok
+        assert time.monotonic() - start < 1
+        assert "quiet state" in req.artifact("stderr", "txt").read_text()
+
+    def test_failed_process_inspection_blocks_launch(self, req):
+        runner = _Runner()
+
+        def processes():
+            raise RuntimeError("ps unavailable")
+
+        runner.processes = processes
+        assert "ps unavailable" in runner.precondition(req)
+
+    def test_process_scan_is_limited_to_current_user(self, monkeypatch):
+        def run(argv, **kwargs):
+            assert argv == ["ps", "-U", str(os.getuid()), "-o", "pid=,comm="]
+            assert kwargs["timeout"] == safari_mod.GRACE_SECONDS
+            return subprocess.CompletedProcess(argv, 0, "42 /sbin/launchd\n", "")
+
+        monkeypatch.setattr(subprocess, "run", run)
+        assert _Runner().processes() == []  # scripted host
+        runner = SafariRunner(log=lambda _: None, progress=lambda: None)
+        assert runner.processes() == [(42, "/sbin/launchd")]
+
+    def test_pid_reused_for_another_executable_is_not_signaled(self, monkeypatch):
+        runner = SafariRunner(log=lambda _: None, progress=lambda: None)
+        runner.processes = lambda: [(4242, "/usr/bin/ssh")]
+        killed = []
+        monkeypatch.setattr(safari_mod, "_kill", lambda *args: killed.append(args))
+        runner._signal_process(4242, LAUNCHER, signal.SIGTERM)
+        assert killed == []
+
+
+class TestRetry:
+    def test_transient_provenance_failure_gets_a_clean_measurement(self, req):
+        from slipstream.runners.browser import Verdict
+
+        host = _Host(req.run_root, 0, live=False)
+        runner = _Runner(host, report=_js2_report(Air=4.0, Box2D=9.0))
+        attempts = 0
+        original_command = runner.command
+        original_verify = runner.verify
+
+        def command(req_, url):
+            host.procs = [(0, LAUNCHER)]
+            return original_command(req_, url)
+
+        def verify(req_, proc):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                host.content(555, jsc_dir="/System/Library/Frameworks")
+                return Verdict(
+                    False, [], "a stale content process loaded the system engine"
+                )
+            host.procs[0] = (proc.pid, LAUNCHER)
+            host.images[proc.pid] = host.images[0]
+            host.content(556)
+            return original_verify(req_, proc)
+
+        runner.command = command
+        runner.verify = verify
+        result = runner.run(req)
+        assert result.ok, runner.logged
+        assert attempts == 2
+        assert any("retrying" in message for message in runner.logged)
+        recovery = req.artifact("stderr-recovery", "txt").read_text()
+        assert "stale content process" in recovery
+        assert "WebContent 556" in req.artifact("stderr", "txt").read_text()
+
+    @pytest.mark.parametrize(
+        "problem,retried",
+        [
+            ("provenance: foreign engine", True),
+            ("browser exited (1) before reporting", True),
+            ("cannot start browser: launcher unavailable", True),
+            ("the page reported an error: workload is broken", False),
+            ("no report within 900s", False),
+        ],
+    )
+    def test_only_environment_failures_retry_and_only_once(
+        self, req, monkeypatch, problem, retried
+    ):
+        from slipstream.runners.base import RunResult
+        from slipstream.runners.browser import BrowserRunner
+
+        calls = []
+
+        def run(self, request):
+            calls.append(request)
+            self._fail("test", problem)
+            return RunResult(False, [])
+
+        monkeypatch.setattr(BrowserRunner, "run", run)
+        result = _Runner().run(req)
+        assert not result.ok
+        assert len(calls) == (2 if retried else 1)

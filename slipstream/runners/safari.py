@@ -20,7 +20,7 @@ launcher has loaded ``Safari.framework`` from the run root, and every
 WebContent process with a ``JavaScriptCore`` mapped has it from the run
 root, at least one of them existing. WebContent processes are launchd's
 children, not ours, which is why the check is over all of them and why
-nothing of Safari's may be running when a run starts.
+the benchmark account is drained of Safari and WebContent before a run.
 """
 
 from __future__ import annotations
@@ -34,8 +34,8 @@ from pathlib import Path
 
 from ..config import EngineConfig
 from ..hostapp import bundle_of, describe
-from .base import RunRequest
-from .browser import GRACE_SECONDS, BrowserRunner, Command, Verdict
+from .base import RunRequest, RunResult
+from .browser import GRACE_SECONDS, BrowserRunner, Command, Verdict, _signal_group
 
 ARCH = "/usr/bin/arch"
 DYLD_VARS = (
@@ -58,6 +58,8 @@ WEBCONTENT = "com.apple.WebKit.WebContent"
 SAFARI_PROCESSES = ("Safari", "SafariForWebKitDevelopment", "Safari Technology Preview")
 JSC_IMAGE = "JavaScriptCore.framework/Versions/A/JavaScriptCore"
 SAFARI_IMAGE = "Safari.framework/Versions/A/Safari"
+QUIET_SECONDS = 0.3
+POLL_SECONDS = 0.1
 
 
 def _is_macos() -> bool:
@@ -70,13 +72,38 @@ class SafariRunner(BrowserRunner):
     def __init__(self, **kw):
         super().__init__(**kw)
         self._content_pids: list[int] = []
+        self._retryable = False
+        self._recovery_problem = ""
 
     def conventions(self) -> tuple[str, ...]:
         return (
             f"{ARCH} -arm64e -e <var>=<dyld_search_path> for " + ", ".join(DYLD_VARS),
             "<launcher> -HomePage <url>",
             *LAUNCH_ARGS,
+            "drain current-user Safari/WebContent before and after each run",
+            "retry launch/provenance failure once after cleanup",
         )
+
+    def run(self, req: RunRequest) -> RunResult:
+        self._retryable = False
+        self._recovery_problem = ""
+        result = super().run(req)
+        if not result.ok and self._retryable:
+            stderr = req.artifact("stderr", "txt")
+            if stderr.exists():
+                with stderr.open("a") as output:
+                    output.write(f"\nrecovery reason: {self._recovery_problem}\n")
+                stderr.replace(req.artifact("stderr-recovery", "txt"))
+            self._log("Safari recovery: retrying the measurement after cleanup")
+            self._retryable = False
+            result = super().run(req)
+        return result
+
+    def _fail(self, label: str, what: str) -> None:
+        if what.startswith(("provenance:", "browser exited", "cannot start browser:")):
+            self._retryable = True
+            self._recovery_problem = what
+        super()._fail(label, what)
 
     def host_env(self, engine: EngineConfig, run_root: Path) -> dict[str, str]:
         # host_app is the STP the entry packaged, read from the run root;
@@ -107,17 +134,46 @@ class SafariRunner(BrowserRunner):
         return Command(args, env=env)
 
     def precondition(self, req: RunRequest) -> str | None:
-        running = [
-            f"{name} ({pid})" for pid, name in self.processes() if _is_safari(name)
-        ]
-        if running:
-            return (
-                "Safari is already running: "
-                + ", ".join(running[:4])
-                + ("..." if len(running) > 4 else "")
-                + "; quit it, nothing of Safari's may run beside a measurement"
-            )
-        return None
+        return self._quiesce()
+
+    def _quiesce(self) -> str | None:
+        """Bounded recovery for this dedicated benchmark account.
+
+        Rescan throughout cleanup: launchd owns WebContent, and helpers can
+        appear after verification or while their launcher is shutting down.
+        """
+        try:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                deadline = time.monotonic() + GRACE_SECONDS
+                signaled: set[tuple[int, str]] = set()
+                quiet_since = None
+                while time.monotonic() < deadline:
+                    running = [(p, n) for p, n in self.processes() if _is_safari(n)]
+                    if not running:
+                        if quiet_since is None:
+                            quiet_since = time.monotonic()
+                        if time.monotonic() - quiet_since >= QUIET_SECONDS:
+                            return None
+                    else:
+                        quiet_since = None
+                        for pid, name in running:
+                            if (pid, name) not in signaled:
+                                self._log(f"Safari cleanup: {sig.name} {name} ({pid})")
+                                self._signal_process(pid, name, sig)
+                                signaled.add((pid, name))
+                    time.sleep(POLL_SECONDS)
+            running = [(p, n) for p, n in self.processes() if _is_safari(n)]
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            return f"cannot clean up Safari processes: {exc}"
+        return "Safari cleanup did not reach a quiet state: " + ", ".join(
+            f"{name} ({pid})" for pid, name in running[:4]
+        )
+
+    def _signal_process(self, pid: int, name: str, sig: signal.Signals) -> None:
+        # Recheck user ownership and executable identity before signaling a
+        # PID from an earlier snapshot; the original process may have exited.
+        if (pid, name) in self.processes():
+            _kill(pid, sig)
 
     # --- evidence ---
 
@@ -139,7 +195,11 @@ class SafariRunner(BrowserRunner):
             )
 
         content: list[tuple[int, str]] = []
-        for pid, name in self.processes():
+        try:
+            processes = self.processes()
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            return Verdict(False, notes, f"cannot inspect WebContent processes: {exc}")
+        for pid, name in processes:
             if WEBCONTENT not in name:
                 continue
             jsc = _image(self.loaded_images(pid), JSC_IMAGE)
@@ -162,43 +222,42 @@ class SafariRunner(BrowserRunner):
     # --- teardown ---
 
     def terminate(self, proc: subprocess.Popen) -> None:
-        super().terminate(proc)
-        # The content processes we identified, and only those: they belong
-        # to launchd, so the launcher's group did not reach them.
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            alive = [pid for pid in self._content_pids if _alive(pid)]
-            if not alive:
-                break
-            for pid in alive:
-                _kill(pid, sig)
-            deadline = time.monotonic() + GRACE_SECONDS
-            while time.monotonic() < deadline and any(_alive(p) for p in alive):
-                time.sleep(0.1)
-        self._content_pids = []
-        if _is_macos() and any(_is_safari(n) for _, n in self.processes()):
-            # Last resort, for whatever of Safari's is still standing.
-            subprocess.run(
-                ["osascript", "-e", 'quit app "Safari"'],
-                capture_output=True,
-                timeout=GRACE_SECONDS,
-                check=False,
-            )
+        try:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                if proc.poll() is not None:
+                    break
+                _signal_group(proc, sig)
+                try:
+                    proc.wait(GRACE_SECONDS)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            else:
+                self._log(f"Safari cleanup: launcher {proc.pid} did not exit")
+        finally:
+            self._content_pids = []
+            problem = self._quiesce()
+            if problem:
+                self._log(f"Safari cleanup: {problem}; next run will retry cleanup")
 
     # --- the host, behind two seams for the tests ---
 
     def processes(self) -> list[tuple[int, str]]:
-        """``(pid, command)`` for every process; the command is the
+        """``(pid, command)`` for this user's processes; the command is the
         executable path for an app, which is how a WebContent process names
         itself."""
-        try:
-            out = subprocess.run(
-                ["ps", "-axo", "pid=,comm="],
-                capture_output=True,
-                text=True,
-                check=False,
-            ).stdout
-        except OSError:
-            return []
+        result = subprocess.run(
+            ["ps", "-U", str(os.getuid()), "-o", "pid=,comm="],
+            capture_output=True,
+            text=True,
+            timeout=GRACE_SECONDS,
+            check=False,
+        )
+        if result.returncode:
+            raise RuntimeError(
+                f"ps failed ({result.returncode}): {result.stderr.strip()}"
+            )
+        out = result.stdout
         procs = []
         for line in out.splitlines():
             parts = line.strip().split(None, 1)
@@ -213,9 +272,10 @@ class SafariRunner(BrowserRunner):
                 ["lsof", "-F", "n", "-p", str(pid)],
                 capture_output=True,
                 text=True,
+                timeout=GRACE_SECONDS,
                 check=False,
             ).stdout
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
             return []
         return [line[1:] for line in out.splitlines() if line.startswith("n/")]
 
@@ -231,18 +291,8 @@ def _image(images: list[str], suffix: str) -> str | None:
     return None
 
 
-def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 def _kill(pid: int, sig: signal.Signals) -> None:
     try:
         os.kill(pid, sig)
-    except (ProcessLookupError, PermissionError):
+    except ProcessLookupError:
         pass

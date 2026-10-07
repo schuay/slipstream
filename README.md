@@ -82,6 +82,14 @@ crossbench gives it. Headless mode changes the browser's rendering
 environment; compare scores against a headed baseline before joining the two
 into one performance series.
 
+Safari runs require a dedicated benchmark account. The runner stops that
+account's Safari and WebContent processes before and after each measurement,
+including orphaned helpers owned by launchd. Cleanup uses bounded TERM/KILL
+waits and waits for a quiet process table. A launch or engine provenance
+failure gets one fresh attempt after cleanup; the first attempt's stderr is
+kept as `stderr-recovery`. Workload failures are not retried, and scores are
+accepted only after the loaded engine passes the provenance checks.
+
 Speedometer 3 (`sp3`) runs in a browser only; a `[[run]]` pairing it with a
 shell engine is refused. A run is one page load with Speedometer's own ten
 iterations. Each suite's mean time is stored as `Total-Time` (milliseconds,
