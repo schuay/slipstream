@@ -229,7 +229,7 @@ class TestRunnerProvenance:
     RUNNER_HASHES = {
         "shell": "sha256:fdb9b01694d1f8052ba10fab1323d49e2d18efdecc040d325067d5c93513cd8b",
         "chromium": "sha256:b186c8202a74696dfbae27dbb7cdc830ba1ee4ecba88edd9a81f1984cf59a027",
-        "safari": "sha256:7e7af7d89a2d0e4330bed77b61e79293a495fed73d680f10a063535cf0dbcec7",
+        "safari": "sha256:9b5d8187696a20157133965977679fb5ffaa3763d78ffaebcf66a8a5ddb73e7a",
     }
     SUITE_HASHES = {
         "js2": "sha256:c8c206b3c459a43f8f7305b13be726b06b65cab2b7c7176a9d647acffcd14c14",

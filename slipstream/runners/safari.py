@@ -16,19 +16,22 @@ Nothing about that launch is self-evidencing. STP's own executable ignores
 the overrides and runs the system engine with no visible difference, and
 ``open -a`` starts stock Safari; both were measured once and discarded. So
 a run is accepted only on evidence from the processes themselves: the
-launcher has loaded ``Safari.framework`` from the run root, and every
+launcher has loaded ``Safari.framework`` from the run root, and every owned
 WebContent process with a ``JavaScriptCore`` mapped has it from the run
-root, at least one of them existing. WebContent processes are launchd's
-children, not ours, which is why the check is over all of them and why
-the benchmark account is drained of Safari and WebContent before a run.
+root, at least one of them existing. Ownership comes from the launcher's
+launchd PID domain, not Unix parentage or the helper's executable path.
 """
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
 import platform
+import re
 import signal
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -72,6 +75,8 @@ class SafariRunner(BrowserRunner):
     def __init__(self, **kw):
         super().__init__(**kw)
         self._content_pids: list[int] = []
+        self._owned: dict[int, tuple[str, tuple[int, int]]] = {}
+        self._owners: dict[int, tuple[int, int]] = {}
         self._retryable = False
         self._recovery_problem = ""
 
@@ -80,7 +85,8 @@ class SafariRunner(BrowserRunner):
             f"{ARCH} -arm64e -e <var>=<dyld_search_path> for " + ", ".join(DYLD_VARS),
             "<launcher> -HomePage <url>",
             *LAUNCH_ARGS,
-            "drain current-user Safari/WebContent before and after each run",
+            "drain current-user Safari and its launchd PID-domain helpers",
+            "verify owned engines with sample binary images including shared cache",
             "retry launch/provenance failure once after cleanup",
         )
 
@@ -139,30 +145,32 @@ class SafariRunner(BrowserRunner):
     def _quiesce(self) -> str | None:
         """Bounded recovery for this dedicated benchmark account.
 
-        Rescan throughout cleanup: launchd owns WebContent, and helpers can
-        appear after verification or while their launcher is shutting down.
+        Rescan PID domains throughout cleanup to catch late helpers.
+        Retain attributed identities after their launcher exits.
         """
         try:
             for sig in (signal.SIGTERM, signal.SIGKILL):
                 deadline = time.monotonic() + GRACE_SECONDS
-                signaled: set[tuple[int, str]] = set()
+                signaled: set[tuple[int, tuple[int, int]]] = set()
                 quiet_since = None
                 while time.monotonic() < deadline:
-                    running = [(p, n) for p, n in self.processes() if _is_safari(n)]
+                    running = self._cleanup_processes()
                     if not running:
                         if quiet_since is None:
                             quiet_since = time.monotonic()
                         if time.monotonic() - quiet_since >= QUIET_SECONDS:
+                            self._owners.clear()
                             return None
                     else:
                         quiet_since = None
                         for pid, name in running:
-                            if (pid, name) not in signaled:
+                            identity = (pid, self._owned[pid][1])
+                            if identity not in signaled:
                                 self._log(f"Safari cleanup: {sig.name} {name} ({pid})")
                                 self._signal_process(pid, name, sig)
-                                signaled.add((pid, name))
+                                signaled.add(identity)
                     time.sleep(POLL_SECONDS)
-            running = [(p, n) for p, n in self.processes() if _is_safari(n)]
+            running = self._cleanup_processes()
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
             return f"cannot clean up Safari processes: {exc}"
         return "Safari cleanup did not reach a quiet state: " + ", ".join(
@@ -172,7 +180,13 @@ class SafariRunner(BrowserRunner):
     def _signal_process(self, pid: int, name: str, sig: signal.Signals) -> None:
         # Recheck user ownership and executable identity before signaling a
         # PID from an earlier snapshot; the original process may have exited.
-        if (pid, name) in self.processes():
+        expected = self._owned.get(pid)
+        if (
+            expected is not None
+            and expected[0] == name
+            and (pid, name) in self.processes()
+            and self.identity(pid) == expected[1]
+        ):
             _kill(pid, sig)
 
     # --- evidence ---
@@ -182,9 +196,15 @@ class SafariRunner(BrowserRunner):
         notes: list[str] = []
 
         def under_root(path: str) -> bool:
-            return path.startswith(root) or path.startswith(os.path.realpath(root))
+            return Path(path).resolve().is_relative_to(Path(root).resolve())
 
-        safari = _image(self.loaded_images(proc.pid), SAFARI_IMAGE)
+        try:
+            owned = self._discover(proc.pid)
+            safari = _image(self.loaded_images(proc.pid), SAFARI_IMAGE)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            return Verdict(
+                False, notes, f"cannot inspect Safari ownership/images: {exc}"
+            )
         notes.append(f"launcher {proc.pid}: Safari.framework from {safari or '(none)'}")
         if not safari or not under_root(safari):
             return Verdict(
@@ -200,12 +220,20 @@ class SafariRunner(BrowserRunner):
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
             return Verdict(False, notes, f"cannot inspect WebContent processes: {exc}")
         for pid, name in processes:
-            if WEBCONTENT not in name:
+            if WEBCONTENT not in name or pid not in owned:
                 continue
-            jsc = _image(self.loaded_images(pid), JSC_IMAGE)
-            if jsc:
-                content.append((pid, jsc))
-                notes.append(f"WebContent {pid}: JavaScriptCore from {jsc}")
+            try:
+                jsc = _image(self.loaded_images(pid), JSC_IMAGE)
+                if self.identity(pid) != self._owned[pid][1]:
+                    raise RuntimeError(f"WebContent {pid} changed during inspection")
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                return Verdict(False, notes, f"cannot inspect WebContent {pid}: {exc}")
+            if not jsc:
+                return Verdict(
+                    False, notes, f"WebContent {pid}: no JavaScriptCore image"
+                )
+            content.append((pid, jsc))
+            notes.append(f"WebContent {pid}: JavaScriptCore from {jsc}")
         if not content:
             return Verdict(False, notes, "no WebContent process has loaded an engine")
         foreign = [f"{pid}: {jsc}" for pid, jsc in content if not under_root(jsc)]
@@ -223,6 +251,11 @@ class SafariRunner(BrowserRunner):
 
     def terminate(self, proc: subprocess.Popen) -> None:
         try:
+            # Capture ownership even when the run failed before verification.
+            try:
+                self._discover(proc.pid)
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                self._log(f"Safari cleanup: cannot inspect launcher domain: {exc}")
             for sig in (signal.SIGTERM, signal.SIGKILL):
                 if proc.poll() is not None:
                     break
@@ -240,7 +273,7 @@ class SafariRunner(BrowserRunner):
             if problem:
                 self._log(f"Safari cleanup: {problem}; next run will retry cleanup")
 
-    # --- the host, behind two seams for the tests ---
+    # --- host inspection seams ---
 
     def processes(self) -> list[tuple[int, str]]:
         """``(pid, command)`` for this user's processes; the command is the
@@ -265,23 +298,128 @@ class SafariRunner(BrowserRunner):
                 procs.append((int(parts[0]), parts[1]))
         return procs
 
+    def identity(self, pid: int) -> tuple[int, int] | None:
+        """Microsecond start time from libproc, also checking effective UID."""
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        info = _BSDInfo()
+        size = ctypes.sizeof(info)
+        result = lib.proc_pidinfo(pid, 3, ctypes.c_uint64(0), ctypes.byref(info), size)
+        if result != size:
+            error = ctypes.get_errno()
+            if error == errno.ESRCH:
+                return None
+            raise OSError(error, f"cannot inspect process identity {pid}")
+        if info.ids[5] != os.getuid():
+            return None
+        return info.start_sec, info.start_usec
+
+    def domain_helpers(self, pid: int) -> set[int]:
+        result = subprocess.run(
+            ["/bin/launchctl", "print", f"pid/{pid}"],
+            capture_output=True,
+            text=True,
+            timeout=GRACE_SECONDS,
+            check=False,
+        )
+        if result.returncode:
+            raise RuntimeError(
+                f"cannot inspect launchd domain {pid}: {result.stderr.strip()}"
+            )
+        match = re.search(r"^\tservices = \{\n(.*?)^\t\}", result.stdout, re.M | re.S)
+        if not result.stdout.startswith(f"pid/{pid} = {{") or match is None:
+            raise RuntimeError(f"unrecognized launchd domain output for {pid}")
+        return {
+            int(m[0])
+            for m in re.findall(
+                r"^\s*(\d+)\s+\S+\s+(com\.apple\.WebKit\.\S+)\s*$",
+                match[1],
+                re.M,
+            )
+            if int(m[0])
+        }
+
+    def _discover(self, owner: int) -> set[int]:
+        identity = self.identity(owner)
+        if identity is None and owner not in self._owners:
+            return set()
+        if identity is not None:
+            if owner in self._owners and self._owners[owner] != identity:
+                return set()
+            self._owners[owner] = identity
+        processes = dict(self.processes())
+        # Snapshot identities before the domain query, then recheck afterwards.
+        candidates = {
+            pid: (name, self.identity(pid))
+            for pid, name in processes.items()
+            if "com.apple.WebKit." in name
+        }
+        helpers = self.domain_helpers(owner)
+        if self.identity(owner) != identity:
+            raise RuntimeError(f"launcher {owner} changed during ownership inspection")
+        owned = set()
+        for pid in helpers & candidates.keys():
+            name, start = candidates[pid]
+            if start is not None and self.identity(pid) == start:
+                self._owned[pid] = (name, start)
+                owned.add(pid)
+        return owned
+
+    def _cleanup_processes(self) -> list[tuple[int, str]]:
+        processes = self.processes()
+        for pid, name in processes:
+            if Path(name).name in SAFARI_PROCESSES:
+                start = self.identity(pid)
+                if start is not None:
+                    self._owned[pid] = (name, start)
+                    self._owners.setdefault(pid, start)
+        for owner in list(self._owners):
+            self._discover(owner)
+        processes = self.processes()
+        running = []
+        for pid, (name, start) in list(self._owned.items()):
+            if (pid, name) in processes and self.identity(pid) == start:
+                running.append((pid, name))
+            else:
+                del self._owned[pid]
+        return running
+
     def loaded_images(self, pid: int) -> list[str]:
-        """Paths mapped into ``pid``, from ``lsof``; empty if it is gone."""
-        try:
-            out = subprocess.run(
-                ["lsof", "-F", "n", "-p", str(pid)],
+        """sample's Binary Images includes dyld shared-cache libraries.
+
+        One sample over one second keeps profiling work bounded. Inspection
+        errors are provenance failures, never evidence of an absent engine.
+        """
+        with tempfile.TemporaryDirectory(prefix="slipstream-images-") as tmp:
+            report = Path(tmp) / "sample.txt"
+            result = subprocess.run(
+                ["/usr/bin/sample", str(pid), "1", "1000", "-file", str(report)],
                 capture_output=True,
                 text=True,
                 timeout=GRACE_SECONDS,
                 check=False,
-            ).stdout
-        except (OSError, subprocess.TimeoutExpired):
-            return []
-        return [line[1:] for line in out.splitlines() if line.startswith("n/")]
+            )
+            if result.returncode or not report.exists():
+                raise RuntimeError(f"sample failed for {pid}: {result.stderr.strip()}")
+            output = report.read_text()
+        if "Binary Images:" not in output:
+            raise RuntimeError(f"sample returned no binary images for {pid}")
+        return re.findall(
+            r"^\s*0x[0-9a-fA-F]+\s+-\s+0x[0-9a-fA-F]+.*?<[^>]+> (/.*)$",
+            output.split("Binary Images:", 1)[1],
+            re.M,
+        )
 
 
-def _is_safari(command: str) -> bool:
-    return Path(command).name in SAFARI_PROCESSES or WEBCONTENT in command
+class _BSDInfo(ctypes.Structure):
+    # Public Darwin proc_bsdinfo (sys/proc_info.h), PROC_PIDTBSDINFO = 3.
+    _fields_ = [
+        ("ids", ctypes.c_uint32 * 12),
+        ("comm", ctypes.c_char * 16),
+        ("name", ctypes.c_char * 32),
+        ("details", ctypes.c_uint32 * 6),
+        ("start_sec", ctypes.c_uint64),
+        ("start_usec", ctypes.c_uint64),
+    ]
 
 
 def _image(images: list[str], suffix: str) -> str | None:

@@ -133,6 +133,16 @@ class _Runner(SafariRunner):
         if self.host:
             self.host.procs = [p for p in self.host.procs if p != (pid, name)]
 
+    def identity(self, pid):
+        return (
+            (pid, 0)
+            if self.host and any(p == pid for p, _ in self.host.procs)
+            else None
+        )
+
+    def domain_helpers(self, pid):
+        return {p for p, n in self.host.procs if "com.apple.WebKit." in n}
+
     def loaded_images(self, pid):
         return list(self.host.images.get(pid, [])) if self.host else []
 
@@ -183,7 +193,6 @@ class TestPrecondition:
             "/System/Cryptexes/App/System/Applications/Safari.app/Contents/MacOS/Safari",
             LAUNCHER,
             "/Applications/Safari Technology Preview.app/Contents/MacOS/Safari Technology Preview",
-            "/x/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
         ],
     )
     def test_stale_safari_processes_are_drained_before_launch(self, req, name):
@@ -484,3 +493,149 @@ class TestRetry:
         result = _Runner().run(req)
         assert not result.ok
         assert len(calls) == (2 if retried else 1)
+
+
+class TestOwnership:
+    def test_foreign_system_worker_is_neither_verified_nor_killed(self, req):
+        host = _Host(req.run_root, 100)
+        host.content(200)
+        host.content(300, jsc_dir="/System/Library/Frameworks")
+        runner = _Runner(host)
+        runner.domain_helpers = lambda owner: {200}
+        assert runner.verify(req, _Proc(100)).ok
+        assert runner._content_pids == [200]
+        assert runner.precondition(req) is None
+        assert [pid for pid, _ in host.procs] == [300]
+        assert not any("(300)" in line for line in runner.logged)
+
+    def test_unattributed_orphan_is_not_killed(self, req):
+        host = _Host(req.run_root, 100)
+        host.content(300)
+        host.procs = host.procs[1:]
+        runner = _Runner(host)
+        assert runner.precondition(req) is None
+        assert [pid for pid, _ in host.procs] == [300]
+
+    def test_missing_owned_engine_fails_even_with_a_good_worker(self, req):
+        host = _Host(req.run_root, 100)
+        host.content(200)
+        host.content(201)
+        host.images[201] = []
+        verdict = _Runner(host).verify(req, _Proc(100))
+        assert not verdict.ok
+        assert "201: no JavaScriptCore" in verdict.problem
+
+    def test_root_prefix_is_not_root_membership(self, req):
+        host = _Host(req.run_root, 100)
+        host.content(200, jsc_dir=f"{req.run_root}-other")
+        assert not _Runner(host).verify(req, _Proc(100)).ok
+
+    def test_same_executable_with_reused_pid_is_not_signaled(self, monkeypatch):
+        runner = SafariRunner(log=lambda _: None, progress=lambda: None)
+        runner._owned[4242] = (LAUNCHER, (1, 2))
+        runner.processes = lambda: [(4242, LAUNCHER)]
+        runner.identity = lambda pid: (1, 3)
+        killed = []
+        monkeypatch.setattr(safari_mod, "_kill", lambda *args: killed.append(args))
+        runner._signal_process(4242, LAUNCHER, signal.SIGKILL)
+        assert killed == []
+
+    def test_ownership_failure_blocks_cleanup_without_signals(self, req):
+        host = _Host(req.run_root, 100)
+        host.content(200)
+        runner = _Runner(host)
+
+        def domain(owner):
+            raise RuntimeError("launchd unavailable")
+
+        runner.domain_helpers = domain
+        assert "launchd unavailable" in runner.precondition(req)
+        assert len(host.procs) == 2
+
+    def test_identity_changes_during_attribution_are_not_adopted(self, req):
+        host = _Host(req.run_root, 100)
+        host.content(200)
+        runner = _Runner(host)
+        identities = {100: (100, 0), 200: (200, 0)}
+        runner.identity = identities.get
+
+        def domain(owner):
+            identities[200] = (200, 1)
+            return {200}
+
+        runner.domain_helpers = domain
+        assert runner._discover(100) == set()
+        assert 200 not in runner._owned
+
+    def test_launchd_parser_uses_only_live_webkit_services(self, monkeypatch):
+        output = """pid/100 = {
+\tservices = {
+\t       0      - com.apple.WebKit.WebContent
+\t     201      - com.apple.WebKit.WebContent.Development.ABCD
+\t     202      - com.apple.WebKit.GPU.ABCD
+\t     300      - com.apple.unrelated
+\t}
+\tunmanaged processes = {
+\t     400      - com.apple.WebKit.WebContent
+\t}
+}
+"""
+
+        def run(argv, **kwargs):
+            assert argv == ["/bin/launchctl", "print", "pid/100"]
+            return subprocess.CompletedProcess(argv, 0, output, "")
+
+        monkeypatch.setattr(subprocess, "run", run)
+        runner = SafariRunner(log=lambda _: None, progress=lambda: None)
+        assert runner.domain_helpers(100) == {201, 202}
+
+    def test_image_reader_includes_shared_cache_paths_with_spaces(self, monkeypatch):
+        path = "/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/JavaScriptCore"
+        safari = "/run/Safari Technology Preview.app/Contents/Frameworks/Safari.framework/Versions/A/Safari"
+
+        def run(argv, **kwargs):
+            assert argv[:4] == ["/usr/bin/sample", "100", "1", "1000"]
+            Path(argv[-1]).write_text(
+                f"Binary Images:\n  0x100 - 0x200 JSC (1) <AB-CD> {path}\n"
+                f"  0x300 - 0x400 Safari (1) <AB-CD> {safari}\n"
+            )
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        monkeypatch.setattr(subprocess, "run", run)
+        runner = SafariRunner(log=lambda _: None, progress=lambda: None)
+        assert runner.loaded_images(100) == [path, safari]
+
+    def test_image_inspection_failure_is_a_failed_verdict(self, req):
+        host = _Host(req.run_root, 100)
+        runner = _Runner(host)
+
+        def images(pid):
+            raise RuntimeError("sample failed")
+
+        runner.loaded_images = images
+        verdict = runner.verify(req, _Proc(100))
+        assert not verdict.ok
+        assert "sample failed" in verdict.problem
+
+    @pytest.mark.parametrize(
+        "output", ["", "pid/100 = {\n}", "pid/200 = {\n\tservices = {\n\t}\n}"]
+    )
+    def test_unrecognized_domain_output_fails_closed(self, monkeypatch, output):
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda argv, **kw: subprocess.CompletedProcess(argv, 0, output, ""),
+        )
+        runner = SafariRunner(log=lambda _: None, progress=lambda: None)
+        with pytest.raises(RuntimeError, match="unrecognized launchd"):
+            runner.domain_helpers(100)
+
+    def test_truncated_sample_is_an_inspection_error(self, monkeypatch):
+        def run(argv, **kwargs):
+            Path(argv[-1]).write_text("Call graph only\n")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        monkeypatch.setattr(subprocess, "run", run)
+        runner = SafariRunner(log=lambda _: None, progress=lambda: None)
+        with pytest.raises(RuntimeError, match="no binary images"):
+            runner.loaded_images(100)

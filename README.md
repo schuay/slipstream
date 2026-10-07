@@ -83,12 +83,23 @@ environment; compare scores against a headed baseline before joining the two
 into one performance series.
 
 Safari runs require a dedicated benchmark account. The runner stops that
-account's Safari and WebContent processes before and after each measurement,
-including orphaned helpers owned by launchd. Cleanup uses bounded TERM/KILL
-waits and waits for a quiet process table. A launch or engine provenance
-failure gets one fresh attempt after cleanup; the first attempt's stderr is
-kept as `stderr-recovery`. Workload failures are not retried, and scores are
-accepted only after the loaded engine passes the provenance checks.
+account's Safari launchers and WebKit helpers attributed to their launchd PID
+domains before and after each measurement. It retains attributed process start
+times through teardown, rescans for late helpers, and rechecks identity before
+signaling. Unrelated WebKit clients (including Software Update's documentation
+renderer) and unattributed orphan helpers are left alone. Cleanup uses bounded
+TERM/KILL waits and waits for Safari's processes to become quiet. A launch or
+engine provenance failure gets one fresh attempt after cleanup; the first
+attempt's stderr is kept as `stderr-recovery`. Workload failures are not retried.
+
+Safari provenance checks inspect owned WebContent workers and the launcher with
+`sample`, whose Binary Images include system dyld shared-cache libraries that
+`lsof` can omit. Missing images and inspection errors fail verification. Each
+process inspection takes approximately one second and samples the process;
+the early check can overlap measurement. This policy changes the configuration
+hash, so measurements are distinguishable from the old inspection policy.
+Safari startup can still trigger Software Update activity; scoped cleanup does
+not establish a background-free measurement environment.
 
 Speedometer 3 (`sp3`) runs in a browser only; a `[[run]]` pairing it with a
 shell engine is refused. A run is one page load with Speedometer's own ten
