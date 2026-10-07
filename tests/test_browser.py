@@ -9,6 +9,7 @@ import signal
 import socket
 import sys
 import urllib.request
+from http.client import IncompleteRead
 from pathlib import Path
 
 import pytest
@@ -22,7 +23,7 @@ from slipstream.runners.report import (
     parse_report,
     parse_speedometer,
 )
-from slipstream.runners.server import inject_tag, injected
+from slipstream.runners.server import _Handler, inject_tag, injected
 from test_runners import _engine
 
 FAKE_BROWSER = Path(__file__).with_name("fake_browser.py")
@@ -164,6 +165,41 @@ class TestParseSpeedometer:
 
 
 class TestBenchServer:
+    @pytest.mark.parametrize("error", [ConnectionResetError, BrokenPipeError])
+    def test_client_disconnect_is_logged_without_a_traceback(
+        self, tmp_path, monkeypatch, capsys, error
+    ):
+        (tmp_path / "index.html").write_text("response body")
+
+        def disconnect(*args):
+            raise error("client canceled the response")
+
+        monkeypatch.setattr(_Handler, "copyfile", disconnect)
+        with BenchServer(tmp_path) as server:
+            with urllib.request.urlopen(server.url("index.html")) as response:
+                with pytest.raises(IncompleteRead):
+                    response.read()
+            assert any(
+                f"client disconnected: {error.__name__}" in line
+                for line in server.requests
+            )
+            req = urllib.request.Request(server.url("report"), data=b"{}")
+            with urllib.request.urlopen(req) as response:
+                assert response.status == 200
+            assert server.wait_for_report(1) == b"{}"
+        assert capsys.readouterr().err == ""
+
+    def test_unexpected_server_errors_still_print_a_traceback(self, tmp_path, capsys):
+        server = BenchServer(tmp_path)
+        try:
+            try:
+                raise RuntimeError("unexpected server error")
+            except RuntimeError:
+                server.handle_error(None, ("127.0.0.1", 1234))
+        finally:
+            server.server_close()
+        assert "RuntimeError: unexpected server error" in capsys.readouterr().err
+
     def test_queues_a_burst_of_browser_connections(self, tmp_path):
         # Pause accepting to reproduce a browser's burst of parallel assets.
         # The old five-connection backlog drops connections on macOS.

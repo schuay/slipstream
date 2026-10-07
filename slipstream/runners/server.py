@@ -19,6 +19,7 @@ is never written to.
 
 from __future__ import annotations
 
+import sys
 import threading
 import urllib.parse
 from functools import partial
@@ -142,6 +143,17 @@ class BenchServer(ThreadingHTTPServer):
         self.shutdown()
         self.server_close()
         self._thread.join()
+
+    def handle_error(self, request, client_address):
+        error = sys.exception()
+        if isinstance(error, (ConnectionResetError, BrokenPipeError)):
+            # Navigation or closing the browser after its report can cancel
+            # an in-flight response. Keep the disconnect in the request log.
+            self.requests.append(
+                f"{client_address[0]} client disconnected: {type(error).__name__}"
+            )
+            return
+        super().handle_error(request, client_address)
 
     @property
     def port(self) -> int:
