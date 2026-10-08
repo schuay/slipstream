@@ -420,7 +420,10 @@ _TOP_LEVEL_KEYS = (
 )
 _ENGINE_KEYS = ("src_dir", "build_cmd", "sync_cmd", "gn_args", "run_set")
 _BENCHMARK_KEYS = ("dir",)
+_RUN_KEYS = ("engine", "suite", "flags", "variant", "run_mode", "runs")
 RUN_MODES = ("suite", "per_benchmark")
+# Measurements per commit for a [[run]] entry that does not say.
+DEFAULT_RUNS = 3
 
 
 @dataclass(frozen=True)
@@ -434,6 +437,10 @@ class RunSpec:
     ``run_mode`` overrides the suite default; "" means take it. "per_benchmark"
     invokes the harness once per line item, which prints no overall score, so
     the collector synthesizes one.
+
+    ``runs`` is how many times each commit is measured with this entry. It is
+    per entry rather than per machine because the suites' noise differs: a
+    count that settles one suite is wasted hours on another.
     """
 
     engine: str
@@ -441,6 +448,16 @@ class RunSpec:
     flags: tuple[str, ...] = ()
     variant: str = "default"
     run_mode: str = ""
+    runs: int = DEFAULT_RUNS
+
+    @property
+    def label(self) -> str:
+        """How the entry is spelled in provenance and in the bus state's
+        ``run_configs``, which `bus status` compares across boxes. The count
+        is part of it: two boxes measuring the same series a different number
+        of times differ in noise, which is the kind of difference that
+        comparison exists to surface."""
+        return f"{self.suite}/{self.variant}@{self.runs}"
 
 
 @dataclass
@@ -760,11 +777,11 @@ def _parse_runs(entries, engines, benchmarks, path: Path) -> list[RunSpec]:
     if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
         raise ValueError("[[run]] must be a list of tables")
 
-    runs: list[RunSpec] = []
+    runs_out: list[RunSpec] = []
     seen: dict[tuple[str, str, str], int] = {}
     for i, entry in enumerate(entries):
         where = f"[[run]] #{i + 1}"
-        unknown = set(entry) - {"engine", "suite", "flags", "variant", "run_mode"}
+        unknown = set(entry) - set(_RUN_KEYS)
         if unknown:
             raise ValueError(f"{where}: unknown keys {sorted(unknown)}")
 
@@ -819,6 +836,11 @@ def _parse_runs(entries, engines, benchmarks, path: Path) -> list[RunSpec]:
                 f"{where}: run_mode must be one of {list(RUN_MODES)}: {run_mode!r}"
             )
 
+        runs = entry.get("runs", DEFAULT_RUNS)
+        # bool is an int in Python; `runs = true` is a typo, not one run.
+        if isinstance(runs, bool) or not isinstance(runs, int) or runs < 1:
+            raise ValueError(f"{where}: runs must be a positive integer: {runs!r}")
+
         key = (engine, suite, variant)
         if key in seen:
             # The three are the store's key for a score row, so a duplicate
@@ -828,16 +850,17 @@ def _parse_runs(entries, engines, benchmarks, path: Path) -> list[RunSpec]:
                 f"[[run]] #{seen[key] + 1}"
             )
         seen[key] = i
-        runs.append(
+        runs_out.append(
             RunSpec(
                 engine=engine,
                 suite=suite,
                 flags=tuple(flags),
                 variant=variant,
                 run_mode=run_mode,
+                runs=runs,
             )
         )
-    return runs
+    return runs_out
 
 
 def _parse_run_set(engine: str, entries) -> list[str]:

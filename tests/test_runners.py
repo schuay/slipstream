@@ -109,21 +109,22 @@ class TestGeomeanOverall:
 
 
 class TestCollectorSeam:
-    def _collector(self, config):
+    def _collector(self, config, runs=1, dry_run=False):
         config.engines["v8"] = _engine()
         config.benchmarks["js3"].dir.mkdir(parents=True, exist_ok=True)
-        return BenchCollector(config)
+        config.runs[:] = [RunSpec(engine="v8", suite="js3", runs=runs)]
+        return BenchCollector(config, dry_run=dry_run)
 
     def test_scores_of_a_failed_run_are_not_kept(self, config, tmp_path, monkeypatch):
         c = self._collector(config)
         half = [Score("js3", "default", "Air", "Total-Score", 1, 4.0)]
         monkeypatch.setattr(c, "_runner", lambda engine: _Fixed(RunResult(False, half)))
-        outcome = c._run_benchmarks(config.engines["v8"], "1", 1, tmp_path / "root")
+        outcome = c._run_benchmarks(config.engines["v8"], "1", tmp_path / "root")
         assert outcome == (0, 1, 0)
         assert c.store.conn.execute("SELECT count(*) FROM scores").fetchone()[0] == 0
 
     def test_the_runners_scores_reach_the_store(self, config, tmp_path, monkeypatch):
-        c = self._collector(config)
+        c = self._collector(config, runs=2)
         scores = [
             Score("js3", "default", "Air", "Total-Score", 1, 4.0),
             Score("js3", "default", "Overall", "Total-Score", 1, 4.0),
@@ -131,7 +132,7 @@ class TestCollectorSeam:
         monkeypatch.setattr(
             c, "_runner", lambda engine: _Fixed(RunResult(True, scores))
         )
-        outcome = c._run_benchmarks(config.engines["v8"], "1", 2, tmp_path / "root")
+        outcome = c._run_benchmarks(config.engines["v8"], "1", tmp_path / "root")
         assert outcome == (2, 2, 4)
         rows = c.store.conn.execute(
             "SELECT benchmark, metric, run, score FROM scores ORDER BY run, benchmark"
@@ -142,13 +143,12 @@ class TestCollectorSeam:
         ]
 
     def test_a_dry_run_runs_nothing(self, config, tmp_path, monkeypatch):
-        c = BenchCollector(config, dry_run=True)
-        config.engines["v8"] = _engine()
+        c = self._collector(config, dry_run=True)
         monkeypatch.setattr(
             ShellRunner, "run", lambda self, req: pytest.fail("ran in dry-run")
         )
         c.cool_down = lambda log: pytest.fail("cooled down in dry-run")
-        outcome = c._run_benchmarks(config.engines["v8"], "1", 1, tmp_path / "root")
+        outcome = c._run_benchmarks(config.engines["v8"], "1", tmp_path / "root")
         assert outcome == (1, 1, 0)
 
     def test_every_measurement_waits_for_the_machine_to_cool(
@@ -156,7 +156,7 @@ class TestCollectorSeam:
     ):
         """Before each (run, config), not once per commit: the previous suite
         is what heated the machine."""
-        c = self._collector(config)
+        c = self._collector(config, runs=3)
         order = []
         c.cool_down = lambda log: order.append("cool")
 
@@ -166,8 +166,42 @@ class TestCollectorSeam:
                 return super().run(req)
 
         monkeypatch.setattr(c, "_runner", lambda engine: _Noting(RunResult(True, [])))
-        c._run_benchmarks(config.engines["v8"], "1", 3, tmp_path / "root")
+        c._run_benchmarks(config.engines["v8"], "1", tmp_path / "root")
         assert order == ["cool", "run"] * 3
+
+    def test_each_entry_has_its_own_count_and_rounds_interleave(
+        self, config, tmp_path, monkeypatch
+    ):
+        """One entry's count is not another's hour. The rounds still rotate
+        through the entries rather than finishing one before the next, so a
+        drift in the machine lands on every series alike; an entry past its
+        count sits out the remaining rounds."""
+        c = self._collector(config)
+        config.runs[:] = [
+            RunSpec(engine="v8", suite="js3", runs=1),
+            RunSpec(engine="v8", suite="js3", variant="b", flags=("--b",), runs=3),
+            RunSpec(engine="v8", suite="js3", variant="c", flags=("--c",), runs=2),
+        ]
+        seen = []
+
+        class _Noting(_Fixed):
+            def run(self, req):
+                seen.append((req.run, req.spec.variant))
+                return super().run(req)
+
+        monkeypatch.setattr(c, "_runner", lambda engine: _Noting(RunResult(True, [])))
+        outcome = c._run_benchmarks(config.engines["v8"], "1", tmp_path / "root")
+        assert seen == [
+            (1, "default"),
+            (1, "b"),
+            (1, "c"),
+            (2, "b"),
+            (2, "c"),
+            (3, "b"),
+        ]
+        assert outcome == (6, 6, 0)
+        # What provenance records as `runs`: the number of rounds.
+        assert c.max_runs(config.engines["v8"]) == 3
 
 
 class _Fixed:

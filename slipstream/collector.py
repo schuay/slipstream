@@ -477,25 +477,33 @@ class BenchCollector:
         )
 
     def _run_benchmarks(
-        self, engine: EngineConfig, key: CommitKey, runs: int, run_root: Path
+        self, engine: EngineConfig, key: CommitKey, run_root: Path
     ) -> BenchOutcome:
         """Run every benchmark configuration and record what came back.
 
         Counts are over (run, config) pairs, so a suite that fails on one run
         of three shows as partial rather than as a clean pass.
+
+        Each [[run]] entry has its own count. The rounds stay interleaved
+        across configs rather than finishing one config before the next, so a
+        drift in the machine over the hour lands on every series alike; a
+        config past its count simply sits out the remaining rounds.
         """
         res_dir = self.cfg.commit_results_dir(engine.name, key)
         res_dir.mkdir(parents=True, exist_ok=True)
 
         runner = self._runner(engine)
         run_configs = self.run_configs(engine)
+        rounds = self.max_runs(engine)
 
         configs_ok = 0
         configs_total = 0
         score_total = 0
-        for run in range(1, runs + 1):
-            self._log(f"  Run [bold]{run}/{runs}[/bold]:")
+        for run in range(1, rounds + 1):
+            self._log(f"  Run [bold]{run}/{rounds}[/bold]:")
             for rc in run_configs:
+                if run > rc.runs:
+                    continue
                 # Before the config's progress line, so the wait's log lines
                 # stand on their own and the elapsed time is the measurement's.
                 if not self.dry_run:
@@ -549,20 +557,19 @@ class BenchCollector:
             job=job,
         )
 
-    def bench_at_root(self, engine, commit, run_root, runs, provenance=None):
+    def bench_at_root(self, engine, commit, run_root, provenance=None):
         if self.dry_run:
-            return self._bench_at_root(engine, commit, run_root, runs, provenance)
+            return self._bench_at_root(engine, commit, run_root, provenance)
         key = CommitKey.from_commit(commit)
         with self.store.result_locks(engine.name, self.cfg.platform, [key]):
             self.store.check_pending(engine.name, self.cfg.platform, [key])
-            return self._bench_at_root(engine, commit, run_root, runs, provenance)
+            return self._bench_at_root(engine, commit, run_root, provenance)
 
     def _bench_at_root(
         self,
         engine: EngineConfig,
         commit: dict,
         run_root: Path,
-        runs: int,
         provenance: dict | None = None,
     ) -> BenchOutcome:
         """Measure one commit from a provisioned run root, and record it.
@@ -586,7 +593,7 @@ class BenchCollector:
             self.store.clear_scores(engine.name, self.cfg.platform, [key])
         outcome = BenchOutcome(0, 0, 0)
         try:
-            outcome = self._run_benchmarks(engine, key, runs, run_root)
+            outcome = self._run_benchmarks(engine, key, run_root)
         except KeyboardInterrupt:
             self._log(
                 f"  [yellow]Interrupted on {key} — will retry on next run[/yellow]"
@@ -635,12 +642,12 @@ class BenchCollector:
         self.store.record_run_env(
             engine.name,
             key,
-            provenance or self.local_provenance(engine, runs, run_root),
+            provenance or self.local_provenance(engine, run_root),
         )
         return outcome
 
     def local_provenance(
-        self, engine: EngineConfig, runs: int, run_root: Path | None = None
+        self, engine: EngineConfig, run_root: Path | None = None
     ) -> dict:
         """What produced the numbers when the binary was built on this machine.
 
@@ -656,6 +663,10 @@ class BenchCollector:
         launcher that started it -- and needs the run root to read it.
         ``suite_cfg_hash`` is the suites' side of the same question, one
         hash per suite this engine ran.
+
+        ``runs`` is the number of rounds, which is the largest count among
+        the engine's entries; a single column cannot hold one count per
+        entry, and the rounds are what the score rows' run numbers go up to.
         """
         from . import __version__
         from .builder import build_cfg_hash
@@ -665,10 +676,8 @@ class BenchCollector:
         host_env = runner.host_env(engine, run_root) if run_root is not None else {}
         return {
             "source": "local",
-            "runs": runs,
-            "run_configs": json.dumps(
-                sorted(f"{c.suite}/{c.variant}" for c in self.run_configs(engine))
-            ),
+            "runs": self.max_runs(engine),
+            "run_configs": json.dumps(self.run_config_labels(engine)),
             "harness_revs": json.dumps(self.harness_revs(), sort_keys=True),
             "hw_model": identity["hw_model"],
             "os_version": identity["os_version"],
@@ -687,6 +696,16 @@ class BenchCollector:
         records, and the cross-box divergence check all come through here.
         """
         return [r for r in self.cfg.runs if r.engine == engine.name]
+
+    def run_config_labels(self, engine: EngineConfig) -> list[str]:
+        """The matrix as provenance and `bus status` spell it, sorted:
+        ``suite/variant@runs`` per entry."""
+        return sorted(c.label for c in self.run_configs(engine))
+
+    def max_runs(self, engine: EngineConfig) -> int:
+        """How many rounds a commit of this engine takes: the largest count
+        among its [[run]] entries, 0 for an engine with none."""
+        return max((r.runs for r in self.run_configs(engine)), default=0)
 
     def suite_cfg_hashes(self, engine: EngineConfig) -> dict[str, str]:
         """``suite -> suite_cfg_hash`` for the suites this engine runs: how
@@ -786,7 +805,6 @@ class BenchCollector:
         start_id: int,
         end_id: int,
         step: int = 1,
-        runs: int = 3,
         clear: bool = False,
         include_start: bool = True,
         should_stop: Callable[[], bool] | None = None,
@@ -868,7 +886,7 @@ class BenchCollector:
                     continue
                 console.print(f"[green]OK ({int(time.time() - t0)}s)[/green]")
 
-                self.bench_at_root(engine, dict(row), run_root, runs)
+                self.bench_at_root(engine, dict(row), run_root)
             finally:
                 self.lock.release()
 

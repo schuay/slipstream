@@ -324,7 +324,7 @@ class TestBenchAtRoot:
 
         c = self._collector(config, tmp_path, monkeypatch)
         monkeypatch.setattr(c, "_run_benchmarks", lambda *a: BenchOutcome(2, 2, 40))
-        c.bench_at_root(config.engines["v8"], self.COMMIT, tmp_path / "root", 3)
+        c.bench_at_root(config.engines["v8"], self.COMMIT, tmp_path / "root")
 
         assert c.store.is_done("v8", config.platform, 109680)
         assert c.store.get_status("v8", config.platform, 109680) == "ok"
@@ -337,7 +337,7 @@ class TestBenchAtRoot:
 
         c = self._collector(config, tmp_path, monkeypatch)
         monkeypatch.setattr(c, "_run_benchmarks", lambda *a: BenchOutcome(0, 2, 0))
-        c.bench_at_root(config.engines["v8"], self.COMMIT, tmp_path / "root", 3)
+        c.bench_at_root(config.engines["v8"], self.COMMIT, tmp_path / "root")
         assert c.store.get_status("v8", config.platform, 109680) == "failed"
 
     def test_a_colliding_commit_id_does_not_wedge_the_consumer(
@@ -348,7 +348,7 @@ class TestBenchAtRoot:
         c = self._collector(config, tmp_path, monkeypatch)
         c.store.upsert_commit("v8", "incumbent", 109680, "d", 0, "held")
         monkeypatch.setattr(c, "_run_benchmarks", lambda *a: BenchOutcome(2, 2, 40))
-        c.bench_at_root(config.engines["v8"], self.COMMIT, tmp_path / "root", 3)
+        c.bench_at_root(config.engines["v8"], self.COMMIT, tmp_path / "root")
 
         assert c.store.get_status("v8", config.platform, 109680) == "failed"
         (row,) = c.store.get_commits_with_metadata("v8", ["incumbent"])
@@ -370,7 +370,7 @@ class TestBenchAtRoot:
         monkeypatch.setattr(ShellRunner, "exec", fake_cmd)
         root = tmp_path / "roots" / "v8" / "109680"
         config.benchmarks["js3"].dir.mkdir(parents=True, exist_ok=True)
-        c._run_benchmarks(engine, "109680", 1, root)
+        c._run_benchmarks(engine, "109680", root)
 
         assert str(root / "out/d8") in seen["argv"]
         assert seen["dyld"] == str(root / "lib")
@@ -388,7 +388,7 @@ class TestBenchAtRoot:
         monkeypatch.setattr(ShellRunner, "exec", fake_cmd)
         root = tmp_path / "a root with spaces"
         config.benchmarks["js3"].dir.mkdir(parents=True, exist_ok=True)
-        c._run_benchmarks(config.engines["v8"], "109680", 1, root)
+        c._run_benchmarks(config.engines["v8"], "109680", root)
         assert str(root / "out/d8") in seen["argv"]
 
 
@@ -432,13 +432,14 @@ class TestConfiguredMatrix:
                 suite="js3",
                 flags=("--turbolev-future", "--no-lazy-feedback-allocation"),
                 variant="tlf",
+                runs=1,
             )
         ]
         seen = []
         monkeypatch.setattr(
             ShellRunner, "exec", lambda self, argv, *a, **k: seen.append(argv) or True
         )
-        c._run_benchmarks(config.engines["v8"], "109680", 1, tmp_path / "root")
+        c._run_benchmarks(config.engines["v8"], "109680", tmp_path / "root")
         (argv,) = seen
         assert (
             argv.index("--turbolev-future")
@@ -472,7 +473,7 @@ class TestConfiguredMatrix:
             return True
 
         monkeypatch.setattr(ShellRunner, "exec", fake_cmd)
-        c._run_benchmarks(config.engines["v8"], "109680", 1, tmp_path / "root")
+        c._run_benchmarks(config.engines["v8"], "109680", tmp_path / "root")
         rows = c.store.conn.execute(
             "SELECT benchmark, score FROM scores WHERE benchmark = 'Overall'"
         ).fetchall()
@@ -497,10 +498,11 @@ class TestResultsLayout:
                 id_regex=r"#([0-9]+)",
             )
         config.benchmarks["js3"].dir.mkdir(parents=True, exist_ok=True)
+        config.runs[:] = [RunSpec(engine=n, suite="js3", runs=1) for n in ("v8", "jsc")]
         c = BenchCollector(config)
         monkeypatch.setattr(ShellRunner, "exec", lambda *a, **k: True)
         for name in ("v8", "jsc"):
-            c._run_benchmarks(config.engines[name], "500", 1, tmp_path / "root")
+            c._run_benchmarks(config.engines[name], "500", tmp_path / "root")
 
         written = sorted(
             p.relative_to(config.results_path).as_posix()
@@ -536,7 +538,6 @@ class TestLocalProvenance:
             config.engines["v8"],
             {"hash": "h", "commit_id": 100, "date": "d", "timestamp": 0, "title": "t"},
             tmp_path / "src",
-            3,
         )
         row = c.store.get_run_env("v8", 100)
         assert row["source"] == "local" and row["runs"] == 3
@@ -568,7 +569,7 @@ class TestLocalProvenance:
         assert c.suite_cfg_hashes(v8) == {
             "js3": suite_cfg_hash(config.benchmarks["js3"])
         }
-        env = c.local_provenance(v8, 1)
+        env = c.local_provenance(v8)
         assert json.loads(env["suite_cfg_hash"]) == c.suite_cfg_hashes(v8)
 
     def test_the_runners_side_is_recorded_beside_the_builds(
@@ -599,11 +600,11 @@ class TestLocalProvenance:
             )
         c = BenchCollector(config)
         monkeypatch.setattr(c, "harness_revs", lambda: {})
-        env = c.local_provenance(config.engines["chrome"], 1, root)
+        env = c.local_provenance(config.engines["chrome"], root)
         assert env["runner_cfg_hash"] == c._runner(config.engines["chrome"]).cfg_hash()
         assert json.loads(env["host_env"]) == {"host_app": "Chromium 7300.0.1"}
         # Without a root there is nothing to read the host app from.
-        assert c.local_provenance(config.engines["chrome"], 1)["host_env"] == "{}"
+        assert c.local_provenance(config.engines["chrome"])["host_env"] == "{}"
 
     def test_a_missing_benchmark_dir_does_not_kill_the_bench(self, config, tmp_path):
         """Provenance runs after scores are already written."""
@@ -794,7 +795,7 @@ class TestInterruptedCommitIsRemeasured:
         }
         c.store.insert_scores("v8", config.platform, 100, 0, [stale])
 
-        def rerun(engine, commit_id, runs, run_root):
+        def rerun(engine, commit_id, run_root):
             c.store.insert_scores(
                 "v8", config.platform, 100, 0, [{**stale, "score": 99.0}]
             )
@@ -805,7 +806,6 @@ class TestInterruptedCommitIsRemeasured:
             config.engines["v8"],
             {"hash": "h", "commit_id": 100, "date": "d", "timestamp": 0, "title": "t"},
             tmp_path / "src",
-            1,
         )
         scores = c.store.conn.execute(
             "SELECT score FROM scores WHERE commit_id=100"
@@ -911,7 +911,7 @@ class TestCollisionDropsTheScores:
         monkeypatch.setattr(c, "harness_revs", lambda: {})
         c.store.upsert_commit("v8", "hashA", 100, "2026-01-01", 1, "A")
 
-        def measure(engine, commit_id, runs, run_root):
+        def measure(engine, commit_id, run_root):
             c.store.insert_scores(
                 "v8",
                 config.platform,
@@ -941,7 +941,6 @@ class TestCollisionDropsTheScores:
                 "title": "B",
             },
             tmp_path / "root",
-            1,
         )
         assert c.store.get_status("v8", config.platform, 100) == "failed"
         assert (
@@ -970,7 +969,7 @@ class TestAMidRunFailureExportsNothing:
         monkeypatch.setattr(c, "harness_revs", lambda: {})
         c.store.upsert_commit("v8", "abc", 100, "2026-01-01", 17, "t")
 
-        def die_after_one_run(engine, commit_id, runs, run_root):
+        def die_after_one_run(engine, commit_id, run_root):
             c.store.insert_scores(
                 "v8",
                 config.platform,
@@ -1000,7 +999,6 @@ class TestAMidRunFailureExportsNothing:
                 "title": "t",
             },
             tmp_path / "root",
-            3,
         )
         assert c.store.get_status("v8", config.platform, 100) == "failed"
         assert (

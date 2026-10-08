@@ -98,9 +98,7 @@ def local_env(cfg: Config, collector, engine: str | None = None) -> dict:
         "harness": collector.harness_revs(),
     }
     if engine is not None:
-        env["run_configs"] = [
-            f"{c.suite}/{c.variant}" for c in collector.run_configs(cfg.engines[engine])
-        ]
+        env["run_configs"] = collector.run_config_labels(cfg.engines[engine])
         env["runner_cfg_hash"] = collector._runner(cfg.engines[engine]).cfg_hash()
         env["suite_cfg_hash"] = collector.suite_cfg_hashes(cfg.engines[engine])
     return env
@@ -110,9 +108,11 @@ def compare_env(local: dict, remote: dict) -> list[str]:
     """Which shared inputs the two boxes disagree on.
 
     run_configs is compared as a set because the two boxes build it from their
-    own engine lists; suite_cfg_hash per suite, naming the suite, because one
-    suite's protocol changing is one series' problem; the rest are compared
-    as read.
+    own engine lists; its entries carry the repeat count (``suite/variant@N``),
+    so a series one box measures five times and the other three shows up
+    here as an entry only each side has. suite_cfg_hash per suite, naming
+    the suite, because one suite's protocol changing is one series' problem;
+    the rest are compared as read.
     """
     out = []
     for key in ("slipstream_version", "os_version", "harness", "runner_cfg_hash"):

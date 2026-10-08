@@ -110,7 +110,6 @@ def bench(
     start: Annotated[int, typer.Argument(help="Start commit ID")],
     end: Annotated[int, typer.Argument(help="End commit ID")],
     step: int = typer.Option(1, help="Sample every N-th commit"),
-    runs: int = typer.Option(3, help="Benchmark iterations per commit"),
     config: Optional[Path] = typer.Option(
         None, help="User config path (default: ~/.config/slipstream/config.toml)"
     ),
@@ -142,7 +141,6 @@ def bench(
             start,
             end,
             step=step,
-            runs=runs,
             clear=clear,
             should_stop=_shutdown_flag(),
         )
@@ -177,7 +175,6 @@ def watch(
     ] = None,
     interval: str = typer.Option("30m", help="Poll interval, e.g. 30m, 2h, 90s"),
     step: int = typer.Option(1, help="Sample every N-th commit"),
-    runs: int = typer.Option(3, help="Benchmark iterations per commit"),
     once: bool = typer.Option(False, "--once", help="Single poll cycle then exit"),
     no_push: bool = typer.Option(
         False,
@@ -294,10 +291,7 @@ def watch(
 
     should_stop = _shutdown_flag()
 
-    typer.echo(
-        f"Watching {', '.join(engine_names)} "
-        f"(interval={interval}, step={step}, runs={runs})"
-    )
+    typer.echo(f"Watching {', '.join(engine_names)} (interval={interval}, step={step})")
 
     try:
         while not should_stop():
@@ -310,7 +304,6 @@ def watch(
                     result = consumer.drain(
                         source,
                         name,
-                        runs,
                         should_stop,
                         lambda: collector.lock.acquire(
                             should_stop,
@@ -353,7 +346,6 @@ def watch(
                     last_done,
                     head_id,
                     step=step,
-                    runs=runs,
                     include_start=False,
                     should_stop=should_stop,
                 )

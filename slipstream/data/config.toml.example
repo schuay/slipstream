@@ -90,6 +90,12 @@ dir = "~/src/JetStream"
 # Adding an entry does not backfill: commits already measured stay done. To
 # fill history for a new variant, `slipstream clear` the range, which re-runs
 # every entry for those commits, not only the new one.
+#
+# runs is how many times each commit is measured with the entry (default 3).
+# It is per entry because the suites' noise differs: the same engine can take
+# three rounds of js3 and five of sp3. The count is part of what `bus status`
+# compares, since the same series measured a different number of times on
+# each box differs in noise.
 
 [[run]]
 engine = "v8"
@@ -120,6 +126,7 @@ suite = "js3"
 # [[run]]
 # engine = "chrome"
 # suite = "sp3"
+# runs = 5
 
 # [push]
 # bot_name = "my-machine-local"   # must match the top-level bot_name

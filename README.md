@@ -109,6 +109,10 @@ same numbers crossbench reports. The page cannot report on its own, so the
 local server appends a small module to `index.html` that POSTs the metrics
 back; the checkout is never modified.
 
+How many times each commit is measured is a property of the `[[run]]` entry,
+`runs = N` (default 3), so `chrome`/`sp3` can take five rounds while
+`chrome`/`js3` takes three. Rounds are interleaved across an engine's entries.
+
 ## Two machines
 
 `build` and `watch` can be split across a pair of boxes over a shared directory

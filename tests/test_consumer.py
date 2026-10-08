@@ -13,7 +13,7 @@ import pytest
 from slipstream.builder import store_run_set
 from slipstream.bus import Bus, Entry
 from slipstream.collector import BenchCollector, BenchOutcome
-from slipstream.config import BusConfig, BusSource, EngineConfig
+from slipstream.config import BusConfig, BusSource, EngineConfig, RunSpec
 from slipstream.consumer import BusConsumer, ConsumerError, ShaMismatch
 from keys import K1
 
@@ -101,16 +101,15 @@ def setup(config, tmp_path, monkeypatch):
     )
 
 
-def _drain(setup, runs=1, should_stop=None):
+def _drain(setup, should_stop=None):
     """The bench count; tests that care about the reason use drain directly."""
-    return _drain_result(setup, runs, should_stop).benched
+    return _drain_result(setup, should_stop).benched
 
 
-def _drain_result(setup, runs=1, should_stop=None):
+def _drain_result(setup, should_stop=None):
     return setup.consumer.drain(
         setup.source,
         "v8",
-        runs,
         should_stop or (lambda: False),
         lambda: setup.collector.lock.try_acquire(),
         setup.collector.lock.release,
@@ -122,7 +121,7 @@ def scored(setup, monkeypatch):
     """Record which run roots were benched, without running a benchmark."""
     seen = []
 
-    def fake(engine, commit_id, runs, run_root):
+    def fake(engine, commit_id, run_root):
         seen.append((commit_id.commit_id, Path(run_root)))
         return BenchOutcome(1, 1, 10)
 
@@ -223,7 +222,7 @@ class TestDraining:
         setup.publish(100)
         seen = {}
 
-        def fake(engine, commit_id, runs, run_root):
+        def fake(engine, commit_id, run_root):
             seen["cursor_during"] = setup.consumer.cursor(setup.source, "v8")
             return BenchOutcome(1, 1, 10)
 
@@ -275,7 +274,7 @@ class TestProvisioning:
         setup.blob_path(100).write_bytes(b"corrupt")
         with pytest.raises(ShaMismatch):
             setup.consumer.bench_entry(
-                LocalSource(setup.source), setup.cfg.engines["v8"], entry, 1
+                LocalSource(setup.source), setup.cfg.engines["v8"], entry
             )
 
     def test_a_missing_blob_is_a_real_error(self, setup, scored):
@@ -320,7 +319,7 @@ class TestResumeAfterInterrupt:
         }
         store.insert_scores("v8", setup.cfg.platform, 100, 0, [stale])
 
-        def fake(engine, commit_id, runs, run_root):
+        def fake(engine, commit_id, run_root):
             store.insert_scores(
                 "v8", setup.cfg.platform, 100, 0, [{**stale, "score": 99.0}]
             )
@@ -347,14 +346,14 @@ class TestFreeSpace:
 class TestProvenance:
     def test_records_both_environments(self, setup, scored):
         setup.publish(100)
-        _drain(setup, runs=3)
+        _drain(setup)
         row = setup.collector.store.get_run_env("v8", 100)
         assert row["source"] == "bus" and row["runs"] == 3
         assert row["build_cfg_hash"] == "sha256:cfg"
         # The builder's toolchain, because an update on it shifts both series.
         assert row["toolchain"] == "clang-21"
         assert json.loads(row["harness_revs"]) == {"js3": "abc1234"}
-        assert "js3/default" in json.loads(row["run_configs"])
+        assert json.loads(row["run_configs"]) == ["js3/default@3"]
         assert row["slipstream_version"]
 
     def test_clearing_a_commit_drops_its_provenance(self, setup, scored):
@@ -384,7 +383,7 @@ class TestBenchState:
             setup.publish(cid)
         done = []
 
-        def one_then_stop(engine, commit_id, runs, run_root):
+        def one_then_stop(engine, commit_id, run_root):
             done.append(commit_id.commit_id)
             return BenchOutcome(1, 1, 10)
 
@@ -520,6 +519,7 @@ def test_one_box_builds_and_benches_through_the_bus(config, tmp_path, monkeypatc
     # than the unpacked archive's, the score below would be 0.1.
     d8.write_text("#!/bin/sh\necho 'test-bench Total-Score 0.1 pts'\n")
 
+    config.runs[:] = [RunSpec(engine="v8", suite="js3", runs=1)]
     collector = BenchCollector(config, role="watch")
     collector.lock.path = tmp_path / "machine.lock"
     monkeypatch.setattr(collector, "harness_revs", lambda: {"js3": "abc1234"})
@@ -527,7 +527,6 @@ def test_one_box_builds_and_benches_through_the_bus(config, tmp_path, monkeypatc
     result = consumer.drain(
         config.bus.sources[0],
         "v8",
-        1,
         lambda: False,
         lambda: collector.lock.try_acquire(),
         collector.lock.release,
@@ -599,17 +598,24 @@ class TestTransportFailures:
 
 class TestRunsInTheEnvBlock:
     def test_runs_is_published(self, setup, scored):
-        """It is one of the shared inputs that can silently differ per box."""
+        """It is one of the shared inputs that can silently differ per box.
+        What goes out is the number of rounds: the largest count among the
+        engine's [[run]] entries."""
+        setup.cfg.runs[:] = [
+            RunSpec(engine="v8", suite="js3", runs=5),
+            RunSpec(engine="v8", suite="js3", variant="x", flags=("--x",), runs=2),
+        ]
         setup.publish(100)
-        _drain(setup, runs=5)
+        _drain(setup)
         assert setup.bus.read_bench_state("v8").env["runs"] == 5
 
     def test_a_change_moves_since(self, setup, scored):
         setup.publish(100)
-        _drain(setup, runs=3)
+        _drain(setup)
         first = setup.bus.read_bench_state("v8").env["since"]
+        setup.cfg.runs[:] = [RunSpec(engine="v8", suite="js3", runs=5)]
         setup.publish(101)
-        _drain(setup, runs=5)
+        _drain(setup)
         state = setup.bus.read_bench_state("v8")
         assert state.env["runs"] == 5 and state.env["since"] > first
 
@@ -680,7 +686,6 @@ class TestDryRun:
         return c.drain(
             setup.source,
             "v8",
-            1,
             lambda: False,
             lambda: setup.collector.lock.try_acquire(),
             setup.collector.lock.release,
@@ -871,7 +876,7 @@ class TestConsumerCircuitBreaker:
 
         seen = []
 
-        def no_scores(engine, commit_id, runs, run_root):
+        def no_scores(engine, commit_id, run_root):
             seen.append(commit_id.commit_id)
             return BenchOutcome(0, 3, 0)  # the binary never ran
 
@@ -983,7 +988,7 @@ class TestConsumerCircuitBreaker:
             setup.publish(cid)
             store.upsert_commit("v8", f"other{cid}", cid, "d", 0, "incumbent")
 
-        def measured(engine, commit_id, runs, run_root):
+        def measured(engine, commit_id, run_root):
             store.insert_scores(
                 "v8",
                 setup.cfg.platform,
@@ -1279,7 +1284,6 @@ class TestEntryIsRevalidatedUnderTheLock:
         result = setup.consumer.drain(
             setup.source,
             "v8",
-            1,
             lambda: False,
             drop_100_while_waiting,
             setup.collector.lock.release,

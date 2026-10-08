@@ -642,6 +642,28 @@ class TestRunMatrix:
                 )
             )
 
+    def test_runs_is_per_entry_and_defaults_to_three(self, tmp_path):
+        """The suites' noise differs, so the count is the entry's, not the
+        machine's or the command line's."""
+        cfg = load_config(
+            _bench_box(
+                tmp_path,
+                '[[run]]\nengine = "v8"\nsuite = "js3"\n'
+                '[[run]]\nengine = "v8"\nsuite = "js3"\nvariant = "five"\nruns = 5\n',
+            )
+        )
+        assert [(r.variant, r.runs) for r in cfg.runs] == [("default", 3), ("five", 5)]
+
+    @pytest.mark.parametrize("value", ["0", "-1", "2.5", '"3"', "true"])
+    def test_runs_must_be_a_positive_integer(self, tmp_path, value):
+        with pytest.raises(ValueError, match="runs must be a positive integer"):
+            load_config(
+                _bench_box(
+                    tmp_path,
+                    f'[[run]]\nengine = "v8"\nsuite = "js3"\nruns = {value}\n',
+                )
+            )
+
     def test_a_box_set_up_to_measure_must_say_what(self, tmp_path):
         with pytest.raises(ValueError, match="nothing to measure"):
             load_config(_bench_box(tmp_path, ""))

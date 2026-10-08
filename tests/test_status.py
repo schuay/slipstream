@@ -294,6 +294,20 @@ class TestCompareEnv:
         (line,) = compare_env(local, {"run_configs": ["a"]})
         assert "only here ['b']" in line
 
+    def test_a_different_repeat_count_is_a_divergence(self):
+        """The same series measured five times on one box and three on the
+        other differ in noise; the count rides on the entry so this shows."""
+        local = {"run_configs": ["js3/default@3", "sp3/default@5"], "harness": {}}
+        assert (
+            compare_env(local, {"run_configs": ["sp3/default@5", "js3/default@3"]})
+            == []
+        )
+        (line,) = compare_env(
+            local, {"run_configs": ["js3/default@3", "sp3/default@3"]}
+        )
+        assert "only here ['sp3/default@5']" in line
+        assert "only there ['sp3/default@3']" in line
+
     def test_keys_absent_from_the_source_are_not_reported(self):
         assert compare_env({"harness": {}}, {}) == []
 
@@ -363,8 +377,8 @@ class TestPerEngineRunConfigs:
         monkeypatch.setattr(collector, "harness_revs", lambda: {})
         jsc = local_env(config, collector, "jsc")["run_configs"]
         v8 = local_env(config, collector, "v8")["run_configs"]
-        assert "js3/turbolev_future" in v8
-        assert "js3/turbolev_future" not in jsc
+        assert "js3/turbolev_future@3" in v8
+        assert "js3/turbolev_future@3" not in jsc
         assert (
             compare_env(local_env(config, collector, "jsc"), {"run_configs": jsc}) == []
         )

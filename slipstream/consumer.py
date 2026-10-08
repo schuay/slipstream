@@ -276,9 +276,7 @@ class BusConsumer:
             root = root.parent
         return shutil.disk_usage(root).free / GB
 
-    def bench_entry(
-        self, source, engine: EngineConfig, entry: Entry, runs: int
-    ) -> BenchOutcome:
+    def bench_entry(self, source, engine: EngineConfig, entry: Entry) -> BenchOutcome:
         """Provision, bench and record one entry. The machine lock is held."""
         root = self.provision(source, engine, entry)
         commit = {
@@ -290,7 +288,7 @@ class BusConsumer:
             "timestamp": entry.timestamp,
             "title": entry.title,
         }
-        provenance = self.collector.local_provenance(engine, runs, root)
+        provenance = self.collector.local_provenance(engine, root)
         provenance.update(
             {
                 "source": "bus",
@@ -300,13 +298,7 @@ class BusConsumer:
                 "build_cfg_hash": entry.build_cfg_hash,
             }
         )
-        return self.collector.bench_at_root(
-            engine,
-            commit,
-            root,
-            runs,
-            provenance=provenance,
-        )
+        return self.collector.bench_at_root(engine, commit, root, provenance=provenance)
 
     # --- the cycle ---
 
@@ -314,7 +306,6 @@ class BusConsumer:
         self,
         source: BusSource,
         engine_name: str,
-        runs: int,
         should_stop: Callable[[], bool],
         take_lock: Callable[[], bool],
         release_lock: Callable[[], None],
@@ -330,7 +321,7 @@ class BusConsumer:
         self._benched = 0
         try:
             return self._drain(
-                source, engine_name, runs, should_stop, take_lock, release_lock
+                source, engine_name, should_stop, take_lock, release_lock
             )
         except TRANSPORT_ERRORS as e:
             self.log(f"{engine_name}: {e}")
@@ -340,7 +331,6 @@ class BusConsumer:
         self,
         source: BusSource,
         engine_name: str,
-        runs: int,
         should_stop: Callable[[], bool],
         take_lock: Callable[[], bool],
         release_lock: Callable[[], None],
@@ -365,7 +355,7 @@ class BusConsumer:
             state.last_error = str(e)
             self.log(f"{engine_name}: {state.last_error}")
             self._publish_state(
-                engine_name, state, self.cursor(source, engine_name), handle, runs
+                engine_name, state, self.cursor(source, engine_name), handle
             )
             return DrainResult(0, state.last_error)
 
@@ -388,7 +378,7 @@ class BusConsumer:
                 f"{time.strftime('%H:%M', time.localtime(state.stall_retry_after))}"
                 f" -- {state.last_error}"
             )
-            self._publish_state(engine_name, state, cursor, handle, runs)
+            self._publish_state(engine_name, state, cursor, handle)
             return DrainResult(0, state.last_error)
 
         # Cleared once per cycle rather than only on the path that benches
@@ -499,7 +489,7 @@ class BusConsumer:
                 # Inside the try: it writes to the filesystem this path is
                 # about running out of, and escaping here would leave the
                 # machine lock held and kill the daemon.
-                self._publish_state(engine_name, state, cursor, handle, runs)
+                self._publish_state(engine_name, state, cursor, handle)
                 # The queue depth is the batch this cycle listed, so it does
                 # not count entries published since; the hash is what matches
                 # the run against a build without opening the state file.
@@ -512,7 +502,7 @@ class BusConsumer:
                     f"{engine_name}: benching {key} ({entry.hash[:8]}), "
                     f"{queued} above the cursor"
                 )
-                outcome = self.bench_entry(handle, engine, entry, runs)
+                outcome = self.bench_entry(handle, engine, entry)
             except TRANSPORT_ERRORS as e:
                 state.last_error = str(e)
                 state.in_flight = None
@@ -554,7 +544,7 @@ class BusConsumer:
                 state.stalled_since = None
                 state.stall_retry_after = None
         try:
-            self._publish_state(engine_name, state, cursor, handle, runs)
+            self._publish_state(engine_name, state, cursor, handle)
         except TRANSPORT_ERRORS as e:
             # Same exposure as the call inside the loop, which is guarded for
             # the same reason: it writes to the filesystem this path is about
@@ -629,9 +619,7 @@ class BusConsumer:
             self.set_cursor(source, engine_name, cursor)
         return None, cursor
 
-    def _publish_state(
-        self, engine_name, state: BenchState, cursor, handle, runs: int | None = None
-    ):
+    def _publish_state(self, engine_name, state: BenchState, cursor, handle):
         state.bot = self.cfg.bot_name
         state.cursor = cursor
         try:
@@ -646,10 +634,8 @@ class BusConsumer:
             "slipstream_version": __version__,
             "hw_model": self.identity["hw_model"],
             "os_version": self.identity["os_version"],
-            "runs": runs if runs is not None else state.env.get("runs"),
-            "run_configs": [
-                f"{c.suite}/{c.variant}" for c in self.collector.run_configs(engine)
-            ],
+            "runs": self.collector.max_runs(engine),
+            "run_configs": self.collector.run_config_labels(engine),
             "runner_cfg_hash": self.collector._runner(engine).cfg_hash(),
             "suite_cfg_hash": self.collector.suite_cfg_hashes(engine),
             "harness": self.collector.harness_revs(),

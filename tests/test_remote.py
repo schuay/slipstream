@@ -278,14 +278,13 @@ def test_a_remote_source_drives_the_consumer(config, tmp_path, monkeypatch, remo
     monkeypatch.setattr(
         collector,
         "_run_benchmarks",
-        lambda e, cid, runs, root: (roots.append(root), BenchOutcome(1, 1, 5))[1],
+        lambda e, cid, root: (roots.append(root), BenchOutcome(1, 1, 5))[1],
     )
     consumer = BusConsumer(config, collector)
 
     result = consumer.drain(
         bus_source,
         "v8",
-        1,
         lambda: False,
         lambda: collector.lock.try_acquire(),
         collector.lock.release,
