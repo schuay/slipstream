@@ -246,7 +246,7 @@ class TestVerify:
         assert "201: /System/Library/Frameworks" in verdict.problem
 
     def test_tmp_and_private_tmp_are_the_same_root(self, req, tmp_path):
-        """lsof reports realpaths; the run root may be spelled through a
+        """Image inspection reports realpaths; the run root may be spelled through a
         symlink (macOS /tmp -> /private/tmp)."""
         link = tmp_path / "link"
         link.symlink_to(req.run_root)
@@ -591,16 +591,19 @@ class TestOwnership:
 
     def test_image_reader_includes_shared_cache_paths_with_spaces(self, monkeypatch):
         path = "/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/JavaScriptCore"
-        safari = "/run/Safari Technology Preview.app/Contents/Frameworks/Safari.framework/Versions/A/Safari"
+        safari = "/Users/bench/bus/roots/safari/run/Safari Technology Preview.app/Contents/Frameworks/Safari.framework/Versions/A/Safari"
 
         def run(argv, **kwargs):
-            assert argv[:4] == ["/usr/bin/sample", "100", "1", "1000"]
+            assert argv == ["/usr/bin/vmmap", "-w", "100"]
             assert kwargs["timeout"] == 30.0
-            Path(argv[-1]).write_text(
-                f"Binary Images:\n  0x100 - 0x200 JSC (1) <AB-CD> {path}\n"
-                f"  0x300 - 0x400 Safari (1) <AB-CD> {safari}\n"
+            output = (
+                "REGION TYPE                    START - END         [ VSIZE] PRT/MAX SHRMOD  REGION DETAIL\n"
+                f"__TEXT                      100-200 [ 16K 16K 0K 0K] r-x/r-x SM=COW  {path}\n"
+                f"__TEXT                      300-400 [ 16K 16K 0K 0K] r-x/r-x SM=COW  {safari}\n"
+                f"__LINKEDIT                  500-600 [ 16K 16K 0K 0K] r--/r-- SM=COW  {safari}\n"
+                "==== Summary for process 100\n__TEXT 32K 2\n"
             )
-            return subprocess.CompletedProcess(argv, 0, "", "")
+            return subprocess.CompletedProcess(argv, 0, output, "")
 
         monkeypatch.setattr(subprocess, "run", run)
         runner = SafariRunner(log=lambda _: None, progress=lambda: None)
@@ -611,12 +614,12 @@ class TestOwnership:
         runner = _Runner(host)
 
         def images(pid):
-            raise RuntimeError("sample failed")
+            raise RuntimeError("vmmap failed")
 
         runner.loaded_images = images
         verdict = runner.verify(req, _Proc(100))
         assert not verdict.ok
-        assert "sample failed" in verdict.problem
+        assert "vmmap failed" in verdict.problem
 
     @pytest.mark.parametrize(
         "output", ["", "pid/100 = {\n}", "pid/200 = {\n\tservices = {\n\t}\n}"]
@@ -631,12 +634,48 @@ class TestOwnership:
         with pytest.raises(RuntimeError, match="unrecognized launchd"):
             runner.domain_helpers(100)
 
-    def test_truncated_sample_is_an_inspection_error(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "returncode, output, problem",
+        [
+            (0, "Summary only\n", "missing summary marker"),
+            (0, "==== Summary for process 100\n", "no image paths"),
+            (1, "", "vmmap failed"),
+        ],
+    )
+    def test_unusable_vmmap_is_an_inspection_error(
+        self, monkeypatch, returncode, output, problem
+    ):
         def run(argv, **kwargs):
-            Path(argv[-1]).write_text("Call graph only\n")
-            return subprocess.CompletedProcess(argv, 0, "", "")
+            return subprocess.CompletedProcess(
+                argv, returncode, output, "inspection error"
+            )
 
         monkeypatch.setattr(subprocess, "run", run)
         runner = SafariRunner(log=lambda _: None, progress=lambda: None)
-        with pytest.raises(RuntimeError, match="no binary images"):
+        with pytest.raises(RuntimeError, match=problem):
             runner.loaded_images(100)
+
+    @pytest.mark.parametrize(
+        "bad_row",
+        [
+            "__TEXT changed output format",
+            "__TEXT 300-400 [ 16K] r-x/r-x SM=COW",
+            "__TEXT 300-400 [ 16K] r-x/r-x SM=COW /Users/*/Safari",
+        ],
+    )
+    def test_partial_image_parse_fails_verification(self, req, monkeypatch, bad_row):
+        output = (
+            "__TEXT 100-200 [ 16K] r-x/r-x SM=COW /valid/image\n"
+            f"{bad_row}\n==== Summary for process 100\n"
+        )
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda argv, **kw: subprocess.CompletedProcess(argv, 0, output, ""),
+        )
+        runner = _Runner(_Host(req.run_root, 100))
+        runner.loaded_images = SafariRunner.loaded_images.__get__(runner)
+        verdict = runner.verify(req, _Proc(100))
+        assert not verdict.ok
+        assert "vmmap parse failure for 100" in verdict.problem
+        assert bad_row in verdict.problem

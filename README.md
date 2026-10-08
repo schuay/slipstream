@@ -102,10 +102,10 @@ engine provenance failure gets one fresh attempt after cleanup; the first
 attempt's stderr is kept as `stderr-recovery`. Workload failures are not retried.
 
 Safari provenance checks inspect owned WebContent workers and the launcher with
-`sample`, whose Binary Images include system dyld shared-cache libraries that
-`lsof` can omit. Missing images and inspection errors fail verification. Each
-process inspection takes approximately one second and samples the process;
-the early check can overlap measurement. This policy changes the configuration
+`vmmap -w`, which includes system dyld shared-cache libraries that `lsof` can
+omit and preserves full paths under home directories that `sample` redacts.
+Missing images and inspection errors fail verification. The early inspection
+can overlap measurement. This policy changes the configuration
 hash, so measurements are distinguishable from the old inspection policy.
 Safari startup can still trigger Software Update activity; scoped cleanup does
 not establish a background-free measurement environment.

@@ -31,7 +31,6 @@ import platform
 import re
 import signal
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 
@@ -63,8 +62,7 @@ JSC_IMAGE = "JavaScriptCore.framework/Versions/A/JavaScriptCore"
 SAFARI_IMAGE = "Safari.framework/Versions/A/Safari"
 QUIET_SECONDS = 0.3
 POLL_SECONDS = 0.1
-# sample's one-second capture is followed by report generation and symbol
-# resolution, which can outlast the process-cleanup grace period.
+# Image inspection can outlast the process-cleanup grace period.
 IMAGE_INSPECTION_SECONDS = 30.0
 
 
@@ -89,7 +87,7 @@ class SafariRunner(BrowserRunner):
             "<launcher> -HomePage <url>",
             *LAUNCH_ARGS,
             "drain current-user Safari and its launchd PID-domain helpers",
-            "verify owned engines with sample binary images including shared cache",
+            "verify owned engines with vmmap image paths including shared cache",
             "retry launch/provenance failure once after cleanup",
         )
 
@@ -387,31 +385,42 @@ class SafariRunner(BrowserRunner):
         return running
 
     def loaded_images(self, pid: int) -> list[str]:
-        """sample's Binary Images includes dyld shared-cache libraries.
+        """Read exact image paths, including dyld shared-cache libraries.
 
-        The one-second capture also needs time for report generation and
-        symbol resolution. Inspection errors are provenance failures, never
-        evidence of an absent engine.
+        sample redacts home-directory paths to /Users/*/..., even with
+        -fullPaths. vmmap -w preserves the paths needed for provenance.
+        Inspection errors fail closed; never expand redactions as globs.
         """
-        with tempfile.TemporaryDirectory(prefix="slipstream-images-") as tmp:
-            report = Path(tmp) / "sample.txt"
-            result = subprocess.run(
-                ["/usr/bin/sample", str(pid), "1", "1000", "-file", str(report)],
-                capture_output=True,
-                text=True,
-                timeout=IMAGE_INSPECTION_SECONDS,
-                check=False,
-            )
-            if result.returncode or not report.exists():
-                raise RuntimeError(f"sample failed for {pid}: {result.stderr.strip()}")
-            output = report.read_text()
-        if "Binary Images:" not in output:
-            raise RuntimeError(f"sample returned no binary images for {pid}")
-        return re.findall(
-            r"^\s*0x[0-9a-fA-F]+\s+-\s+0x[0-9a-fA-F]+.*?<[^>]+> (/.*)$",
-            output.split("Binary Images:", 1)[1],
-            re.M,
+        result = subprocess.run(
+            ["/usr/bin/vmmap", "-w", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=IMAGE_INSPECTION_SECONDS,
+            check=False,
         )
+        if result.returncode:
+            raise RuntimeError(f"vmmap failed for {pid}: {result.stderr.strip()}")
+        regions, summary, _ = result.stdout.partition("==== Summary for process ")
+        if not summary:
+            raise RuntimeError(f"vmmap parse failure for {pid}: missing summary marker")
+        image_row = re.compile(
+            r"^__TEXT\s+[0-9a-fA-F]+-[0-9a-fA-F]+\s+\[[^\]\n]+\]"
+            r"\s+\S+\s+SM=\S+\s+(/[^\n]+)$"
+        )
+        images = []
+        for line in regions.splitlines():
+            if not re.match(r"^\s*__TEXT\b", line):
+                continue
+            match = image_row.fullmatch(line.strip())
+            if match is None or "*" in match[1]:
+                raise RuntimeError(
+                    f"vmmap parse failure for {pid}: unrecognized or redacted "
+                    f"image row: {line.strip()[:300]}"
+                )
+            images.append(match[1])
+        if not images:
+            raise RuntimeError(f"vmmap parse failure for {pid}: no image paths")
+        return images
 
 
 class _BSDInfo(ctypes.Structure):
