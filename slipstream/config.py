@@ -287,6 +287,34 @@ class BusConfig:
 
 
 @dataclass
+class DeltaConfig:
+    """How the builder stores a run set entry against the previous one.
+
+    A delta is accepted when its patches come to at most ``max_ratio`` of
+    the full archive; past that the archive is stored whole and becomes the
+    base for what follows. ``max_ratio`` 0 turns deltas off. Archives under
+    ``min_mb`` are stored whole: the saving is not worth a plan.
+    """
+
+    block_mb: int = 8
+    max_ratio: float = 0.5
+    min_mb: float = 4.0
+    workers: int = 0  # 0: one per core, capped
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_ratio > 0
+
+    @property
+    def block_bytes(self) -> int:
+        return self.block_mb << 20
+
+    @property
+    def min_bytes(self) -> int:
+        return int(self.min_mb * (1 << 20))
+
+
+@dataclass
 class BuildConfig:
     """What ``slipstream build`` publishes, and how much of it is kept."""
 
@@ -302,6 +330,7 @@ class BuildConfig:
     # Only consulted when an engine has neither published entries nor terminal
     # build failures, so a restart cannot rewind the frontier.
     start_from: dict[str, CommitKey] = field(default_factory=dict)
+    delta: DeltaConfig = field(default_factory=DeltaConfig)
 
 
 @dataclass

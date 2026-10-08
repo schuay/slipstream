@@ -25,10 +25,21 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import host
-from .bus import Blob, Bus, BuilderState, BusError, Entry, sha256_file, tree_hash
+from . import delta, host
+from .bus import (
+    Blob,
+    Bus,
+    BuilderState,
+    BusError,
+    Delta,
+    Entry,
+    patch_name,
+    sha256_file,
+    tree_hash,
+)
 from .collector import BenchCollector, BuildStepError, FetchError
-from .config import Config, EngineConfig
+from .config import Config, DeltaConfig, EngineConfig
+from .delta import DeltaError
 from .lock import MachineLock
 from .models import CommitKey
 from .resolve import (
@@ -150,29 +161,187 @@ def package(
         raise BuildError(f"packaging failed (tar {tar_rc}, zstd {zstd_rc})")
 
 
-def store_run_set(
-    bus: Bus, src_dir: Path, run_set: list[str], *, caffeinate: bool = True
-) -> list[Blob]:
-    """Archive each run set entry into the blob store, once per distinct tree.
+@dataclass(frozen=True)
+class _Base:
+    """The archive a new blob of a run set path is planned against."""
 
-    The tree hash is computed first and the entry packaged only if the store
-    has no blob of that name: the ICU data file, the browser bundle, the
-    runtime a commit did not touch are then hashed per publish but archived
-    once. The returned blobs are what the manifest names, in run set order.
+    id: str
+    sha256: str
+    bytes: int
+
+    @classmethod
+    def of(cls, blob: Blob) -> _Base:
+        if blob.delta is None:
+            return cls(blob.id, blob.sha256, blob.bytes)
+        d = blob.delta
+        return cls(d.base_id, d.base_sha256, d.base_bytes)
+
+
+class _Stored:
+    """What the bus already holds, read once per run set.
+
+    A tree that is already a blob of some entry -- this engine's or another's,
+    as a full archive or a delta -- is named again rather than re-stored. The
+    newest blob at each of this engine's run set paths is where a new delta's
+    base comes from: its own archive, or the archive it was itself planned
+    against, so every delta since the last full store shares one base.
+    """
+
+    def __init__(self, bus: Bus, engine: str | None):
+        self.bus = bus
+        self.blobs: dict[str, Blob] = {}
+        self.latest: dict[str, Blob] = {}
+        for name in bus.engines():
+            for entry in bus.entries(name):
+                for blob in entry.blobs:
+                    self.blobs[blob.id] = blob
+                    if name == engine:
+                        self.latest[blob.path] = blob
+
+    def known(self, blob_id: str) -> Blob | None:
+        blob = self.blobs.get(blob_id)
+        if blob is None:
+            return None
+        if all(self.bus.has_object(o.name) for o in blob.objects()):
+            return blob
+        return None
+
+    def base_for(self, path: str) -> _Base | None:
+        blob = self.latest.get(path)
+        if blob is None:
+            return None
+        base = _Base.of(blob)
+        return base if self.bus.has_blob(base.id) else None
+
+
+def store_run_set(
+    bus: Bus,
+    src_dir: Path,
+    run_set: list[str],
+    *,
+    caffeinate: bool = True,
+    engine: str | None = None,
+    delta_cfg: DeltaConfig | None = None,
+    log: Callable[[str], None] = lambda msg: None,
+) -> list[Blob]:
+    """Store each run set entry once per distinct tree, as a delta when it pays.
+
+    The tree hash is computed first and the entry packaged only if no blob
+    of that tree is stored: the ICU data file, the browser bundle, the
+    runtime a commit did not touch are then hashed per publish but stored
+    once. A tree new to the store is archived whole, then planned against
+    the engine's newest base at that path; the plan replaces the archive
+    when its patches fit the budget, and otherwise the archive stays and is
+    the next base. Nothing on the delta path can fail a publish: any error
+    in it is logged and the archive stored whole. The returned blobs are
+    what the manifest names, in run set order.
     """
     missing = [entry for entry in run_set if not (src_dir / entry).exists()]
     if missing:
         raise BuildError(f"run_set entries missing from the build: {missing}")
+    stored = _Stored(bus, engine)
     blobs = []
     for entry in run_set:
         blob_id = tree_hash(src_dir, entry)
         dest = bus.blob_path(blob_id)
-        if not dest.exists():
-            tmp = bus.tmp_blob(blob_id)
-            package(src_dir, [entry], tmp, caffeinate=caffeinate)
+        if dest.exists():
+            blobs.append(Blob(entry, blob_id, sha256_file(dest), dest.stat().st_size))
+            continue
+        known = stored.known(blob_id)
+        if known is not None:
+            blobs.append(Blob(entry, blob_id, known.sha256, known.bytes, known.delta))
+            continue
+        tmp = bus.tmp_blob(blob_id)
+        package(src_dir, [entry], tmp, caffeinate=caffeinate)
+        planned = None
+        if delta_cfg is not None and delta_cfg.enabled:
+            planned = _try_delta(
+                bus, tmp, stored.base_for(entry), delta_cfg, log, entry
+            )
+        if planned is not None:
+            tmp.unlink()
+            blobs.append(Blob(entry, blob_id, delta=planned))
+        else:
             bus.store_blob(tmp, blob_id)
-        blobs.append(Blob(entry, blob_id, sha256_file(dest), dest.stat().st_size))
+            blobs.append(Blob(entry, blob_id, sha256_file(dest), dest.stat().st_size))
     return blobs
+
+
+def _try_delta(
+    bus: Bus,
+    archive: Path,
+    base: _Base | None,
+    cfg: DeltaConfig,
+    log: Callable[[str], None],
+    label: str,
+) -> Delta | None:
+    """Plan ``archive`` against ``base``, or say why it stays whole.
+
+    Patches are stored as they are produced; the ones of a plan that is
+    abandoned, over budget or by an error, are unreferenced and the sweep
+    after the publish reclaims them.
+    """
+    size = archive.stat().st_size
+    if base is None:
+        log(f"{label}: no base, stored whole ({size / MB:.0f}MB)")
+        return None
+    if size < cfg.min_bytes:
+        return None
+    budget = int(size * cfg.max_ratio)
+
+    def store_patch(sha: str, data: bytes) -> None:
+        name = patch_name(sha)
+        if bus.has_object(name):
+            return
+        tmp = bus.tmp_object(name)
+        tmp.write_bytes(data)
+        bus.store_object(tmp, name)
+
+    t0 = time.monotonic()
+    try:
+        with (
+            subprocess.Popen(
+                ["zstd", "-dc", str(bus.blob_path(base.id))], stdout=subprocess.PIPE
+            ) as base_proc,
+            subprocess.Popen(
+                ["zstd", "-dc", str(archive)], stdout=subprocess.PIPE
+            ) as target_proc,
+        ):
+            plan = delta.plan(
+                base_proc.stdout,
+                target_proc.stdout,
+                store_patch,
+                block_bytes=cfg.block_bytes,
+                workers=cfg.workers or delta.default_workers(),
+                max_patch_bytes=budget,
+            )
+            if plan is not None:
+                # The plan ends with the target; a longer base is left
+                # unread, and zstd must reach its own end for its exit code
+                # to say whether the archive was sound.
+                while base_proc.stdout.read(1 << 20):
+                    pass
+            # On an abandoned plan the reads stopped early; closing the pipes
+            # ends zstd with EPIPE, which is the intended outcome.
+            base_proc.stdout.close()
+            target_proc.stdout.close()
+        if plan is not None and (base_proc.returncode or target_proc.returncode):
+            raise DeltaError("zstd failed while streaming the archives")
+    except Exception as e:  # noqa: BLE001 -- the delta path may not fail a publish
+        log(f"{label}: delta against {base.id[:12]} failed, stored whole: {e}")
+        return None
+    secs = time.monotonic() - t0
+    if plan is None:
+        log(
+            f"{label}: delta against {base.id[:12]} exceeds {cfg.max_ratio:.0%} of "
+            f"{size / MB:.0f}MB, stored whole as the new base ({secs:.0f}s)"
+        )
+        return None
+    log(
+        f"{label}: delta against {base.id[:12]}: {plan.patch_bytes / MB:.1f}MB of "
+        f"patches for a {size / MB:.0f}MB archive ({secs:.0f}s)"
+    )
+    return Delta(base.id, base.sha256, base.bytes, plan)
 
 
 class Builder:
@@ -451,9 +620,11 @@ class Builder:
         state.last_error = cleanup_error
         state.in_flight = None
         self._publish_state(engine_name, state)
+        patches = sum(b.delta.plan.patch_bytes for b in entry.blobs if b.delta)
         self.log(
-            f"{engine_name}: published {key} "
-            f"({entry.blob_bytes / MB:.0f}MB, {entry.build_secs}s)"
+            f"{engine_name}: published {key} ({entry.blob_bytes / MB:.0f}MB"
+            + (f", {patches / MB:.1f}MB of it patches" if patches else "")
+            + f", {entry.build_secs}s)"
         )
         return BuildResult(key=key, published=True)
 
@@ -482,9 +653,7 @@ class Builder:
         commit = job.commit
         inherited = None
         if job.compiles:
-            blobs = store_run_set(
-                self.bus, engine.require_src_dir(), engine.require_run_set()
-            )
+            blobs = self._store(engine)
         else:
             # The inner entry's blobs by reference, then this engine's own.
             # The app can be replaced under us by its updater: its identity
@@ -494,9 +663,7 @@ class Builder:
             # on the floor (the sweep reclaims it) and the cycle retries.
             resolver = self.resolver(engine.name)
             before, _ = resolver.installed()
-            own = store_run_set(
-                self.bus, engine.require_src_dir(), engine.require_run_set()
-            )
+            own = self._store(engine)
             after, _ = resolver.installed()
             if after != before:
                 raise BuildError(
@@ -523,6 +690,17 @@ class Builder:
         )
         self.bus.publish(entry)
         return entry
+
+    def _store(self, engine: EngineConfig) -> list[Blob]:
+        """This engine's own run set into the store, under its delta policy."""
+        return store_run_set(
+            self.bus,
+            engine.require_src_dir(),
+            engine.require_run_set(),
+            engine=engine.name,
+            delta_cfg=self.cfg.build.delta,
+            log=lambda msg: self.log(f"{engine.name}: {msg}"),
+        )
 
     def migrate(self, should_stop=lambda: False) -> None:
         """Bring the root's entries to the current format, once at startup.

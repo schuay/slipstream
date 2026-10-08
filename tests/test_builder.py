@@ -15,7 +15,7 @@ import pytest
 from slipstream.builder import BuildError, Builder, build_cfg_hash, package
 from slipstream.bus import ENTRY_VERSION, Bus
 from slipstream.collector import BuildStepError
-from slipstream.config import EngineConfig
+from slipstream.config import DeltaConfig, EngineConfig
 from slipstream.models import CommitKey
 from keys import K, K1
 
@@ -196,6 +196,165 @@ class TestBlobStore:
         assert any("migrated 1 entries" in m for m in builder.logs)
         assert builder.lock.try_acquire(), "migrate left the machine lock held"
         builder.lock.release()
+
+
+class TestDeltaStore:
+    """A changed run set entry is stored as patches against the engine's
+    newest base at that path, when the patches are small enough."""
+
+    @pytest.fixture
+    def delta_builder(self, builder, config, monkeypatch):
+        # Real tar and zstd: the plan is over the archive's actual stream.
+        monkeypatch.setattr("slipstream.builder.package", package)
+        config.build.delta = DeltaConfig(block_mb=1, max_ratio=0.5, min_mb=0, workers=1)
+        builder.history = list(range(100, 120))
+        builder.d8 = builder.cfg.engines["v8"].src_dir / "out" / "d8"
+        builder.d8.write_bytes(_payload(seed=1))
+        return builder
+
+    def _publish(self, builder, payload=None):
+        if payload is not None:
+            builder.d8.write_bytes(payload)
+        key = builder.build_one("v8").key
+        return builder.bus.read_entry("v8", key)
+
+    def _patch_files(self, builder):
+        return sorted(p.name for p in builder.bus.blobs_dir.glob("*.bsdiff"))
+
+    def test_the_first_publish_is_a_full_archive(self, delta_builder):
+        entry = self._publish(delta_builder)
+        (blob,) = entry.blobs
+        assert not blob.is_delta and delta_builder.bus.has_blob(blob.id)
+        assert any("no base, stored whole" in m for m in delta_builder.logs)
+
+    def test_a_change_is_a_delta_against_the_previous_archive(self, delta_builder):
+        first = self._publish(delta_builder)
+        second = self._publish(delta_builder, _payload(seed=1, edits=20))
+        (base,), (blob,) = first.blobs, second.blobs
+        assert blob.is_delta
+        assert blob.delta.base_id == base.id
+        assert (blob.delta.base_sha256, blob.delta.base_bytes) == (
+            base.sha256,
+            base.bytes,
+        )
+        assert not delta_builder.bus.has_blob(blob.id)
+        assert self._patch_files(delta_builder) == [
+            f"{sha}.bsdiff" for sha in sorted(blob.delta.plan.patches())
+        ]
+        assert any("MB of it patches" in m for m in delta_builder.logs)
+
+    def test_every_delta_shares_the_base_until_a_new_one(self, delta_builder):
+        """Star, not chain: a consumer holds one base per path, and a chain
+        would make each entry's cost depend on how many came before it."""
+        first = self._publish(delta_builder)
+        second = self._publish(delta_builder, _payload(seed=1, edits=20))
+        third = self._publish(delta_builder, _payload(seed=1, edits=40))
+        assert third.blobs[0].is_delta
+        assert third.blobs[0].delta.base_id == first.blobs[0].id
+        assert third.blobs[0].id != second.blobs[0].id
+
+    def test_an_unchanged_tree_names_the_stored_delta_again(self, delta_builder):
+        self._publish(delta_builder)
+        second = self._publish(delta_builder, _payload(seed=1, edits=20))
+        before = self._patch_files(delta_builder)
+        third = self._publish(delta_builder)
+        assert third.blobs == second.blobs
+        assert self._patch_files(delta_builder) == before
+
+    def test_a_delta_over_budget_is_stored_whole_and_is_the_next_base(
+        self, delta_builder
+    ):
+        self._publish(delta_builder)
+        # Nothing in common with the base: the patch is the whole thing.
+        rebased = self._publish(delta_builder, _payload(seed=2))
+        (blob,) = rebased.blobs
+        assert not blob.is_delta and delta_builder.bus.has_blob(blob.id)
+        assert any("exceeds 50%" in m for m in delta_builder.logs)
+        after = self._publish(delta_builder, _payload(seed=2, edits=20))
+        assert after.blobs[0].delta.base_id == blob.id
+        # The abandoned plan's patches were swept with the publish.
+        assert self._patch_files(delta_builder) == [
+            f"{sha}.bsdiff" for sha in sorted(after.blobs[0].delta.plan.patches())
+        ]
+
+    def test_a_small_archive_is_stored_whole(self, delta_builder, config):
+        config.build.delta.min_mb = 1
+        self._publish(delta_builder)
+        second = self._publish(delta_builder, _payload(seed=1, edits=20))
+        assert not second.blobs[0].is_delta
+        assert self._patch_files(delta_builder) == []
+
+    def test_a_failure_on_the_delta_path_stores_whole(self, delta_builder, monkeypatch):
+        """A publish is never lost to the optimisation."""
+        self._publish(delta_builder)
+
+        def broken(*a, **kw):
+            raise RuntimeError("bsdiff fell over")
+
+        monkeypatch.setattr("slipstream.builder.delta.plan", broken)
+        second = self._publish(delta_builder, _payload(seed=1, edits=20))
+        assert not second.blobs[0].is_delta
+        assert delta_builder.bus.has_blob(second.blobs[0].id)
+        assert any(
+            "failed, stored whole: bsdiff fell over" in m for m in delta_builder.logs
+        )
+
+    def test_a_ratio_of_zero_turns_deltas_off(self, delta_builder, config):
+        config.build.delta.max_ratio = 0
+        self._publish(delta_builder)
+        second = self._publish(delta_builder, _payload(seed=1, edits=20))
+        assert not second.blobs[0].is_delta
+
+    def test_a_base_no_longer_stored_is_no_base(self, delta_builder):
+        first = self._publish(delta_builder)
+        delta_builder.bus.blob_path(first.blobs[0].id).unlink()
+        second = self._publish(delta_builder, _payload(seed=1, edits=20))
+        assert not second.blobs[0].is_delta
+
+    def test_bases_are_per_run_set_path(self, delta_builder, config, tmp_path):
+        icu = tmp_path / "src" / "icudtl.dat"
+        icu.write_bytes(_payload(seed=3))
+        config.engines["v8"].run_set = ["out/d8", "icudtl.dat"]
+        first = self._publish(delta_builder)
+        icu.write_bytes(_payload(seed=3, edits=20))
+        second = self._publish(delta_builder, _payload(seed=1, edits=20))
+        d8, icu_blob = second.blobs
+        assert d8.delta.base_id == first.blobs[0].id
+        assert icu_blob.delta.base_id == first.blobs[1].id
+
+    def test_the_delta_unpacks_to_the_tree_that_was_built(
+        self, delta_builder, tmp_path
+    ):
+        from slipstream.bus import patch_name
+        from slipstream.consumer import _unpack_delta
+
+        self._publish(delta_builder)
+        payload = _payload(seed=1, edits=20)
+        second = self._publish(delta_builder, payload)
+        (blob,) = second.blobs
+        bus = delta_builder.bus
+        dest = tmp_path / "root"
+        dest.mkdir()
+        _unpack_delta(
+            bus.blob_path(blob.delta.base_id),
+            blob.delta,
+            lambda sha: bus.object_path(patch_name(sha)).read_bytes(),
+            dest,
+        )
+        assert (dest / "out" / "d8").read_bytes() == payload
+
+
+def _payload(seed: int, edits: int = 0) -> bytes:
+    """64 KiB that zstd cannot shrink, so the archive's size is honest, with
+    ``edits`` bytes changed at spread-out offsets: a build that touched a
+    few functions."""
+    import random
+
+    data = bytearray(random.Random(seed).randbytes(64 << 10))
+    for i in range(edits):
+        pos = (i * 2999) % len(data)
+        data[pos] ^= 0xFF
+    return bytes(data)
 
 
 class TestFrontier:
