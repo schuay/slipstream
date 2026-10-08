@@ -63,6 +63,9 @@ JSC_IMAGE = "JavaScriptCore.framework/Versions/A/JavaScriptCore"
 SAFARI_IMAGE = "Safari.framework/Versions/A/Safari"
 QUIET_SECONDS = 0.3
 POLL_SECONDS = 0.1
+# sample's one-second capture is followed by report generation and symbol
+# resolution, which can outlast the process-cleanup grace period.
+IMAGE_INSPECTION_SECONDS = 30.0
 
 
 def _is_macos() -> bool:
@@ -386,8 +389,9 @@ class SafariRunner(BrowserRunner):
     def loaded_images(self, pid: int) -> list[str]:
         """sample's Binary Images includes dyld shared-cache libraries.
 
-        One sample over one second keeps profiling work bounded. Inspection
-        errors are provenance failures, never evidence of an absent engine.
+        The one-second capture also needs time for report generation and
+        symbol resolution. Inspection errors are provenance failures, never
+        evidence of an absent engine.
         """
         with tempfile.TemporaryDirectory(prefix="slipstream-images-") as tmp:
             report = Path(tmp) / "sample.txt"
@@ -395,7 +399,7 @@ class SafariRunner(BrowserRunner):
                 ["/usr/bin/sample", str(pid), "1", "1000", "-file", str(report)],
                 capture_output=True,
                 text=True,
-                timeout=GRACE_SECONDS,
+                timeout=IMAGE_INSPECTION_SECONDS,
                 check=False,
             )
             if result.returncode or not report.exists():

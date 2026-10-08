@@ -595,6 +595,7 @@ class TestOwnership:
 
         def run(argv, **kwargs):
             assert argv[:4] == ["/usr/bin/sample", "100", "1", "1000"]
+            assert kwargs["timeout"] == 30.0
             Path(argv[-1]).write_text(
                 f"Binary Images:\n  0x100 - 0x200 JSC (1) <AB-CD> {path}\n"
                 f"  0x300 - 0x400 Safari (1) <AB-CD> {safari}\n"
