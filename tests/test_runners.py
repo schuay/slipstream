@@ -256,14 +256,34 @@ class TestRunnerProvenance:
             ChromiumRunner(**self.kw).cfg_hash() == ChromiumRunner(**self.kw).cfg_hash()
         )
 
+    def test_http_policy_changes_both_browser_hashes_but_not_shell(self, monkeypatch):
+        from slipstream.runners import server
+
+        before = {
+            rt: runner_for(rt, **self.kw).cfg_hash()
+            for rt in ("shell", "chromium", "safari")
+        }
+        monkeypatch.setattr(
+            server,
+            "RESPONSE_HEADERS",
+            tuple(
+                (name, value)
+                for name, value in server.RESPONSE_HEADERS
+                if name != "Cross-Origin-Embedder-Policy"
+            ),
+        )
+        assert runner_for("shell", **self.kw).cfg_hash() == before["shell"]
+        for rt in ("chromium", "safari"):
+            assert runner_for(rt, **self.kw).cfg_hash() != before[rt]
+
     # The exact values, so that a change to how an engine is driven or a
     # suite is read shows up here first. Changing a value below is the
     # deliberate act of saying "runs from now on are a new series"; update
     # it together with the change that moved it, never on its own.
     RUNNER_HASHES = {
         "shell": "sha256:fdb9b01694d1f8052ba10fab1323d49e2d18efdecc040d325067d5c93513cd8b",
-        "chromium": "sha256:b186c8202a74696dfbae27dbb7cdc830ba1ee4ecba88edd9a81f1984cf59a027",
-        "safari": "sha256:9b5d8187696a20157133965977679fb5ffaa3763d78ffaebcf66a8a5ddb73e7a",
+        "chromium": "sha256:60a05e56577cd5e3d0f0f8cb3522970a7ae2f3e2c83a6c856d3252e88eff1892",
+        "safari": "sha256:b6b10e7446bd7843c3c9d2866a9236fc553b067d4f2339350e7144510ae7d0b2",
     }
     SUITE_HASHES = {
         "js2": "sha256:c8c206b3c459a43f8f7305b13be726b06b65cab2b7c7176a9d647acffcd14c14",

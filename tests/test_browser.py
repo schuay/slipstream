@@ -222,8 +222,11 @@ class TestBenchServer:
             with urllib.request.urlopen(server.url("index.html", report="true")) as r:
                 assert r.read() == b"<html>"
                 assert r.headers["Cache-Control"] == "no-store"
+                assert r.headers["Cross-Origin-Opener-Policy"] == "same-origin"
+                assert r.headers["Cross-Origin-Embedder-Policy"] == "require-corp"
             with urllib.request.urlopen(server.url("m.wasm")) as r:
                 assert r.headers["Content-Type"] == "application/wasm"
+                assert r.headers["Cross-Origin-Embedder-Policy"] == "require-corp"
         assert any("GET /index.html?report=true" in line for line in server.requests)
 
     def test_takes_the_report(self, tmp_path):
@@ -264,10 +267,14 @@ class TestBenchServer:
             with urllib.request.urlopen(server.url("index.html")) as r:
                 html = r.read()
                 assert r.headers["Content-Type"] == "text/html"
+                assert r.headers["Cross-Origin-Opener-Policy"] == "same-origin"
+                assert r.headers["Cross-Origin-Embedder-Policy"] == "require-corp"
             with urllib.request.urlopen(server.url("other.html")) as r:
                 assert r.read() == page
+                assert r.headers["Cross-Origin-Embedder-Policy"] == "require-corp"
             with urllib.request.urlopen(server.url("__slipstream/sp3-report.mjs")) as r:
                 assert r.headers["Content-Type"] == "text/javascript"
+                assert r.headers["Cross-Origin-Embedder-Policy"] == "require-corp"
                 script = r.read()
         tag = inject_tag("sp3-report.mjs")
         assert html.count(tag) == 1

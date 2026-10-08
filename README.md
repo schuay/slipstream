@@ -82,6 +82,15 @@ crossbench gives it. Headless mode changes the browser's rendering
 environment; compare scores against a headed baseline before joining the two
 into one performance series.
 
+The local benchmark server uses Crossbench's cross-origin isolation headers
+(`Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp`), enabling high-resolution timers
+where the browser supports them. It also sends `Cache-Control: no-store`.
+Chrome explicitly suppresses model downloads, crashpad metrics and translation
+triggers alongside its existing benchmarking/background flags. HTTP policy and
+Chrome flags are included in the runner configuration hash; adopting them
+changes the measurement baseline for existing browser results.
+
 Safari runs require a dedicated benchmark account. The runner stops that
 account's Safari launchers and WebKit helpers attributed to their launchd PID
 domains before and after each measurement. It retains attributed process start

@@ -32,6 +32,15 @@ REPORT_PATH = "/report"
 INJECT_PREFIX = "/__slipstream/"
 _DATA = pkg_files("slipstream.data")
 
+# Match Crossbench's local benchmark isolation policy for high-resolution
+# timers. Apply it to frames and worker scripts too, not just the entry
+# page. The cache policy also belongs to the measurement environment.
+RESPONSE_HEADERS = (
+    ("Cross-Origin-Opener-Policy", "same-origin"),
+    ("Cross-Origin-Embedder-Policy", "require-corp"),
+    ("Cache-Control", "no-store"),
+)
+
 
 def inject_tag(script: str) -> bytes:
     return f'<script type="module" src="{INJECT_PREFIX}{script}"></script>'.encode()
@@ -100,7 +109,8 @@ class _Handler(SimpleHTTPRequestHandler):
     def end_headers(self):
         # A fresh profile has no cache, but a browser that is not fresh
         # (Safari) must not serve a previous run's page either.
-        self.send_header("Cache-Control", "no-store")
+        for name, value in RESPONSE_HEADERS:
+            self.send_header(name, value)
         super().end_headers()
 
     def log_message(self, format, *args):
@@ -118,6 +128,11 @@ class BenchServer(ThreadingHTTPServer):
     # can overflow it on macOS, resetting connections before their GETs ever
     # reach the handler and leaving benchmark applications partly loaded.
     request_queue_size = 128
+
+    @staticmethod
+    def conventions() -> tuple[str, ...]:
+        """Response policy recorded in every browser runner's provenance."""
+        return tuple(f"HTTP {name}: {value}" for name, value in RESPONSE_HEADERS)
 
     def __init__(
         self, root: Path, *, page: str = "index.html", inject: str | None = None

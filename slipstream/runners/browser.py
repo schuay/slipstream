@@ -79,7 +79,12 @@ class BrowserRunner:
         raise NotImplementedError
 
     def cfg_hash(self) -> str:
-        return cfg_digest(self.runtime, "POST /report", *self.conventions())
+        return cfg_digest(
+            self.runtime,
+            "POST /report",
+            *self.conventions(),
+            *BenchServer.conventions(),
+        )
 
     def host_env(self, engine: EngineConfig, run_root: Path) -> dict[str, str]:
         return {}
