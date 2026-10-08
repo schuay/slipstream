@@ -492,6 +492,53 @@ class TestBuildAndBenchConfig:
         with pytest.raises(ValueError, match="whole number"):
             load_config(_write(tmp_path, f"[build]\n{line}\n"))
 
+    def test_delta_defaults(self, tmp_path):
+        delta = load_config(_write(tmp_path, "")).build.delta
+        assert delta.enabled
+        assert (delta.block_mb, delta.max_ratio, delta.min_mb, delta.workers) == (
+            8,
+            0.5,
+            4.0,
+            0,
+        )
+        assert delta.block_bytes == 8 << 20 and delta.min_bytes == 4 << 20
+
+    def test_delta_values(self, tmp_path):
+        delta = load_config(
+            _write(
+                tmp_path,
+                "[build]\ndelta_block_mb = 4\ndelta_max_ratio = 0.3\n"
+                "delta_min_mb = 0\ndelta_workers = 6\n",
+            )
+        ).build.delta
+        assert (delta.block_mb, delta.max_ratio, delta.min_mb, delta.workers) == (
+            4,
+            0.3,
+            0.0,
+            6,
+        )
+
+    def test_a_zero_ratio_turns_deltas_off(self, tmp_path):
+        delta = load_config(_write(tmp_path, "[build]\ndelta_max_ratio = 0\n"))
+        assert not delta.build.delta.enabled
+
+    @pytest.mark.parametrize(
+        "line,match",
+        [
+            ("delta_max_ratio = 1.5", "at most 1"),
+            ("delta_max_ratio = -0.1", "zero or a positive"),
+            ("delta_max_ratio = true", "zero or a positive"),
+            ("delta_min_mb = -1", "zero or a positive"),
+            ("delta_block_mb = 0", "positive"),
+            ("delta_block_mb = 1.5", "whole number"),
+            ("delta_workers = 2.5", "whole number"),
+            ("delta_workers = -1", "zero or a positive"),
+        ],
+    )
+    def test_delta_values_are_checked(self, tmp_path, line, match):
+        with pytest.raises(ValueError, match=match):
+            load_config(_write(tmp_path, f"[build]\n{line}\n"))
+
 
 class TestSpeedometerConfig:
     def _cfg(self, tmp_path, runs='[[run]]\nengine = "chrome"\nsuite = "sp3"\n'):

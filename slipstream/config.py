@@ -968,6 +968,10 @@ def _parse_build(data: dict, engines: dict[str, EngineConfig]) -> BuildConfig:
             "max_consecutive_burns",
             "batch",
             "from",
+            "delta_block_mb",
+            "delta_max_ratio",
+            "delta_min_mb",
+            "delta_workers",
         ),
         "[build]",
     )
@@ -1007,6 +1011,30 @@ def _parse_build(data: dict, engines: dict[str, EngineConfig]) -> BuildConfig:
         ),
         batch=batch,
         start_from=start_from,
+        delta=_parse_delta(data),
+    )
+
+
+def _parse_delta(data: dict) -> DeltaConfig:
+    """The ``delta_*`` keys of ``[build]``. Zero is meaningful for all but the
+    block size: it turns deltas off, drops the size floor, or leaves the
+    worker count to the machine."""
+    ratio = _non_negative(data, "delta_max_ratio", 0.5, "[build]")
+    if ratio > 1:
+        raise ValueError(
+            "[build] delta_max_ratio must be at most 1; 0 turns deltas off"
+        )
+    workers = _non_negative(data, "delta_workers", 0, "[build]")
+    if not isinstance(workers, int):
+        raise ValueError("[build] delta_workers must be a whole number")
+    block_mb = _positive(data, "delta_block_mb", 8, "[build]")
+    if not isinstance(block_mb, int):
+        raise ValueError("[build] delta_block_mb must be a whole number of MiB")
+    return DeltaConfig(
+        block_mb=block_mb,
+        max_ratio=float(ratio),
+        min_mb=float(_non_negative(data, "delta_min_mb", 4.0, "[build]")),
+        workers=workers,
     )
 
 
@@ -1030,6 +1058,13 @@ def _positive(data: dict, key: str, default, section: str):
     # bool is an int subclass, and a true here would silently mean one.
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise ValueError(f"{section} {key} must be a positive number")
+    return value
+
+
+def _non_negative(data: dict, key: str, default, section: str):
+    value = data.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError(f"{section} {key} must be zero or a positive number")
     return value
 
 

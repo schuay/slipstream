@@ -126,6 +126,17 @@ and it keeps a slow build off the critical path of the faster box.
 the two boxes do not agree on. `bus pause`, `bus resume`, and `bus gc` handle
 the rest.
 
+Consecutive builds of an engine differ little, so the builder stores a changed
+`run_set` entry as bsdiff patches against the newest full archive at that
+path, and a watcher that already holds the archive moves only the patches.
+Patches that would come to more than `delta_max_ratio` of the full archive
+(default half) make it a new full archive instead, which is what the next
+builds are patched against; `delta_max_ratio = 0` turns this off. Any trouble
+on the delta path stores the archive whole, so a publish never fails because
+of it. Entries carrying patches are version 3: when upgrading, restart the
+watchers before the builder, since an old watcher refuses an entry it cannot
+read and the builder will not go back to rewrite it.
+
 ## Sending scores somewhere
 
 `deliver` continuously drains bounded cycles of local results and remote SSH
