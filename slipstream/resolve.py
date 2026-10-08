@@ -223,7 +223,7 @@ class EmbedderResolver:
             # A fresh roll starts at its own old pin -- the chromium-only
             # step -- unless the frontier is already past it (a re-roll after
             # a revert), in which case it resumes there.
-            job = self._first_within(roll, *ends, min_id=inner_id)
+            job = self._first_within(roll, *ends, min_id=inner_id, preserve_first=True)
             if job:
                 return job
         return None
@@ -369,7 +369,13 @@ class EmbedderResolver:
         return old.id <= new.id
 
     def _first_within(
-        self, roll: str, old: _Point, new: _Point, *, min_id: int
+        self,
+        roll: str,
+        old: _Point,
+        new: _Point,
+        *,
+        min_id: int,
+        preserve_first: bool = False,
     ) -> BuildJob | None:
         """The lowest inner commit in ``old..=new`` with id >= ``min_id``.
 
@@ -389,7 +395,17 @@ class EmbedderResolver:
             if not raw.strip():
                 continue
             commit = self.collector._parse_commit_metadata(self.inner, raw)
-            if commit and commit["commit_id"] >= min_id:
+            if (
+                commit
+                and commit["commit_id"] >= min_id
+                and (
+                    preserve_first
+                    or commit["hash"] == old.sha
+                    or self.collector.commit_is_relevant(
+                        self.inner, commit["hash"], build_engine=self.outer
+                    )
+                )
+            ):
                 return self._job(roll, commit)
         return None
 

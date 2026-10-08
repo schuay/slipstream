@@ -20,6 +20,7 @@ from rich.console import Console
 from rich.markup import escape
 
 from . import host
+from .commit_filter import V8CommitFilter
 from .config import Config, EngineConfig, RunSpec
 from .lock import MachineLock
 from .models import CommitKey
@@ -90,6 +91,7 @@ class BenchCollector:
         )
         # Before every measurement; a seam so tests do not read pmset.
         self.cool_down: Callable[[Callable[[str], None]], float] = host.cool_down
+        self._commit_relevance: dict[tuple, bool] = {}
 
     def _log(self, message: str, **kwargs):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -171,6 +173,56 @@ class BenchCollector:
 
     _METADATA_FORMAT = "%H|%cs|%ct|%s|%b%n--END-COMMIT--"
 
+    def commit_is_relevant(
+        self, engine: EngineConfig, commit_hash: str, *, build_engine=None
+    ) -> bool:
+        """Whether a V8 commit changes inputs this benchmark build measures.
+
+        Unknown changes and failed reads are measured. The outer engine's GN
+        args govern V8 when it is built inside Chromium.
+        """
+        if engine.name != "v8":
+            return True
+        build_engine = build_engine or engine
+        key = (engine.src_dir, commit_hash, build_engine.gn_args, self.cfg.platform)
+        if key in self._commit_relevance:
+            return self._commit_relevance[key]
+        sha = shlex.quote(commit_hash)
+        changes = self._run(
+            f"git diff-tree --root --no-commit-id --name-only --no-renames -r -z {sha}",
+            cwd=engine.require_src_dir(),
+            capture=True,
+            caffeinate=False,
+        )
+        if changes.returncode:
+            return True
+        paths = [p for p in changes.stdout.split("\0") if p]
+        policy = V8CommitFilter(build_engine.gn_args or "", self.cfg.platform)
+        relevant = not paths
+        for path in paths:
+            if policy.ignores_path(path):
+                continue
+            if path == "DEPS":
+                versions = [
+                    self._run(
+                        f"git show {sha}{suffix}:DEPS",
+                        cwd=engine.require_src_dir(),
+                        capture=True,
+                        caffeinate=False,
+                    )
+                    for suffix in ("^", "")
+                ]
+                if all(
+                    v.returncode == 0 for v in versions
+                ) and policy.ignores_deps_change(
+                    versions[0].stdout, versions[1].stdout
+                ):
+                    continue
+            relevant = True
+            break
+        self._commit_relevance[key] = relevant
+        return relevant
+
     def _parse_commit_metadata(self, engine: EngineConfig, raw: str) -> dict | None:
         """One --END-COMMIT-- record into a commit dict, or None if it has no id."""
         parts = raw.strip().split("|", 4)
@@ -213,7 +265,11 @@ class BenchCollector:
             if not raw.strip():
                 continue
             commit = self._parse_commit_metadata(engine, raw)
-            if commit and commit["commit_id"] > commit_id:
+            if (
+                commit
+                and commit["commit_id"] > commit_id
+                and self.commit_is_relevant(engine, commit["hash"])
+            ):
                 return commit
         return None
 
@@ -259,6 +315,8 @@ class BenchCollector:
             if not line:
                 continue
             parts = line.split(" ", 1)
+            if not self.commit_is_relevant(engine, parts[0]):
+                continue
             commits.append(
                 {"hash": parts[0], "title": parts[1] if len(parts) > 1 else ""}
             )

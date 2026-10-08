@@ -73,6 +73,16 @@ the same thing as a daemon: it picks up where the last run left off,
 measures each new commit, and persists the scores. Run `slipstream deliver`
 separately to send them onward.
 
+V8 selection skips commits whose changes are entirely in `tools/`, `test/`,
+`agents/`, `docs/`, ownership metadata, or CPU backends unused by the host and
+target build. DEPS changes are skipped when limited to test dependencies,
+those excluded directories, or Android packages for a non-Android build;
+variables used exclusively by those dependencies are included in the check.
+Changes to runtime dependencies, hooks, build settings, and unknown inputs
+remain candidates. This applies to V8 inside Chromium rolls too, preserving
+each roll's first measurement. An explicitly requested range start or V8 build
+retry is still measured even if it would otherwise be skipped.
+
 `clear` forgets a range so it can be measured again, which is also how you
 backfill history for a `[[run]]` entry added after the fact.
 
