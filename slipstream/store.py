@@ -508,6 +508,23 @@ class CommitStore:
             return None  # db predates the meta table and was opened readonly
         return row[0] if row else None
 
+    def rotation_order(self, role: str, engines: list[str]) -> list[str]:
+        """Resume after the last attempted engine, including after a restart."""
+        last = self.get_meta(f"rotation.{role}")
+        if last not in engines:
+            return list(engines)
+        start = engines.index(last) + 1
+        return engines[start:] + engines[:start]
+
+    @_write
+    def record_rotation_turn(self, role: str, engine: str) -> None:
+        # Before starting the work: even a killed turn must not always put
+        # the first engine ahead of the rest when the daemon restarts.
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            (f"rotation.{role}", engine),
+        )
+
     @property
     def bot(self) -> str | None:
         """The bot this db belongs to: the configured name, else the recorded one."""

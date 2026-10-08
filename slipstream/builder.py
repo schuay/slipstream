@@ -816,10 +816,12 @@ class Builder:
         otherwise be retried back to back, and a stall or a floor has
         already said it wants to wait. Each engine fetches once per cycle,
         in its first turn; what lands after that is next cycle's.
+        The last attempted engine is persisted, so bounded cycles and daemon
+        restarts resume the rotation rather than favoring its first engine.
         """
         published = 0
         jobs = 0
-        rotation = list(engine_names)
+        rotation = self.store.rotation_order("build", engine_names)
         fetched: set[str] = set()
         batch = self.cfg.build.batch
         while rotation and jobs < MAX_JOBS_PER_CYCLE and not should_stop():
@@ -835,6 +837,7 @@ class Builder:
                 ):
                     name = rotation.pop(0)
                     try:
+                        self.store.record_rotation_turn("build", name)
                         if name not in fetched:
                             self.resolver(name).fetch()  # so origin/main is current
                             fetched.add(name)

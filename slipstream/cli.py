@@ -196,6 +196,7 @@ def watch(
     An engine claimed by a bus source is bus-driven: it benches published
     artifacts in commit order from its cursor. An engine without one is
     git-driven and builds what it measures, which is how a single box runs.
+    Engines take turns one commit at a time when reacquiring the machine lock.
     """
     import time
 
@@ -293,12 +294,20 @@ def watch(
 
     typer.echo(f"Watching {', '.join(engine_names)} (interval={interval}, step={step})")
 
+    from .consumer import MAX_BENCHES_PER_CYCLE
+
     try:
         while not should_stop():
             t0 = time.monotonic()
-            for name in engine_names:
+            rotation = collector.store.rotation_order("watch", engine_names)
+            turns = {name: 0 for name in engine_names}
+            git_frontiers = {}
+            while rotation:
+                name = rotation.pop(0)
                 if should_stop():
                     break
+                if not dry_run:
+                    collector.store.record_rotation_turn("watch", name)
                 source = source_for(name)
                 if source is not None:
                     result = consumer.drain(
@@ -311,6 +320,7 @@ def watch(
                             log=lambda m: typer.echo(f"  {m}"),
                         ),
                         collector.lock.release,
+                        max_benches=1,
                     )
                     if dry_run:
                         # It has already said what it would do.
@@ -319,6 +329,9 @@ def watch(
                         typer.echo(
                             f"  {name}: {result.benched} benched from {source.name}"
                         )
+                        turns[name] += 1
+                        if not result.error and turns[name] < MAX_BENCHES_PER_CYCLE:
+                            rotation.append(name)
                     elif result.error:
                         # Reported already; do not follow it with "up to date".
                         pass
@@ -326,7 +339,11 @@ def watch(
                         typer.echo(f"  {name}: up to date with {source.name}")
                     continue
                 try:
-                    last_done, head_id = collector.find_frontier(name)
+                    if name not in git_frontiers:
+                        git_frontiers[name] = collector.find_frontier(name)
+                    # Keep the cycle's range fixed: rebuilding it from the
+                    # new frontier each turn would reset --step sampling.
+                    last_done, head_id = git_frontiers[name]
                 except FetchError:
                     typer.echo(f"  {name}: skipping until fetch succeeds")
                     continue
@@ -341,14 +358,19 @@ def watch(
                     continue
 
                 typer.echo(f"  {name}: new commits {last_done + 1}..{head_id}")
-                collector.collect(
+                completed = collector.collect(
                     name,
                     last_done,
                     head_id,
                     step=step,
                     include_start=False,
                     should_stop=should_stop,
+                    max_commits=1,
                 )
+                if completed and not dry_run:
+                    turns[name] += completed
+                    if turns[name] < MAX_BENCHES_PER_CYCLE:
+                        rotation.append(name)
 
             if once:
                 break

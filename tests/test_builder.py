@@ -835,6 +835,39 @@ class TestCycle:
         assert builder.run_cycle(["v8"], lambda: False) == 2
         assert builder.bus.keys("v8") == K(101, 102, 103, 104)
 
+    def test_bounded_cycles_resume_at_the_next_engine(self, builder, monkeypatch):
+        from slipstream.builder import BuildResult
+
+        monkeypatch.setattr("slipstream.builder.MAX_JOBS_PER_CYCLE", 1)
+        order = []
+        monkeypatch.setattr(builder, "resolver", lambda name: builder.resolver_v8)
+        builder.resolver_v8 = type("Resolver", (), {"fetch": lambda self: None})()
+
+        def publish(name):
+            order.append(name)
+            return BuildResult(key=K1(101), published=True)
+
+        monkeypatch.setattr(builder, "build_one", publish)
+        for _ in range(6):
+            assert builder.run_cycle(["v8", "jsc", "chrome"], lambda: False) == 1
+        assert order == ["v8", "jsc", "chrome"] * 2
+
+    def test_interrupted_cycle_resumes_after_the_attempted_engine(self, builder):
+        stop = [False]
+        real = builder.build_one
+
+        def one_then_stop(name):
+            stop[0] = True
+            return real(name)
+
+        builder.build_one = one_then_stop
+        builder.run_cycle(["v8", "jsc"], lambda: stop[0])
+        assert builder.store.rotation_order("build", ["v8", "jsc"]) == ["jsc", "v8"]
+
+    def test_stopping_before_a_turn_does_not_advance_the_rotation(self, builder):
+        builder.run_cycle(["v8", "jsc"], lambda: True)
+        assert builder.store.rotation_order("build", ["v8", "jsc"]) == ["v8", "jsc"]
+
     def test_a_failure_ends_the_engines_turns_for_the_cycle(self, builder):
         """An infrastructure failure retried back to back is the same outage
         hit again; the next cycle is when to look."""

@@ -41,6 +41,71 @@ class TestParseInterval:
             _parse_interval("30d")
 
 
+class TestWatchRotation:
+    @pytest.mark.parametrize("bus_driven", [True, False])
+    def test_lock_turns_alternate_engines(
+        self, config, tmp_path, monkeypatch, bus_driven
+    ):
+        from typer.testing import CliRunner
+
+        from slipstream import cli
+        from slipstream.collector import BenchCollector
+        from slipstream.config import BusConfig, BusSource, EngineConfig
+        from slipstream.consumer import DrainResult
+
+        config.engines = {
+            name: EngineConfig(
+                name=name,
+                src_dir=tmp_path,
+                build_cmd="true",
+                binary_path="out/d8",
+                id_regex=r"#([0-9]+)",
+            )
+            for name in ("v8", "jsc")
+        }
+        if bus_driven:
+            config.bus = BusConfig(
+                root=tmp_path / "bus",
+                sources=[
+                    BusSource(
+                        name="local", root=str(tmp_path / "bus"), engines=["v8", "jsc"]
+                    )
+                ],
+            )
+        collector = BenchCollector(config)
+        for name in config.engines:
+            collector.store.mark_done(name, config.platform, 100)
+        monkeypatch.setattr(cli, "_load_config", lambda path: config)
+        monkeypatch.setattr(cli, "_open_collector", lambda *a, **kw: collector)
+        monkeypatch.setattr(cli, "_host_preflight", lambda cfg: None)
+        monkeypatch.setattr(cli, "_shutdown_flag", lambda: lambda: False)
+        order = []
+        counts = {"v8": 0, "jsc": 0}
+
+        def turn(name):
+            order.append(name)
+            counts[name] += 1
+            return int(counts[name] <= 3)
+
+        def drain(
+            self, source, name, should_stop, take_lock, release_lock, *, max_benches
+        ):
+            assert max_benches == 1
+            return DrainResult(turn(name))
+
+        def collect(name, *args, **kwargs):
+            assert kwargs["max_commits"] == 1
+            assert args == (100, 200)
+            return turn(name)
+
+        monkeypatch.setattr("slipstream.consumer.BusConsumer.drain", drain)
+        monkeypatch.setattr(collector, "find_frontier", lambda name: (100, 200))
+        monkeypatch.setattr(collector, "collect", collect)
+        result = CliRunner().invoke(cli.app, ["watch", "v8", "jsc", "--once"])
+        assert result.exit_code == 0, result.output
+        assert order == ["v8", "jsc"] * 4
+
+
 class TestParseCursorArg:
     def test_bot_only_replays_everything(self):
         from slipstream.relay import parse_cursor_arg

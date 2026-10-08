@@ -808,8 +808,12 @@ class BenchCollector:
         clear: bool = False,
         include_start: bool = True,
         should_stop: Callable[[], bool] | None = None,
+        max_commits: int | None = None,
     ):
         """Benchmark commits in (start_id, end_id].
+
+        Returns the number measured. ``max_commits`` bounds attempts per turn
+        so watch can hand the next lock acquisition to another engine.
 
         ``should_stop`` lets a shutdown request reach the per-commit path,
         where the wait for the machine lock can otherwise last hours. It
@@ -852,7 +856,11 @@ class BenchCollector:
 
         t_start = time.time()
         total = len(sampled)
+        attempted = 0
+        completed = 0
         for idx, row in enumerate(sampled):
+            if max_commits is not None and attempted >= max_commits:
+                break
             key = CommitKey.from_commit(row)
             commit_id = str(key)
             commit_hash = row["hash"]
@@ -877,6 +885,7 @@ class BenchCollector:
             # a peer's build cannot land between two of its runs.
             if not self._take_machine_lock(should_stop, f"{engine_name} {key}"):
                 break
+            attempted += 1
             try:
                 t0 = time.time()
                 console.print("  Building... ", end="")
@@ -887,8 +896,10 @@ class BenchCollector:
                 console.print(f"[green]OK ({int(time.time() - t0)}s)[/green]")
 
                 self.bench_at_root(engine, dict(row), run_root)
+                completed += 1
             finally:
                 self.lock.release()
 
             if should_stop():
                 break
+        return completed

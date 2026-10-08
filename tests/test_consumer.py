@@ -131,6 +131,46 @@ def scored(setup, monkeypatch):
 
 
 class TestBenchingLine:
+    def test_one_commit_turn_releases_the_lock_and_preserves_the_cursor(
+        self, setup, scored
+    ):
+        for cid in (100, 101, 102):
+            setup.publish(cid)
+        for cid in (100, 101, 102):
+            result = setup.consumer.drain(
+                setup.source,
+                "v8",
+                lambda: False,
+                lambda: setup.collector.lock.try_acquire(),
+                setup.collector.lock.release,
+                max_benches=1,
+            )
+            assert result.benched == 1
+            assert setup.consumer.cursor(setup.source, "v8") == K1(cid)
+            assert not setup.collector.lock.held
+        assert [cid for cid, _ in scored] == [100, 101, 102]
+
+    def test_failure_breaker_survives_single_commit_turns(self, setup, monkeypatch):
+        setup.cfg.bench.max_consecutive_failures = 2
+        monkeypatch.setattr(
+            setup.collector, "_run_benchmarks", lambda *a: BenchOutcome(0, 1, 0)
+        )
+        for cid in (100, 101, 102):
+            setup.publish(cid)
+        for _ in range(2):
+            result = setup.consumer.drain(
+                setup.source,
+                "v8",
+                lambda: False,
+                lambda: setup.collector.lock.try_acquire(),
+                setup.collector.lock.release,
+                max_benches=1,
+            )
+            assert result.benched == 1
+        assert result.error and "2 commits in a row" in result.error
+        assert _drain(setup) == 0
+        assert setup.consumer.cursor(setup.source, "v8") == K1(101)
+
     def test_it_names_the_commit_and_the_queue_behind_it(self, setup, scored):
         """`watch` otherwise shows benchmark progress with no way to tell which
         commit it is on, or how much is left."""

@@ -324,8 +324,12 @@ class BusConsumer:
         should_stop: Callable[[], bool],
         take_lock: Callable[[], bool],
         release_lock: Callable[[], None],
+        *,
+        max_benches: int | None = None,
     ) -> DrainResult:
         """Bench every entry above the cursor.
+
+        ``max_benches`` lets watch yield to the next engine after one commit.
 
         Everything inside is wrapped: this writes the cursor and the state file
         on several paths, both under a filesystem that a stalled or paused
@@ -336,7 +340,7 @@ class BusConsumer:
         self._benched = 0
         try:
             return self._drain(
-                source, engine_name, should_stop, take_lock, release_lock
+                source, engine_name, should_stop, take_lock, release_lock, max_benches
             )
         except TRANSPORT_ERRORS as e:
             self.log(f"{engine_name}: {e}")
@@ -349,6 +353,7 @@ class BusConsumer:
         should_stop: Callable[[], bool],
         take_lock: Callable[[], bool],
         release_lock: Callable[[], None],
+        max_benches: int | None,
     ) -> DrainResult:
         engine = self.cfg.engines[engine_name]
         handle = open_source(source)
@@ -411,8 +416,11 @@ class BusConsumer:
         # While stalled, one commit per window: a machine problem then costs a
         # commit per backoff instead of the whole backlog in one pass.
         limit = self.cfg.bench.max_consecutive_failures
-        consecutive_failures = limit - 1 if stalled else 0
-        while not should_stop() and benched < MAX_BENCHES_PER_CYCLE:
+        consecutive_failures = limit - 1 if stalled else state.consecutive_failures
+        budget = MAX_BENCHES_PER_CYCLE
+        if max_benches is not None:
+            budget = min(budget, max_benches)
+        while not should_stop() and benched < budget:
             try:
                 batch = handle.keys_above(engine_name, cursor)
             except TRANSPORT_ERRORS as e:
@@ -540,6 +548,7 @@ class BusConsumer:
                 # every entry in the topic failed, and is_done is status-blind,
                 # so none of them is ever revisited.
                 consecutive_failures += 1
+                state.consecutive_failures = consecutive_failures
                 if consecutive_failures >= limit:
                     state.stalled_since = state.stalled_since or time.time()
                     state.stall_retry_after = time.time() + min(
@@ -556,6 +565,7 @@ class BusConsumer:
                     break
             else:
                 consecutive_failures = 0
+                state.consecutive_failures = 0
                 state.stalled_since = None
                 state.stall_retry_after = None
         try:

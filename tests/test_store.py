@@ -8,6 +8,24 @@ import pytest
 from slipstream.models import CommitKey
 
 
+class TestRotation:
+    def test_rotation_survives_reopening_and_keeps_roles_separate(self, tmp_path):
+        from slipstream.store import CommitStore
+
+        path = tmp_path / "rotation.db"
+        with_store = CommitStore(path)
+        with_store.record_rotation_turn("build", "v8")
+        with_store.close()
+        reopened = CommitStore(path)
+        try:
+            assert reopened.rotation_order("build", ["v8", "jsc"]) == ["jsc", "v8"]
+            assert reopened.rotation_order("watch", ["v8", "jsc"]) == ["v8", "jsc"]
+            assert reopened.rotation_order("build", ["jsc"]) == ["jsc"]
+            assert reopened.rotation_order("build", []) == []
+        finally:
+            reopened.close()
+
+
 class TestCommitOperations:
     def test_insert_and_query_commits(self, store):
         commits = [
@@ -179,7 +197,11 @@ class TestPushState:
 
     def test_unpushed_initially_all_done(self, store):
         self._seed_done(store, [100, 200, 300])
-        assert store.unpushed_keys("v8", "arm64") == [CommitKey(0, 100), CommitKey(0, 200), CommitKey(0, 300)]
+        assert store.unpushed_keys("v8", "arm64") == [
+            CommitKey(0, 100),
+            CommitKey(0, 200),
+            CommitKey(0, 300),
+        ]
 
     def test_mark_pushed_filters_next_call(self, store):
         self._seed_done(store, [100, 200, 300])

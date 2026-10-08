@@ -456,6 +456,8 @@ class BenchState:
     # it. Its own record, because the builder's highest_dropped stops being
     # evidence the moment the cursor passes it.
     skipped_dropped: CommitKey | None = None
+    # Carry the breaker across round-robin turns and daemon restarts.
+    consecutive_failures: int = 0
     benching_paused_by_floor: bool = False
     in_flight: dict | None = None
     # The blob ids of the entry this machine last provisioned. On a box with
