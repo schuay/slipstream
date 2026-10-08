@@ -30,10 +30,11 @@ from pathlib import Path
 from . import __version__, host
 from .bus import (
     BenchState,
-    Blob,
     Bus,
     BusError,
     Entry,
+    StoredObject,
+    archive_name,
     cursor_path,
     parse_key_stem,
     read_cursor,
@@ -99,14 +100,17 @@ class ShaMismatch(ConsumerError):
     """
 
 
-def verify_blob(path: Path, blob: Blob, label: str) -> None:
-    """Raise unless ``path`` is the archive the entry describes."""
+def verify_object(path: Path, obj: StoredObject, label: str) -> None:
+    """Raise unless ``path`` is the stored object the entry describes."""
     if not path.exists():
-        raise ConsumerError(f"{label}: entry is published but its blob is missing")
+        raise ConsumerError(
+            f"{label}: entry is published but its object {obj.name} is missing"
+        )
     digest = sha256_file(path)
-    if digest != blob.sha256:
+    if digest != obj.sha256:
         raise ShaMismatch(
-            f"{label}: blob sha256 {digest} does not match the entry's {blob.sha256}"
+            f"{label}: {obj.name} sha256 {digest} does not match the entry's "
+            f"{obj.sha256}"
         )
 
 
@@ -128,14 +132,14 @@ class LocalSource:
     def read_entry(self, engine: str, key) -> Entry | None:
         return self.bus.read_entry(engine, key)
 
-    def fetch(self, entry: Entry, into: Bus) -> list[Path]:
-        """Readable, verified paths to the entry's blobs, in run set order."""
+    def fetch(self, entry: Entry, into: Bus) -> dict[str, Path]:
+        """Readable, verified paths to the entry's stored objects, by name."""
         del into
-        paths = []
-        for blob in entry.blobs:
-            path = self.bus.entry_blob_path(entry, blob)
-            verify_blob(path, blob, f"{entry.engine} {entry.key}")
-            paths.append(path)
+        paths = {}
+        for obj in entry.objects():
+            path = self.bus.entry_object_path(entry, obj)
+            verify_object(path, obj, f"{entry.engine} {entry.key}")
+            paths[obj.name] = path
         return paths
 
     def builder_state(self, engine: str):
@@ -214,13 +218,13 @@ class BusConsumer:
         t0 = time.monotonic()
         paths = source.fetch(entry, self.bus)
         t1 = time.monotonic()
-        size_mb = sum(p.stat().st_size for p in paths) / 1e6
+        size_mb = sum(p.stat().st_size for p in paths.values()) / 1e6
         tmp_root = root.with_name(root.name + ".unpacking")
         if tmp_root.exists():
             shutil.rmtree(tmp_root)
         tmp_root.mkdir(parents=True)
-        for path in paths:
-            _unpack(path, tmp_root)
+        for blob in entry.blobs:
+            _unpack(paths[archive_name(blob.id)], tmp_root)
         tmp_root.rename(root)
         t2 = time.monotonic()
         self._trim_run_roots(engine.name, keep=entry.key)
@@ -232,7 +236,7 @@ class BusConsumer:
         # A browser bundle is a gigabyte of small files; this is where the
         # minute between two commits goes, and it should say so.
         self.log(
-            f"{engine.name}: provisioned {entry.key} from {len(paths)} blob(s), "
+            f"{engine.name}: provisioned {entry.key} from {len(paths)} object(s), "
             f"{size_mb:.0f} MB: fetch {t1 - t0:.0f}s, unpack {t2 - t1:.0f}s, "
             f"trim {t3 - t2:.0f}s"
         )
@@ -485,7 +489,7 @@ class BusConsumer:
                 }
                 # Written before provisioning, so the sweep inside it counts
                 # these as held and reclaims the previous entry's instead.
-                state.blobs = [b.id for b in entry.blobs]
+                state.blobs = [o.name for o in entry.objects()]
                 # Inside the try: it writes to the filesystem this path is
                 # about running out of, and escaping here would leave the
                 # machine lock held and kill the daemon.

@@ -37,6 +37,14 @@ Entries written as version 1 named one payload per entry under
 ``blobs/builds/<engine>/<key>.tar.zst``. They read back as a manifest with a
 single blob whose id is its sha256, found at the old path until the builder
 has migrated it (``Bus.migrate``), which is a hardlink and a rewrite.
+
+Version 3 adds the delta shape of a blob: the same tree, stored as a base
+archive plus one bsdiff patch per changed 8 MiB block of the tar stream
+(``delta.py``). Patches are files beside the archives, ``blobs/<sha>.bsdiff``,
+named by their own sha256. A blob therefore maps to one or more *stored
+objects* -- its archive, or its base's archive and its patches -- and
+everything below the manifest (fetch, retention, the sweep, the bencher's
+pin) iterates objects, not blobs. Only provisioning tells the shapes apart.
 """
 
 from __future__ import annotations
@@ -50,15 +58,18 @@ import time
 from dataclasses import MISSING, asdict, dataclass, field
 from pathlib import Path
 
+from .delta import DeltaError, DeltaPlan
 from .models import CommitKey
 
 # State files and cursors. Their schema has not changed.
 VERSION = 1
-# Entries. Version 1 is read, version 2 is written.
-ENTRY_VERSION = 2
-READABLE_ENTRY_VERSIONS = (1, 2)
+# Entries. Versions 1 and 2 are read, version 3 is written.
+ENTRY_VERSION = 3
+READABLE_ENTRY_VERSIONS = (1, 2, 3)
 
 BLOB_SUFFIX = ".tar.zst"
+PATCH_SUFFIX = ".bsdiff"
+OBJECT_SUFFIXES = (BLOB_SUFFIX, PATCH_SUFFIX)
 
 
 def parse_key_stem(stem: str) -> CommitKey | None:
@@ -132,32 +143,150 @@ def tree_hash(src_dir: Path, relpath: str) -> str:
     return h.hexdigest()
 
 
+def archive_name(blob_id: str) -> str:
+    return f"{blob_id}{BLOB_SUFFIX}"
+
+
+def patch_name(sha256: str) -> str:
+    return f"{sha256}{PATCH_SUFFIX}"
+
+
+def object_name(ref: str) -> str:
+    """A stored object's file name from a reference that may predate
+    patches: bench state files written before version 3 pinned bare blob
+    ids, which only ever named archives."""
+    return ref if ref.endswith(OBJECT_SUFFIXES) else archive_name(ref)
+
+
+@dataclass(frozen=True)
+class StoredObject:
+    """One file under ``blobs/``: what a fetch moves and verifies, what
+    retention counts, and what the sweep keeps or deletes."""
+
+    name: str
+    sha256: str
+    bytes: int
+
+
+@dataclass(frozen=True)
+class Delta:
+    """A blob stored as patches against another blob's archive.
+
+    The base's sha256 and size are repeated here rather than looked up in
+    the base's own entry: a remote consumer fetches and verifies the base
+    from this entry alone, and the entry that first published the base may
+    be pruned on the remote by then.
+    """
+
+    base_id: str
+    base_sha256: str
+    base_bytes: int
+    plan: DeltaPlan
+
+    def to_json(self) -> dict:
+        return {
+            "base": {
+                "id": self.base_id,
+                "sha256": self.base_sha256,
+                "bytes": self.base_bytes,
+            },
+            **self.plan.to_json(),
+        }
+
+    @classmethod
+    def from_json(cls, data: dict, where: str) -> Delta:
+        if not isinstance(data, dict) or not isinstance(data.get("base"), dict):
+            raise BusError(f"bus entry {where} has a malformed delta: {data!r}")
+        base = data["base"]
+        if set(base) != {"id", "sha256", "bytes"} or not all(
+            isinstance(base[k], t) for k, t in (("id", str), ("sha256", str))
+        ):
+            raise BusError(f"bus entry {where} has a malformed delta base: {base!r}")
+        if not isinstance(base["bytes"], int) or isinstance(base["bytes"], bool):
+            raise BusError(f"bus entry {where} has a malformed delta base: {base!r}")
+        try:
+            plan = DeltaPlan.from_json({k: v for k, v in data.items() if k != "base"})
+        except DeltaError as e:
+            raise BusError(f"bus entry {where} has a malformed delta: {e}") from e
+        return cls(base["id"], base["sha256"], base["bytes"], plan)
+
+
 @dataclass(frozen=True)
 class Blob:
-    """One archived run set entry.
+    """One run set entry of a built commit, and how it is stored.
 
-    ``path`` is the run set entry the archive unpacks to and ``id`` the tree
-    hash that names the file; ``sha256`` and ``bytes`` describe the archive
-    itself, which is what a fetch verifies and retention counts. A version 1
-    entry reads back as one blob with an empty path and the archive's sha256
-    for an id, since that is the only name it ever had.
+    ``path`` is the run set entry the blob unpacks to and ``id`` the tree
+    hash that identifies the result. A blob stored whole has ``sha256`` and
+    ``bytes`` of its archive, ``blobs/<id>.tar.zst``. A blob stored as a
+    delta has them empty and ``delta`` set: the archive is reconstructed
+    from the base and the patches, and nothing named ``<id>.tar.zst`` need
+    exist. A version 1 entry reads back as one whole blob with an empty path
+    and the archive's sha256 for an id, since that is the only name it had.
     """
 
     path: str
     id: str
-    sha256: str
-    bytes: int
+    sha256: str = ""
+    bytes: int = 0
+    delta: Delta | None = None
+
+    @property
+    def is_delta(self) -> bool:
+        return self.delta is not None
+
+    def objects(self) -> list[StoredObject]:
+        """The files this blob needs, base first for a delta. Patches shared
+        between blocks appear once."""
+        if self.delta is None:
+            return [StoredObject(archive_name(self.id), self.sha256, self.bytes)]
+        d = self.delta
+        return [
+            StoredObject(archive_name(d.base_id), d.base_sha256, d.base_bytes),
+            *(StoredObject(patch_name(s), s, n) for s, n in d.plan.patches().items()),
+        ]
+
+    def to_json(self) -> dict:
+        d = {"path": self.path, "id": self.id}
+        if self.delta is None:
+            d["archive"] = {"sha256": self.sha256, "bytes": self.bytes}
+        else:
+            d["delta"] = self.delta.to_json()
+        return d
+
+    @classmethod
+    def from_json(cls, item, where: str) -> Blob:
+        if not isinstance(item, dict):
+            raise BusError(f"bus entry {where} has a malformed blob: {item!r}")
+        keys = set(item)
+        if keys == {"path", "id", "sha256", "bytes"}:
+            # Version 2: always an archive, fields flat.
+            return cls(**item)
+        if keys == {"path", "id", "archive"} and isinstance(item["archive"], dict):
+            arc = item["archive"]
+            if set(arc) == {"sha256", "bytes"}:
+                return cls(item["path"], item["id"], arc["sha256"], arc["bytes"])
+        if keys == {"path", "id", "delta"}:
+            return cls(
+                item["path"],
+                item["id"],
+                delta=Delta.from_json(item["delta"], where),
+            )
+        raise BusError(f"bus entry {where} has a malformed blob: {item!r}")
 
 
 def _parse_blobs(raw, where: str) -> list[Blob]:
     if not isinstance(raw, list) or not raw:
         raise BusError(f"bus entry {where} names no blobs")
-    blobs = []
-    for item in raw:
-        if not isinstance(item, dict) or set(item) != set(Blob.__dataclass_fields__):
-            raise BusError(f"bus entry {where} has a malformed blob: {item!r}")
-        blobs.append(Blob(**item))
-    return blobs
+    return [Blob.from_json(item, where) for item in raw]
+
+
+def distinct_objects(blobs) -> dict[str, StoredObject]:
+    """name -> object over every blob given, each object once."""
+    out: dict[str, StoredObject] = {}
+    for blob in blobs:
+        for obj in blob.objects():
+            out.setdefault(obj.name, obj)
+    return out
 
 
 @dataclass
@@ -205,10 +334,18 @@ class Entry:
 
     @property
     def blob_bytes(self) -> int:
-        return sum(b.bytes for b in self.blobs)
+        """Bytes of the distinct stored objects this entry needs. A delta
+        entry counts its base here: it is what a cold consumer fetches."""
+        return sum(o.bytes for o in distinct_objects(self.blobs).values())
+
+    def objects(self) -> list[StoredObject]:
+        """Every stored object this entry needs, each once, in blob order."""
+        return list(distinct_objects(self.blobs).values())
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=1, sort_keys=True)
+        data = asdict(self)
+        data["blobs"] = [b.to_json() for b in self.blobs]
+        return json.dumps(data, indent=1, sort_keys=True)
 
     @classmethod
     def from_json(cls, text: str, where: str = "") -> Entry:
@@ -373,11 +510,18 @@ class Bus:
             / f"{CommitKey.of(key)}{BLOB_SUFFIX}"
         )
 
-    def entry_blob_path(self, entry: Entry, blob: Blob) -> Path:
-        """Where one of an entry's blobs is in this root."""
-        if entry.version == 1 and not self.has_blob(blob.id):
+    def object_path(self, name: str) -> Path:
+        """Where a stored object -- an archive or a patch -- is by file name."""
+        return self.blobs_dir / name
+
+    def has_object(self, name: str) -> bool:
+        return self.object_path(name).exists()
+
+    def entry_object_path(self, entry: Entry, obj: StoredObject) -> Path:
+        """Where one of an entry's objects is in this root."""
+        if entry.version == 1 and not self.has_object(obj.name):
             return self.legacy_blob_path(entry.engine, entry.key)
-        return self.blob_path(blob.id)
+        return self.object_path(obj.name)
 
     def builder_state_path(self, engine: str) -> Path:
         return self.root / "state" / "builds" / f"{engine}.json"
@@ -452,23 +596,29 @@ class Bus:
         """
         _atomic_write(self.entry_path(entry.engine, entry.key), entry.to_json())
 
-    def tmp_blob(self, blob_id: str) -> Path:
-        """Where a packager writes before ``store_blob`` renames it into place.
+    def tmp_object(self, name: str) -> Path:
+        """Where a writer puts an object before ``store_object`` renames it
+        into place.
 
         Under tmp/ on the same filesystem, uniquely named: a crash leaves it
-        for gc, and two processes packaging the same tree cannot collide.
+        for gc, and two processes producing the same object cannot collide.
         """
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
-        return self.tmp_dir / (
-            f"{blob_id}{BLOB_SUFFIX}.tmp-{os.getpid()}-{time.time_ns():x}"
-        )
+        return self.tmp_dir / f"{name}.tmp-{os.getpid()}-{time.time_ns():x}"
 
-    def store_blob(self, tmp: Path, blob_id: str) -> Path:
-        """Rename a complete, verified archive into the blob store."""
-        dest = self.blob_path(blob_id)
+    def tmp_blob(self, blob_id: str) -> Path:
+        return self.tmp_object(archive_name(blob_id))
+
+    def store_object(self, tmp: Path, name: str) -> Path:
+        """Rename a complete, verified object into the store."""
+        dest = self.object_path(name)
         dest.parent.mkdir(parents=True, exist_ok=True)
         os.replace(tmp, dest)
         return dest
+
+    def store_blob(self, tmp: Path, blob_id: str) -> Path:
+        """Rename a complete, verified archive into the blob store."""
+        return self.store_object(tmp, archive_name(blob_id))
 
     # --- state files ---
 
@@ -526,11 +676,12 @@ class Bus:
         used = 0.0
         over_budget = False
         for entry in reversed(self.entries(engine)):
-            size = sum(b.bytes for b in entry.blobs if b.id not in retained)
+            objects = distinct_objects(entry.blobs)
+            size = sum(o.bytes for n, o in objects.items() if n not in retained)
             if not over_budget and used and used + size > retain_bytes:
                 over_budget = True
             if not over_budget or (keep is not None and entry.key >= keep):
-                retained.update(b.id for b in entry.blobs)
+                retained.update(objects)
                 used += size
                 continue
             self.entry_path(engine, entry.key).unlink(missing_ok=True)
@@ -542,40 +693,46 @@ class Bus:
         return keys[0] if keys else None
 
     def footprint(self, engine: str) -> int:
-        """Bytes of the distinct blobs the engine's entries name."""
+        """Bytes of the distinct stored objects the engine's entries name.
+        A base shared by a group of delta entries is counted once."""
         seen: dict[str, int] = {}
         for entry in self.entries(engine):
-            for b in entry.blobs:
-                seen.setdefault(b.id, b.bytes)
+            for obj in entry.objects():
+                seen.setdefault(obj.name, obj.bytes)
         return sum(seen.values())
 
-    def referenced_blobs(self) -> set[str]:
-        """Every blob id something in this root still needs.
+    def referenced_objects(self) -> set[str]:
+        """Every stored object's name something in this root still needs.
 
         Every manifest of every topic, plus what each bencher's state file
         says it holds: on a box with no topic that list is the only reference
-        a fetched blob has.
+        a fetched object has. A delta entry names its base, so the base
+        outlives its own entry for as long as any delta against it is kept.
         """
         refs: set[str] = set()
         for engine in self.engines():
             for entry in self.entries(engine):
-                refs.update(b.id for b in entry.blobs)
+                refs.update(o.name for o in entry.objects())
         bench_dir = self.root / "state" / "bench"
         for path in sorted(bench_dir.glob("*.json")) if bench_dir.exists() else []:
-            refs.update(self.read_bench_state(path.stem).blobs)
+            refs.update(object_name(r) for r in self.read_bench_state(path.stem).blobs)
         return refs
 
     def sweep_blobs(self) -> list[Path]:
-        """Delete every stored blob nothing references. Returns what went.
+        """Delete every stored object nothing references. Returns what went.
 
-        The caller holds the machine lock: a blob between being stored and
+        The caller holds the machine lock: an object between being stored and
         its manifest being written, or between being fetched and unpacked,
         is unreferenced too, and only the lock says nobody is in that window.
         """
-        refs = self.referenced_blobs()
+        refs = self.referenced_objects()
         removed = []
-        for path in sorted(self.blobs_dir.glob(f"*{BLOB_SUFFIX}")):
-            if path.is_file() and path.name[: -len(BLOB_SUFFIX)] not in refs:
+        for path in sorted(self.blobs_dir.iterdir()) if self.blobs_dir.exists() else []:
+            if (
+                path.is_file()
+                and path.name.endswith(OBJECT_SUFFIXES)
+                and path.name not in refs
+            ):
                 path.unlink(missing_ok=True)
                 removed.append(path)
         return removed

@@ -9,17 +9,21 @@ import json
 import pytest
 
 from slipstream.bus import (
+    ENTRY_VERSION,
     BenchState,
     Blob,
     Bus,
     BuilderState,
     BusError,
+    Delta,
     Entry,
     cursor_path,
+    patch_name,
     read_cursor,
     tree_hash,
     write_cursor,
 )
+from slipstream.delta import Block, DeltaPlan
 from keys import K, K1
 
 
@@ -232,9 +236,8 @@ class TestVersionOneEntries:
             Blob("", data["blob_sha256"], data["blob_sha256"], len(b"old payload"))
         ]
         assert entry.blob_bytes == len(b"old payload")
-        assert bus.entry_blob_path(entry, entry.blobs[0]) == bus.legacy_blob_path(
-            "v8", 100
-        )
+        (obj,) = entry.objects()
+        assert bus.entry_object_path(entry, obj) == bus.legacy_blob_path("v8", 100)
 
     def test_a_version_one_entry_without_its_payload_fields_is_refused(self, bus):
         _publish_v1(bus, 100)
@@ -250,7 +253,7 @@ class TestVersionOneEntries:
         _publish(bus, 101)  # already current, untouched
         assert bus.migrate() == K(100)
         entry = bus.read_entry("v8", 100)
-        assert entry.version == 2
+        assert entry.version == ENTRY_VERSION
         assert bus.blob_path(data["blob_sha256"]).read_bytes() == b"old payload"
         assert not bus.legacy_blob_path("v8", 100).exists()
         assert not (bus.root / "blobs" / "builds").exists()
@@ -265,11 +268,11 @@ class TestVersionOneEntries:
         os.link(bus.legacy_blob_path("v8", 100), bus.blob_path(data["blob_sha256"]))
         entry = bus.read_entry("v8", 100)
         # Both exist: the store wins, since it is where the entry is going.
-        assert bus.entry_blob_path(entry, entry.blobs[0]) == bus.blob_path(
+        assert bus.entry_object_path(entry, entry.objects()[0]) == bus.blob_path(
             data["blob_sha256"]
         )
         assert bus.migrate() == K(100)
-        assert bus.read_entry("v8", 100).version == 2
+        assert bus.read_entry("v8", 100).version == ENTRY_VERSION
 
     def test_a_missing_payload_is_left_for_the_consumer_to_report(self, bus):
         _publish_v1(bus, 100)
@@ -443,6 +446,137 @@ class TestSharedBlobs:
         assert bus.has_blob(held.id)
         bus.write_bench_state("v8", BenchState(blobs=[]))
         assert bus.sweep_blobs() == [bus.blob_path(held.id)]
+
+
+def _patch(bus, payload):
+    """Store ``payload`` as a patch object named by its sha256."""
+    sha = hashlib.sha256(payload).hexdigest()
+    tmp = bus.tmp_object(patch_name(sha))
+    tmp.write_bytes(payload)
+    bus.store_object(tmp, patch_name(sha))
+    return sha, len(payload)
+
+
+def _delta_blob(bus, base: Blob, patches, blob_id, path="out", n_blocks=3):
+    """A blob stored against ``base`` with the given patch payloads: one
+    block per patch plus ``n_blocks`` unchanged ones. The plan's hashes are
+    not real -- nothing here reconstructs -- only its bookkeeping is."""
+    blocks = [Block(f"b{i}", 10) for i in range(n_blocks)]
+    for payload in patches:
+        sha, size = _patch(bus, payload)
+        blocks.append(Block(f"p{sha[:4]}", 10, sha, size))
+    plan = DeltaPlan(10, "tar" * 20, 10 * len(blocks), tuple(blocks))
+    return Blob(path, blob_id, delta=Delta(base.id, base.sha256, base.bytes, plan))
+
+
+class TestDeltaBlobs:
+    """A blob stored as a base plus patches is, below the manifest, a set of
+    stored objects like any other: fetched, counted and swept by name."""
+
+    def test_round_trips_through_the_entry(self, bus):
+        base = _store(bus, b"B" * 100)
+        blob = _delta_blob(bus, base, [b"patch one", b"patch two"], "tree2")
+        _publish(bus, 101, blobs=[blob])
+        read = bus.read_entry("v8", 101)
+        assert read.version == ENTRY_VERSION
+        assert read.blobs == [blob]
+        assert read.blobs[0].is_delta
+        data = json.loads(bus.entry_path("v8", 101).read_text())
+        (item,) = data["blobs"]
+        assert set(item) == {"path", "id", "delta"}
+        assert item["delta"]["base"] == {
+            "id": base.id,
+            "sha256": base.sha256,
+            "bytes": 100,
+        }
+        assert item["delta"]["block_bytes"] == 10
+
+    def test_a_whole_blob_is_written_nested_and_read_either_way(self, bus):
+        whole = _store(bus, b"W" * 10)
+        _publish(bus, 100, blobs=[whole])
+        data = json.loads(bus.entry_path("v8", 100).read_text())
+        (item,) = data["blobs"]
+        assert item == {
+            "path": "out",
+            "id": whole.id,
+            "archive": {"sha256": whole.sha256, "bytes": 10},
+        }
+        # A version 2 builder wrote the four fields flat.
+        data["version"] = 2
+        data["blobs"] = [
+            {"path": "out", "id": whole.id, "sha256": whole.sha256, "bytes": 10}
+        ]
+        bus.entry_path("v8", 100).write_text(json.dumps(data))
+        assert bus.read_entry("v8", 100).blobs == [whole]
+
+    def test_objects_are_the_base_and_each_distinct_patch(self, bus):
+        base = _store(bus, b"B" * 100)
+        blob = _delta_blob(bus, base, [b"same", b"same", b"other"], "tree2")
+        names = [o.name for o in blob.objects()]
+        assert names[0] == f"{base.id}.tar.zst"
+        assert len(names) == 3 and all(n.endswith(".bsdiff") for n in names[1:])
+        assert sum(o.bytes for o in blob.objects()) == 100 + 4 + 5
+
+    def test_the_sweep_keeps_patches_and_base_while_named(self, bus):
+        base = _store(bus, b"B" * 100)
+        _publish(bus, 100, blobs=[base])
+        blob = _delta_blob(bus, base, [b"patch"], "tree2")
+        _publish(bus, 101, blobs=[blob])
+        stray_sha, _ = _patch(bus, b"stray")
+        assert bus.sweep_blobs() == [bus.object_path(patch_name(stray_sha))]
+        # The base's own entry goes; the delta still names the base.
+        bus.entry_path("v8", 100).unlink()
+        assert bus.sweep_blobs() == []
+        assert bus.has_blob(base.id)
+        bus.entry_path("v8", 101).unlink()
+        removed = {p.name for p in bus.sweep_blobs()}
+        assert removed == {o.name for o in blob.objects()}
+
+    def test_retention_counts_the_base_once_and_a_delta_as_its_patches(self, bus):
+        base = _store(bus, b"B" * 100)
+        _publish(bus, 100, blobs=[base])
+        for cid in (101, 102, 103):
+            _publish(
+                bus, cid, blobs=[_delta_blob(bus, base, [_bytes(cid, 5)], f"t{cid}")]
+            )
+        assert bus.footprint("v8") == 115
+        # Newest first: 103 costs 105 (base + patch), 102 and 101 5 each,
+        # 100 nothing more. A budget of 112 keeps 103 and 102.
+        assert bus.prune("v8", 112) == K(100, 101)
+        bus.sweep_blobs()
+        assert bus.has_blob(base.id), "two deltas still name it"
+        assert bus.footprint("v8") == 110
+
+    def test_a_pre_patch_bench_state_still_pins_its_archive(self, bus):
+        """State files written before version 3 hold bare blob ids."""
+        held = _store(bus, b"held")
+        bus.write_bench_state("v8", BenchState(blobs=[held.id]))
+        assert bus.sweep_blobs() == []
+        assert bus.has_blob(held.id)
+
+    def test_a_malformed_delta_is_a_bus_error(self, bus):
+        base = _store(bus, b"B" * 100)
+        _publish(bus, 101, blobs=[_delta_blob(bus, base, [b"p"], "tree2")])
+        path = bus.entry_path("v8", 101)
+        data = json.loads(path.read_text())
+        data["blobs"][0]["delta"]["blocks"][0]["bytes"] = 99
+        path.write_text(json.dumps(data))
+        with pytest.raises(BusError, match="malformed delta"):
+            bus.read_entry("v8", 101)
+        del data["blobs"][0]["delta"]["base"]["sha256"]
+        path.write_text(json.dumps(data))
+        with pytest.raises(BusError, match="malformed delta base"):
+            bus.read_entry("v8", 101)
+
+    def test_a_reader_without_deltas_refuses_the_entry(self, bus, monkeypatch):
+        """The pairing that must fail loudly: a builder on this version and
+        a consumer on the previous one, which would tar-extract a patch."""
+        import slipstream.bus as busmod
+
+        _publish(bus, 100)
+        monkeypatch.setattr(busmod, "READABLE_ENTRY_VERSIONS", (1, 2))
+        with pytest.raises(BusError, match="version 3.*upgrade the consumer"):
+            bus.read_entry("v8", 100)
 
 
 class TestRetentionLeavesNoHole:

@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from slipstream.builder import BuildError, Builder, build_cfg_hash, package
-from slipstream.bus import Bus
+from slipstream.bus import ENTRY_VERSION, Bus
 from slipstream.collector import BuildStepError
 from slipstream.config import EngineConfig
 from slipstream.models import CommitKey
@@ -191,7 +191,7 @@ class TestBlobStore:
         bus.entry_path("v8", 100).write_text(json.dumps(data))
 
         builder.migrate()
-        assert bus.read_entry("v8", 100).version == 2
+        assert bus.read_entry("v8", 100).version == ENTRY_VERSION
         assert not legacy.exists()
         assert any("migrated 1 entries" in m for m in builder.logs)
         assert builder.lock.try_acquire(), "migrate left the machine lock held"

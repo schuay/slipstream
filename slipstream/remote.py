@@ -22,15 +22,15 @@ from pathlib import Path
 from .bus import (
     BLOB_SUFFIX,
     BenchState,
-    Blob,
     Bus,
     BuilderState,
     Entry,
+    StoredObject,
     parse_key_stem,
     state_from_json,
 )
 from .config import BusSource
-from .consumer import ShaMismatch, verify_blob
+from .consumer import ShaMismatch, verify_object
 from .models import CommitKey
 
 
@@ -148,47 +148,49 @@ class SshSource:
             )
         return Entry.from_json(res.stdout, f"{self.host}:{path}")
 
-    def fetch(self, entry: Entry, into: Bus) -> list[Path]:
-        """Make the entry's blobs readable here; returns their paths in order.
+    def fetch(self, entry: Entry, into: Bus) -> dict[str, Path]:
+        """Make the entry's stored objects readable here; returns their paths
+        by name.
 
-        Only blobs ``into`` does not already hold cross the link: one rsync
-        per blob, resuming a previous attempt, verified in tmp and then
-        renamed into the store under its id. A single-blob entry therefore
-        costs what a payload did; a multi-blob one costs what the commit
-        changed.
+        Only objects ``into`` does not already hold cross the link: one rsync
+        per object, resuming a previous attempt, verified in tmp and then
+        renamed into the store under its name. A single-archive entry
+        therefore costs what a payload did; a multi-blob one costs what the
+        commit changed; a delta entry whose base is already here costs its
+        patches.
 
         rsync rather than scp: the rate limit units differ between them
         (rsync KB/s, scp Kbit/s), so the tool is pinned to keep the config
         value meaningful.
         """
         label = f"{entry.engine} {entry.key}"
-        paths = []
-        for blob in entry.blobs:
-            dest = into.blob_path(blob.id)
+        paths = {}
+        for obj in entry.objects():
+            dest = into.object_path(obj.name)
             if not dest.exists():
                 # A stable name, not a unique one: --partial --inplace resume
                 # from whatever the last attempt left under it.
-                tmp = into.tmp_dir / f"{blob.id}{BLOB_SUFFIX}"
+                tmp = into.tmp_dir / obj.name
                 tmp.parent.mkdir(parents=True, exist_ok=True)
-                self._rsync(self._remote_blob_path(entry, blob), tmp)
+                self._rsync(self._remote_object_path(entry, obj), tmp)
                 try:
-                    verify_blob(tmp, blob, label)
+                    verify_object(tmp, obj, label)
                 except ShaMismatch:
                     # Not an interrupted transfer, so there is nothing to
                     # resume from: the bytes on disk are the wrong ones.
                     tmp.unlink(missing_ok=True)
                     raise
-                into.store_blob(tmp, blob.id)
-            paths.append(dest)
+                into.store_object(tmp, obj.name)
+            paths[obj.name] = dest
         return paths
 
-    def _remote_blob_path(self, entry: Entry, blob: Blob) -> str:
+    def _remote_object_path(self, entry: Entry, obj: StoredObject) -> str:
         if entry.version == 1:
             return (
                 f"{self.root}/blobs/builds/{entry.engine}/"
                 f"{CommitKey.of(entry.key)}{BLOB_SUFFIX}"
             )
-        return f"{self.root}/blobs/{blob.id}{BLOB_SUFFIX}"
+        return f"{self.root}/blobs/{obj.name}"
 
     def _rsync(self, remote_path: str, dest: Path) -> None:
         cmd = [

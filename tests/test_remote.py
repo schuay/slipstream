@@ -122,8 +122,9 @@ class TestFetch:
     def test_streams_to_the_store_with_the_rate_limit(self, remote, local):
         entry = _publish(remote.far, 100, b"payload bytes")
         paths = remote.source.fetch(entry, local)
-        assert paths == [local.blob_path(entry.blobs[0].id)]
-        assert paths[0].read_bytes() == b"payload bytes"
+        name = f"{entry.blobs[0].id}.tar.zst"
+        assert paths == {name: local.blob_path(entry.blobs[0].id)}
+        assert paths[name].read_bytes() == b"payload bytes"
         (rsync,) = [c for c in remote.calls if c[0] == "rsync"]
         assert "--bwlimit=20000" in rsync
         # Not ssh cat: that decodes the blob as text and buffers it whole.
@@ -139,7 +140,7 @@ class TestFetch:
         remote.source.fetch(first, local)
         remote.calls.clear()
         paths = remote.source.fetch(second, local)
-        assert [p.name for p in paths] == [f"{b.id}.tar.zst" for b in second.blobs]
+        assert list(paths) == [f"{b.id}.tar.zst" for b in second.blobs]
         rsyncs = [c for c in remote.calls if c[0] == "rsync"]
         assert len(rsyncs) == 1 and second.blobs[0].id in rsyncs[0][-2]
 
@@ -216,7 +217,7 @@ class TestFetch:
 
         entry = remote.source.read_entry("v8", 100)
         assert entry.version == 1
-        (path,) = remote.source.fetch(entry, local)
+        (path,) = remote.source.fetch(entry, local).values()
         assert path.read_bytes() == payload
         (rsync,) = [c for c in remote.calls if c[0] == "rsync"]
         assert rsync[-2].endswith("/blobs/builds/v8/100.tar.zst")
@@ -296,7 +297,7 @@ def test_a_remote_source_drives_the_consumer(config, tmp_path, monkeypatch, remo
     # and so kept for the next entry to share; tmp is clean.
     local = Bus(config.bus.root)
     assert local.has_blob(entry.blobs[0].id)
-    assert local.read_bench_state("v8").blobs == [entry.blobs[0].id]
+    assert local.read_bench_state("v8").blobs == [f"{entry.blobs[0].id}.tar.zst"]
     assert not list(local.tmp_dir.glob("*"))
 
 

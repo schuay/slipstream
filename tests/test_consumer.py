@@ -281,7 +281,7 @@ class TestProvisioning:
         setup.publish(100)
         setup.blob_path(100).unlink()
         assert _drain(setup) == 0
-        assert "blob is missing" in setup.bus.read_bench_state("v8").last_error
+        assert "is missing" in setup.bus.read_bench_state("v8").last_error
 
     def test_a_local_source_keeps_the_builders_blob(self, setup, scored):
         setup.publish(100)
@@ -292,7 +292,9 @@ class TestProvisioning:
         """What the sweep protects on a box that has no topic of its own."""
         entry = setup.publish(100)
         _drain(setup)
-        assert setup.bus.read_bench_state("v8").blobs == [b.id for b in entry.blobs]
+        assert setup.bus.read_bench_state("v8").blobs == [
+            f"{b.id}.tar.zst" for b in entry.blobs
+        ]
 
     def test_only_run_roots_is_kept(self, setup, scored):
         setup.cfg.bench.run_roots = 2
