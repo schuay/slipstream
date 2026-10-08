@@ -9,10 +9,12 @@ import subprocess
 
 import pytest
 
+from slipstream.builder import store_run_set
 from slipstream.bus import Blob, Bus, BuilderState, Entry
 from slipstream.config import BusSource
 from slipstream.consumer import ShaMismatch
 from slipstream.remote import SshSource, quote_remote
+from deltas import delta_blob
 from keys import K, K1
 
 
@@ -221,6 +223,30 @@ class TestFetch:
         assert path.read_bytes() == payload
         (rsync,) = [c for c in remote.calls if c[0] == "rsync"]
         assert rsync[-2].endswith("/blobs/builds/v8/100.tar.zst")
+
+    def test_a_delta_entry_moves_only_its_patches(self, remote, local, tmp_path):
+        """The point of the delta: with the base already here from the last
+        entry, the next one costs its patches over the link, nothing more."""
+        src = tmp_path / "src"
+        (src / "out").mkdir(parents=True)
+        (src / "out" / "d8").write_bytes(b"d8 " + bytes(range(256)) * 40)
+        base = store_run_set(remote.far, src, ["out"], caffeinate=False)[0]
+        first = _publish(remote.far, 100, blobs=[base])
+        (src / "out" / "d8").write_bytes(b"d8 " + bytes(range(255, -1, -1)) * 40)
+        blob = delta_blob(remote.far, base, src, "out")
+        second = _publish(remote.far, 101, blobs=[blob])
+        assert remote.source.read_entry("v8", 101) == second
+
+        remote.source.fetch(first, local)
+        remote.calls.clear()
+        paths = remote.source.fetch(second, local)
+        assert list(paths) == [o.name for o in second.objects()]
+        assert paths[f"{base.id}.tar.zst"] == local.blob_path(base.id)
+        rsyncs = [c for c in remote.calls if c[0] == "rsync"]
+        assert len(rsyncs) == len(blob.delta.plan.patches())
+        assert all(c[-2].endswith(".bsdiff") for c in rsyncs)
+        for name, path in paths.items():
+            assert path == local.object_path(name) and path.exists()
 
 
 class TestBuilderState:

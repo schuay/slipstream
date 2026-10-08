@@ -15,6 +15,7 @@ from slipstream.bus import Bus, Entry
 from slipstream.collector import BenchCollector, BenchOutcome
 from slipstream.config import BusConfig, BusSource, EngineConfig, RunSpec
 from slipstream.consumer import BusConsumer, ConsumerError, ShaMismatch
+from deltas import delta_blob
 from keys import K1
 
 
@@ -457,6 +458,98 @@ class TestUnpackSafety:
         dest.mkdir()
         with pytest.raises(ConsumerError, match="escapes"):
             _unpack(payload, dest)
+
+
+class TestDeltaProvisioning:
+    """An entry whose blob is patches against another entry's archive."""
+
+    @pytest.fixture
+    def published(self, setup):
+        """A full base entry and, on top of it, a delta entry.
+
+        The two trees differ only in the binary, so most blocks of the tar
+        stream match the base and only a few carry a patch.
+        """
+        base = setup.publish(100, binary=b"d8 " + bytes(range(256)) * 40)
+        src = setup.tmp_path / "build" / "101"
+        (src / "out").mkdir(parents=True)
+        (src / "out" / "d8").write_bytes(b"d8 " + bytes(range(255, -1, -1)) * 40)
+        blob = delta_blob(setup.bus, base.blobs[0], src, "out")
+        return base, self._publish(setup, 101, blob), blob
+
+    @staticmethod
+    def _publish(setup, commit_id, blob):
+        commit = _commit(commit_id)
+        entry = Entry(
+            engine="v8",
+            commit_id=commit_id,
+            hash=commit["hash"],
+            date=commit["date"],
+            timestamp=commit["timestamp"],
+            title=commit["title"],
+            build_cfg_hash="sha256:cfg",
+            blobs=[blob],
+            builder={"bot": "box2-m4"},
+            built_at=1757116999,
+            build_secs=1183,
+        )
+        setup.bus.publish(entry)
+        return entry
+
+    def test_the_delta_is_stored_as_patches_only(self, setup, published):
+        _, _, blob = published
+        assert blob.is_delta
+        assert blob.delta.plan.patches()
+        assert not setup.bus.blob_path(blob.id).exists()
+
+    def test_the_run_root_is_the_rebuilt_tree(self, setup, scored, published):
+        _, delta_entry, _ = published
+        assert _drain(setup) == 2
+        roots = dict(scored)
+        assert (roots[101] / "out" / "d8").read_bytes() == (
+            setup.tmp_path / "build" / "101" / "out" / "d8"
+        ).read_bytes()
+        assert (roots[100] / "out" / "d8").read_bytes() != (
+            roots[101] / "out" / "d8"
+        ).read_bytes()
+
+    def test_the_bench_state_pins_the_base_and_the_patches(
+        self, setup, scored, published
+    ):
+        _, delta_entry, blob = published
+        _drain(setup)
+        assert setup.bus.read_bench_state("v8").blobs == [
+            o.name for o in delta_entry.objects()
+        ]
+        assert f"{blob.delta.base_id}.tar.zst" in setup.bus.read_bench_state("v8").blobs
+
+    def test_a_plan_that_does_not_describe_its_objects_is_refused(
+        self, setup, scored, published
+    ):
+        """The base and patches hash as the entry says; the plan lies about
+        what they rebuild. Nothing of it reaches a run root."""
+        from dataclasses import replace
+
+        base, _, blob = published
+        plan = blob.delta.plan
+        first = plan.blocks[0]
+        bad = replace(plan, blocks=[replace(first, sha256="0" * 64), *plan.blocks[1:]])
+        self._publish(setup, 102, replace(blob, delta=replace(blob.delta, plan=bad)))
+        assert _drain(setup) == 2
+        assert [cid for cid, _ in scored] == [100, 101]
+        assert "do not match the plan" in setup.bus.read_bench_state("v8").last_error
+        assert not setup.consumer.run_root("v8", K1(102)).exists()
+
+    def test_a_delta_with_no_patches_is_the_base_again(self, setup, scored):
+        """A tree identical to the base plans to zero patches; it still
+        unpacks, from the base alone."""
+        base = setup.publish(100, binary=b"same")
+        src = setup.tmp_path / "build" / "100"
+        blob = delta_blob(setup.bus, base.blobs[0], src, "out")
+        assert blob.delta.plan.patches() == {}
+        self._publish(setup, 101, blob)
+        assert _drain(setup) == 2
+        assert (dict(scored)[101] / "out" / "d8").read_bytes() == b"same"
 
 
 def test_one_box_builds_and_benches_through_the_bus(config, tmp_path, monkeypatch):

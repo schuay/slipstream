@@ -32,17 +32,20 @@ from .bus import (
     BenchState,
     Bus,
     BusError,
+    Delta,
     Entry,
     StoredObject,
     archive_name,
     cursor_path,
     parse_key_stem,
+    patch_name,
     read_cursor,
     sha256_file,
     write_cursor,
 )
 from .collector import BenchCollector, BenchOutcome, outcome_status
 from .config import BusSource, Config, EngineConfig
+from .delta import BlockReader, DeltaMismatch, reconstruct
 from .models import CommitKey
 
 GB = 1_000_000_000
@@ -224,7 +227,15 @@ class BusConsumer:
             shutil.rmtree(tmp_root)
         tmp_root.mkdir(parents=True)
         for blob in entry.blobs:
-            _unpack(paths[archive_name(blob.id)], tmp_root)
+            if blob.delta is None:
+                _unpack(paths[archive_name(blob.id)], tmp_root)
+            else:
+                _unpack_delta(
+                    paths[archive_name(blob.delta.base_id)],
+                    blob.delta,
+                    lambda sha: paths[patch_name(sha)].read_bytes(),
+                    tmp_root,
+                )
         tmp_root.rename(root)
         t2 = time.monotonic()
         self._trim_run_roots(engine.name, keep=entry.key)
@@ -661,29 +672,66 @@ def _max_key(current: CommitKey | None, key: CommitKey) -> CommitKey:
 
 def _unpack(payload: Path, dest: Path) -> None:
     """Unpack a tar.zst payload, refusing members that escape the destination."""
-    proc = subprocess.Popen(["zstd", "-dc", str(payload)], stdout=subprocess.PIPE)
-    failed = None
-    try:
-        with tarfile.open(fileobj=proc.stdout, mode="r|") as tf:
-            root = dest.resolve()
-            for member in tf:
-                target = (dest / member.name).resolve()
-                # relative_to, not a string prefix: a sibling directory whose
-                # name merely starts with the root's would pass that.
-                if target != root and root not in target.parents:
-                    raise ConsumerError(
-                        f"payload member escapes the run root: {member.name}"
-                    )
-                tf.extract(member, dest, filter="tar")
-    except BaseException as e:
-        failed = e
-        raise
-    finally:
-        if proc.stdout:
-            proc.stdout.close()
+    with _decompress(payload) as stream:
+        _extract(stream, dest)
+
+
+def _unpack_delta(
+    base: Path, delta: Delta, load_patch: Callable[[str], bytes], dest: Path
+) -> None:
+    """Rebuild a tar stream from its base archive and patches, then unpack it.
+
+    The reconstructor verifies every block before handing it on, so tar never
+    sees a byte the plan did not vouch for. The base and the patches were
+    hashed when they were fetched; a mismatch here means the plan does not
+    describe them, which is the builder's fault, not this copy's.
+    """
+    with _decompress(base) as base_stream:
+        reader = BlockReader(reconstruct(base_stream, delta.plan, load_patch))
+        try:
+            _extract(reader, dest)
+            # tar stops at the end-of-archive marker and leaves the padding
+            # unread; draining it is what runs the plan's whole-stream check.
+            while reader.read(1 << 20):
+                pass
+        except DeltaMismatch as e:
+            raise ConsumerError(f"delta against {base.name}: {e}") from e
+
+
+class _decompress:
+    """``zstd -dc`` as a context manager yielding the decompressed stream."""
+
+    def __init__(self, payload: Path):
+        self.payload = payload
+        self.proc = subprocess.Popen(
+            ["zstd", "-dc", str(payload)], stdout=subprocess.PIPE
+        )
+
+    def __enter__(self):
+        return self.proc.stdout
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.proc.stdout:
+            self.proc.stdout.close()
         # Closing the pipe kills zstd with EPIPE, so its exit code is only
         # meaningful when we got through the archive. Reporting it over the
         # rejection would tell the operator "decompression failed" for what is
         # actually a path-traversal refusal.
-        if proc.wait() != 0 and failed is None:
-            raise ConsumerError(f"zstd failed to decompress {payload}")
+        if self.proc.wait() != 0 and exc_type is None:
+            raise ConsumerError(f"zstd failed to decompress {self.payload}")
+        return False
+
+
+def _extract(stream, dest: Path) -> None:
+    """Extract a tar stream, refusing members that escape the destination."""
+    with tarfile.open(fileobj=stream, mode="r|") as tf:
+        root = dest.resolve()
+        for member in tf:
+            target = (dest / member.name).resolve()
+            # relative_to, not a string prefix: a sibling directory whose
+            # name merely starts with the root's would pass that.
+            if target != root and root not in target.parents:
+                raise ConsumerError(
+                    f"payload member escapes the run root: {member.name}"
+                )
+            tf.extract(member, dest, filter="tar")
