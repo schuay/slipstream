@@ -14,6 +14,10 @@ dependencies = [
     # Not an extra: a spanner target is the only way scores reach the perf
     # database, and the machine that cannot reach it spools for one that can.
     "google-cloud-spanner>=3.0",
+    # Delta blobs on the bus: one BSDIFF40 patch per 8 MiB block of the tar
+    # stream, against the previous base. The builder encodes, every consumer
+    # decodes, so it is a dependency rather than an extra.
+    "bsdiff4>=1.2",
 ]
 
 [dependency-groups]
