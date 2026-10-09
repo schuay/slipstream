@@ -715,13 +715,20 @@ class _decompress:
         return self.proc.stdout
 
     def __exit__(self, exc_type, exc, tb):
-        if self.proc.stdout:
-            self.proc.stdout.close()
-        # Closing the pipe kills zstd with EPIPE, so its exit code is only
-        # meaningful when we got through the archive. Reporting it over the
-        # rejection would tell the operator "decompression failed" for what is
-        # actually a path-traversal refusal.
-        if self.proc.wait() != 0 and exc_type is None:
+        try:
+            if self.proc.stdout and exc_type is None:
+                # Tar stops at its end marker, and a delta may use fewer
+                # blocks than its base contains. Read the rest so zstd can
+                # finish and check its checksum instead of failing on EPIPE.
+                while self.proc.stdout.read(1 << 20):
+                    pass
+        finally:
+            if self.proc.stdout:
+                self.proc.stdout.close()
+            rc = self.proc.wait()
+        # On rejection, closing early can cause EPIPE; preserve the original
+        # error rather than reporting that as a decompression failure.
+        if rc != 0 and exc_type is None:
             raise ConsumerError(f"zstd failed to decompress {self.payload}")
         return False
 

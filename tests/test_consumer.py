@@ -1001,6 +1001,60 @@ class TestUnpackErrorIsNotMasked:
         assert "failed to decompress" not in str(exc.value)
 
 
+class TestDecompressionCompletes:
+    @pytest.fixture
+    def archives(self, tmp_path):
+        import io
+        import tarfile
+
+        src = tmp_path / "x.tar"
+        with tarfile.open(src, "w") as tf:
+            member = tarfile.TarInfo("f")
+            member.size = 1
+            tf.addfile(member, io.BytesIO(b"x"))
+        short = src.read_bytes()
+        # More than a pipe can buffer: closing at tar's end marker must fail
+        # even when zstd has already decompressed the whole frame internally.
+        src.write_bytes(short + b"\0" * (4 << 20))
+        payload = tmp_path / "x.tar.zst"
+        subprocess.run(["zstd", "-q", "-o", str(payload), str(src)], check=True)
+        return payload, short, src.read_bytes()
+
+    def test_tar_padding_is_drained(self, tmp_path, archives):
+        from slipstream.consumer import _unpack
+
+        payload, _, _ = archives
+        dest = tmp_path / "root"
+        _unpack(payload, dest)
+        assert (dest / "f").read_bytes() == b"x"
+
+    def test_a_delta_shorter_than_its_base_is_drained(self, tmp_path, archives):
+        import io
+
+        from slipstream.bus import Delta
+        from slipstream.consumer import _unpack_delta
+        from slipstream.delta import plan
+
+        payload, short, base = archives
+        patches = {}
+        delta_plan = plan(
+            io.BytesIO(base), io.BytesIO(short), patches.__setitem__, block_bytes=16384
+        )
+        delta = Delta("base", "unused", payload.stat().st_size, delta_plan)
+        dest = tmp_path / "root"
+        _unpack_delta(payload, delta, patches.__getitem__, dest)
+        assert (dest / "f").read_bytes() == b"x"
+
+    def test_corruption_after_tar_ends_is_still_reported(self, tmp_path, archives):
+        from slipstream.consumer import _unpack
+
+        payload, _, _ = archives
+        # Remove the frame checksum, after the complete tar and its padding.
+        payload.write_bytes(payload.read_bytes()[:-4])
+        with pytest.raises(ConsumerError, match="failed to decompress"):
+            _unpack(payload, tmp_path / "root")
+
+
 class TestConsumerCircuitBreaker:
     """A cycle drains, so a machine-side failure would otherwise mark every
     entry in the topic failed in one pass -- and is_done is status-blind, so
