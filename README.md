@@ -76,9 +76,11 @@ separately to send them onward.
 Bus-driven `watch` uses macOS/BSD filesystem notifications for new builds.
 Local sources are watched directly; SSH sources use a persistent
 `slipstream bus subscribe` connection, then fetch artifacts as usual. Install
-this version on the source machine first, with `slipstream` on its noninteractive
-SSH PATH. Startup and reconnect scan from the cursor; there is no build-polling
-fallback. `--interval` controls git fetches. Consumer errors and disk-floor
+this version on the source machine first. The SSH command adds `~/.local/bin`
+(the default `uv tool install` location) to PATH; custom installation directories
+must be on the noninteractive SSH PATH. Startup and reconnect scan from the
+cursor; there is no build-polling fallback. `--interval` controls git fetches.
+Consumer errors and disk-floor
 recovery retry after one minute; repeated benchmark failures use a two-hour
 stall deadline. `--once` performs one bounded scan/drain without subscribing.
 Notifications wake discovery immediately; local benchmarking still waits for

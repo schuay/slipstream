@@ -185,6 +185,56 @@ def test_remote_ready_changed_and_shutdown(monkeypatch):
     assert processes[0].poll() is not None
 
 
+@pytest.mark.parametrize("on_path", [False, True])
+def test_remote_command_finds_tool_without_shell_startup_files(
+    tmp_path, monkeypatch, on_path
+):
+    fallback = tmp_path / ".local/bin"
+    fallback.mkdir(parents=True)
+    tools = tmp_path / "custom bin"
+    tools.mkdir()
+    engines = ["v8; echo unexpected"]
+    expected_args = [
+        "bus",
+        "subscribe",
+        str(tmp_path / "bus space"),
+        "--engine",
+        *engines,
+    ]
+    message = {"version": 1, "type": "ready", "engines": engines}
+    script = (
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        f"assert sys.argv[1:] == {expected_args!r}\n"
+        f"print(json.dumps({message!r}), flush=True)\n"
+        "sys.stdin.read()\n"
+    )
+    executable = (tools if on_path else fallback) / "slipstream"
+    executable.write_text(script)
+    executable.chmod(0o755)
+    if on_path:
+        # An existing PATH installation must take precedence over the fallback.
+        (fallback / "slipstream").write_text("#!/bin/sh\nexit 1\n")
+        (fallback / "slipstream").chmod(0o755)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PATH", f"{tools}:/usr/bin:/bin" if on_path else "/usr/bin:/bin")
+    real_popen = subprocess.Popen
+
+    def popen(command, **kwargs):
+        return real_popen(["/bin/sh", "-c", command[-1]], **kwargs)
+
+    monkeypatch.setattr(n.subprocess, "Popen", popen)
+    obj = reader()
+    received = []
+
+    def receive(names):
+        received.append(names)
+        obj.stop.set()
+
+    obj._remote(BusSource("remote", "~/bus space", ssh_host="remote"), engines, receive)
+    assert received == [engines]
+
+
 @pytest.mark.parametrize(
     "message",
     [

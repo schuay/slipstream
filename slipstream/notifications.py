@@ -262,7 +262,12 @@ class Subscriptions:
     def _remote(self, source, engines, receive):
         from .remote import SSH_OPTIONS, quote_remote
 
-        command = f"slipstream bus subscribe {quote_remote(source.root)}"
+        # Noninteractive SSH shells often omit uv's default tool bin directory.
+        # Keep an explicitly configured PATH installation ahead of the fallback.
+        command = (
+            'export PATH="$PATH:$HOME/.local/bin"; '
+            f"exec slipstream bus subscribe {quote_remote(source.root)}"
+        )
         for engine in engines:
             command += f" --engine {shlex.quote(engine)}"
         process = subprocess.Popen(
