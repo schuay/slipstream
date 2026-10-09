@@ -53,9 +53,7 @@ GB = 1_000_000_000
 # A stalled consumer keeps trying, or the guard against burning the topic
 # becomes a permanent stop. It attempts one commit per window, so a genuine
 # machine problem costs one commit per backoff rather than the whole backlog.
-STALL_BACKOFF = 4
-STALL_BACKOFF_CAP_SECS = 6 * 3600
-DEFAULT_INTERVAL_SECS = 1800.0
+STALL_RETRY_SECS = 2 * 3600
 # The batch is re-listed after every bench, so a builder that keeps publishing
 # would otherwise keep one cycle going forever, past every state refresh.
 MAX_BENCHES_PER_CYCLE = 50
@@ -168,14 +166,12 @@ class BusConsumer:
         *,
         log: Callable[[str], None] | None = None,
         dry_run: bool = False,
-        interval_secs: float = DEFAULT_INTERVAL_SECS,
     ):
         self.cfg = cfg
         self.collector = collector
         self.store = collector.store
         self.log = log or (lambda msg: None)
         self.dry_run = dry_run
-        self.interval_secs = interval_secs
         if cfg.bus is None:
             raise ConsumerError("no [bus] section in config")
         self.bus = Bus(cfg.bus.root)
@@ -551,9 +547,7 @@ class BusConsumer:
                 state.consecutive_failures = consecutive_failures
                 if consecutive_failures >= limit:
                     state.stalled_since = state.stalled_since or time.time()
-                    state.stall_retry_after = time.time() + min(
-                        self.interval_secs * STALL_BACKOFF, STALL_BACKOFF_CAP_SECS
-                    )
+                    state.stall_retry_after = time.time() + STALL_RETRY_SECS
                     state.last_error = (
                         f"{consecutive_failures} commits in a row produced no "
                         f"scores; this is the machine or the run set, not the "

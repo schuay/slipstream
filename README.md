@@ -73,6 +73,17 @@ the same thing as a daemon: it picks up where the last run left off,
 measures each new commit, and persists the scores. Run `slipstream deliver`
 separately to send them onward.
 
+Bus-driven `watch` uses macOS/BSD filesystem notifications for new builds.
+Local sources are watched directly; SSH sources use a persistent
+`slipstream bus subscribe` connection, then fetch artifacts as usual. Install
+this version on the source machine first, with `slipstream` on its noninteractive
+SSH PATH. Startup and reconnect scan from the cursor; there is no build-polling
+fallback. `--interval` controls git fetches. Consumer errors and disk-floor
+recovery retry after one minute; repeated benchmark failures use a two-hour
+stall deadline. `--once` performs one bounded scan/drain without subscribing.
+Notifications wake discovery immediately; local benchmarking still waits for
+the builder's configured batch and the existing machine lock.
+
 V8 selection skips commits whose changes are entirely in `tools/`, `test/`,
 `agents/`, `docs/`, ownership metadata, or CPU backends unused by the host and
 target build. DEPS changes are skipped when limited to test dependencies,

@@ -42,9 +42,10 @@ class TestParseInterval:
 
 
 class TestWatchRotation:
+    @pytest.mark.parametrize("continuous", [True, False])
     @pytest.mark.parametrize("bus_driven", [True, False])
     def test_lock_turns_alternate_engines(
-        self, config, tmp_path, monkeypatch, bus_driven
+        self, config, tmp_path, monkeypatch, bus_driven, continuous
     ):
         from typer.testing import CliRunner
 
@@ -81,6 +82,29 @@ class TestWatchRotation:
         monkeypatch.setattr(cli, "_shutdown_flag", lambda: lambda: False)
         order = []
         counts = {"v8": 0, "jsc": 0}
+        if continuous:
+            import time
+            from types import SimpleNamespace
+
+            deadline = time.monotonic() + 3
+            monkeypatch.setattr(
+                cli,
+                "_shutdown_flag",
+                lambda: (
+                    lambda: (
+                        all(n >= 4 for n in counts.values())
+                        or time.monotonic() > deadline
+                    )
+                ),
+            )
+            monkeypatch.setattr("slipstream.consumer.MAX_BENCHES_PER_CYCLE", 2)
+
+            def subscribe(sources, schedule, log):
+                for _, names in sources:
+                    schedule.changed(names)
+                return SimpleNamespace(close=lambda: None)
+
+            monkeypatch.setattr("slipstream.notifications.Subscriptions", subscribe)
 
         def turn(name):
             order.append(name)
@@ -101,7 +125,10 @@ class TestWatchRotation:
         monkeypatch.setattr("slipstream.consumer.BusConsumer.drain", drain)
         monkeypatch.setattr(collector, "find_frontier", lambda name: (100, 200))
         monkeypatch.setattr(collector, "collect", collect)
-        result = CliRunner().invoke(cli.app, ["watch", "v8", "jsc", "--once"])
+        args = (
+            ["--interval", "100h" if bus_driven else "0s"] if continuous else ["--once"]
+        )
+        result = CliRunner().invoke(cli.app, ["watch", "v8", "jsc", *args])
         assert result.exit_code == 0, result.output
         assert order == ["v8", "jsc"] * 4
 

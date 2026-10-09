@@ -173,7 +173,9 @@ def watch(
         Optional[list[str]],
         typer.Argument(help="Engines to watch (default: all configured)"),
     ] = None,
-    interval: str = typer.Option("30m", help="Poll interval, e.g. 30m, 2h, 90s"),
+    interval: str = typer.Option(
+        "30m", help="Git fetch interval; bus builds use notifications"
+    ),
     step: int = typer.Option(1, help="Sample every N-th commit"),
     once: bool = typer.Option(False, "--once", help="Single poll cycle then exit"),
     no_push: bool = typer.Option(
@@ -239,7 +241,6 @@ def watch(
                 collector,
                 log=lambda m: typer.echo(f"  {m}"),
                 dry_run=dry_run,
-                interval_secs=interval_secs,
             )
         except ConsumerError as e:
             typer.echo(f"Error: {e}", err=True)
@@ -296,10 +297,34 @@ def watch(
 
     from .consumer import MAX_BENCHES_PER_CYCLE
 
+    schedule = subscriptions = None
     try:
+        if not once and not dry_run:
+            from .bus import BusError
+            from .notifications import RETRY_SECS, Subscriptions, WorkSchedule
+
+            bus_names = [name for name in engine_names if source_for(name) is not None]
+            git_names = [name for name in engine_names if source_for(name) is None]
+            schedule = WorkSchedule(bus_names, git_names, interval_secs)
+            sources = [
+                (source, [name for name in bus_names if source_for(name) == source])
+                for source in (cfg.bus.sources if cfg.bus else [])
+            ]
+            subscriptions = Subscriptions(
+                [(source, names) for source, names in sources if names],
+                schedule,
+                lambda msg: typer.echo(f"  {msg}", err=True),
+            )
         while not should_stop():
+            if schedule is not None:
+                schedule.wait(should_stop)
+                if should_stop():
+                    break
             t0 = time.monotonic()
             rotation = collector.store.rotation_order("watch", engine_names)
+            if schedule is not None:
+                ready = schedule.ready()
+                rotation = [name for name in rotation if name in ready]
             turns = {name: 0 for name in engine_names}
             git_frontiers = {}
             while rotation:
@@ -310,6 +335,9 @@ def watch(
                     collector.store.record_rotation_turn("watch", name)
                 source = source_for(name)
                 if source is not None:
+                    generation = (
+                        schedule.snapshot(name) if schedule is not None else None
+                    )
                     result = consumer.drain(
                         source,
                         name,
@@ -322,6 +350,20 @@ def watch(
                         collector.lock.release,
                         max_benches=1,
                     )
+                    if schedule is not None:
+                        retry = None
+                        if result.error:
+                            retry = RETRY_SECS
+                            try:
+                                state = consumer.bus.read_bench_state(name)
+                                retry = max(
+                                    retry, (state.stall_retry_after or 0) - time.time()
+                                )
+                            except (OSError, ValueError, BusError):
+                                pass
+                        schedule.finished(
+                            name, generation, more=bool(result.benched), retry=retry
+                        )
                     if dry_run:
                         # It has already said what it would do.
                         continue
@@ -340,6 +382,8 @@ def watch(
                     continue
                 try:
                     if name not in git_frontiers:
+                        if schedule is not None:
+                            schedule.git_finished(name)
                         git_frontiers[name] = collector.find_frontier(name)
                     # Keep the cycle's range fixed: rebuilding it from the
                     # new frontier each turn would reset --step sampling.
@@ -375,6 +419,9 @@ def watch(
             if once:
                 break
 
+            if schedule is not None:
+                continue
+
             # Interruptible sleep, accounting for time spent working
             work_time = time.monotonic() - t0
             sleep_secs = int(interval_secs - min(interval_secs, work_time))
@@ -383,6 +430,8 @@ def watch(
                     break
                 time.sleep(1)
     finally:
+        if subscriptions is not None:
+            subscriptions.close()
         collector.store.close()
 
     typer.echo("Watch stopped.")
@@ -699,6 +748,38 @@ bus_app = typer.Typer(
     name="bus", help="Inspect and gate the build bus.", no_args_is_help=True
 )
 app.add_typer(bus_app)
+
+
+@bus_app.command("subscribe")
+def bus_subscribe(
+    root: Annotated[Path, typer.Argument(help="Bus root on this machine")],
+    engine: Annotated[
+        list[str], typer.Option("--engine", help="Engine to watch; repeatable")
+    ],
+):
+    """Stream build-directory changes as JSON lines (macOS/BSD)."""
+    import sys
+
+    from .notifications import serve
+
+    if any(not name or name in (".", "..") or "/" in name for name in engine):
+        raise typer.BadParameter("engine must be a directory name")
+    should_stop = _shutdown_flag(
+        "subscription", log=lambda msg: typer.echo(msg, err=True)
+    )
+    try:
+        serve(root, engine, should_stop, sys.stdout, sys.stdin.fileno())
+    except EOFError:
+        pass
+    except BrokenPipeError:
+        # The SSH client went away. Avoid a second flush at interpreter exit.
+        import os
+
+        with open(os.devnull, "w") as sink:
+            os.dup2(sink.fileno(), sys.stdout.fileno())
+    except (OSError, RuntimeError) as exc:
+        typer.echo(f"Subscription failed: {exc}", err=True)
+        raise typer.Exit(1)
 
 
 @bus_app.command("status")
