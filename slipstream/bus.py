@@ -50,11 +50,13 @@ pin) iterates objects, not blobs. Only provisioning tells the shapes apart.
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import os
 import shutil
 import stat
 import time
+from collections import Counter
 from dataclasses import MISSING, asdict, dataclass, field
 from pathlib import Path
 
@@ -640,55 +642,57 @@ class Bus:
 
     # --- retention ---
 
-    def prune(self, engine: str, retain_bytes: float, keep=None) -> list[CommitKey]:
-        """Drop the oldest entries until the engine's blobs fit the budget.
+    def prune(self, retain_bytes: float, keep=None) -> dict[str, list[CommitKey]]:
+        """Apply one artifact budget across every engine in this bus.
 
-        A byte budget rather than a count: artifact size per commit is what
-        matters. The footprint is the distinct blobs the retained entries
-        name, so an entry whose blobs are all shared with a newer one costs
-        nothing to keep and dropping it frees nothing. Only manifests are
-        deleted here; ``sweep_blobs`` then reclaims whatever no manifest in
-        the root names, across every engine, since blobs are shared between
-        them. Deleting a manifest before its blobs is the safe order: a crash
-        between the two leaves blobs with no entry, which the next sweep
-        reclaims, where the reverse would leave an entry pointing at nothing.
-
-        What is retained is always a contiguous run ending at the newest entry.
-        Keeping a smaller older entry below a dropped one would fit more in the
-        budget, but it would leave a hole that nothing can detect: a consumer
-        finds out about dropped entries by comparing its cursor against
-        ``lowest_retained``, which a surviving older entry holds down, so it
-        would step over the hole in silence.
-
-        ``keep`` lowers the floor of that run rather than exempting one entry,
-        for the commit just published: a ``build --retry`` republishes below
-        the frontier, so its entry is the oldest and would otherwise be deleted
-        by the very cycle that produced it. Exempting it alone would leave
-        exactly the hole described above, so everything from it upward is
-        retained and the budget is overshot for one cycle. The next publish
-        prunes normally, dropping it along with its neighbours and reporting it.
-
-        Retention does not coordinate with consumers. Detection does that
-        instead: lowest_retained above a consumer's cursor means entries were
-        dropped unread, which bus status reports.
+        Evict the oldest eligible build by built_at, taking only the oldest
+        key of each engine so every surviving topic remains contiguous.
+        Shared archives and delta bases/patches count once across all topics.
+        Preserve each topic's newest key (its build frontier), and, for a
+        just-published retry, the whole suffix starting at ``keep=(engine, key)``.
+        These protections can exceed a budget smaller than the required blobs.
+        The caller holds the machine lock, records drops and sweeps blobs.
         """
-        keep = CommitKey.of(keep) if keep is not None else None
-        dropped = []
-        retained: set[str] = set()
-        used = 0.0
-        over_budget = False
-        for entry in reversed(self.entries(engine)):
-            objects = distinct_objects(entry.blobs)
-            size = sum(o.bytes for n, o in objects.items() if n not in retained)
-            if not over_budget and used and used + size > retain_bytes:
-                over_budget = True
-            if not over_budget or (keep is not None and entry.key >= keep):
-                retained.update(objects)
-                used += size
-                continue
+        topics = {engine: self.entries(engine) for engine in self.engines()}
+        refs: Counter[str] = Counter()
+        sizes: dict[str, int] = {}
+        for entries in topics.values():
+            for entry in entries:
+                objects = distinct_objects(entry.blobs)
+                refs.update(objects.keys())
+                sizes.update({name: obj.bytes for name, obj in objects.items()})
+        used = sum(sizes.values())
+        floors = {
+            engine: entries[-1].key for engine, entries in topics.items() if entries
+        }
+        if keep is not None:
+            engine, key = keep
+            floors[engine] = min(floors[engine], CommitKey.of(key))
+
+        candidates = []
+
+        def offer(engine, index):
+            entries = topics[engine]
+            if index < len(entries) and entries[index].key < floors[engine]:
+                entry = entries[index]
+                heapq.heappush(
+                    candidates, (entry.built_at or entry.timestamp, engine, index)
+                )
+
+        for engine in floors:
+            offer(engine, 0)
+        dropped: dict[str, list[CommitKey]] = {}
+        while used > retain_bytes and candidates:
+            _, engine, index = heapq.heappop(candidates)
+            entry = topics[engine][index]
             self.entry_path(engine, entry.key).unlink(missing_ok=True)
-            dropped.append(entry.key)
-        return sorted(dropped)
+            dropped.setdefault(engine, []).append(entry.key)
+            for name in distinct_objects(entry.blobs):
+                refs[name] -= 1
+                if refs[name] == 0:
+                    used -= sizes[name]
+            offer(engine, index + 1)
+        return dropped
 
     def lowest_retained(self, engine: str) -> CommitKey | None:
         keys = self.keys(engine)

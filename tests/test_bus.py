@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -351,11 +352,78 @@ class TestState:
 
 
 class TestRetention:
+    def test_global_cap_evicts_by_build_age_across_engines(self, bus):
+        # Each engine fits alone; their combined 400 bytes exceed the cap.
+        # Commit ids across engines are incomparable, and the oldest build
+        # belongs to the engine that sorts last alphabetically.
+        for engine, key, age in (
+            ("v8", 900, 1),
+            ("jsc", 100, 2),
+            ("v8", 901, 3),
+            ("jsc", 101, 4),
+        ):
+            entry = _publish(bus, key, _bytes(key, 100), engine=engine)
+            bus.publish(replace(entry, built_at=age))
+        assert bus.prune(300) == {"v8": K(900)}
+        assert bus.keys("v8") == K(901)
+        assert bus.keys("jsc") == K(100, 101)
+        assert bus.prune(200) == {"jsc": K(100)}
+
+    def test_global_cap_counts_cross_engine_sharing_once(self, bus):
+        shared = _store(bus, b"s" * 100)
+        old = _store(bus, b"o" * 100)
+        _publish(bus, 100, engine="v8", blobs=[old, shared])
+        _publish(bus, 101, engine="v8", blobs=[shared])
+        _publish(bus, 200, engine="jsc", blobs=[shared])
+        assert bus.prune(200) == {}
+        assert bus.prune(100) == {"v8": K(100)}
+        bus.sweep_blobs()
+        assert not bus.has_blob(old.id)
+        assert bus.has_blob(shared.id)
+
+    def test_global_cap_preserves_every_frontier_even_over_budget(self, bus):
+        for engine in ("v8", "jsc"):
+            for key in (100, 101):
+                _publish(bus, key, engine=engine)
+        assert bus.prune(1) == {"jsc": K(100), "v8": K(100)}
+        for engine in ("v8", "jsc"):
+            assert bus.keys(engine) == K(101)
+
+    def test_retry_does_not_leave_holes_when_build_age_disagrees_with_keys(self, bus):
+        for key, age in ((100, 4), (101, 1), (102, 2)):
+            entry = _publish(bus, key, _bytes(key, 100))
+            bus.publish(replace(entry, built_at=age))
+        # A republished old key cannot keep the topic's head hidden below a
+        # deleted middle key, even though that middle build is older by age.
+        assert bus.prune(200) == {"v8": K(100)}
+        entry = _publish(bus, 50, _bytes(50, 100))
+        bus.publish(replace(entry, built_at=5))
+        assert bus.prune(200, keep=("v8", 50)) == {}
+        assert bus.keys("v8") == K(50, 101, 102)
+        assert bus.prune(200) == {"v8": K(50)}
+
+    def test_global_cap_keeps_a_delta_base_after_its_manifest_is_evicted(self, bus):
+        base = _store(bus, b"B" * 100)
+        _publish(bus, 100, engine="v8", blobs=[base])
+        _publish(bus, 101, engine="v8", payload=b"new" * 10)
+        _publish(
+            bus, 200, engine="jsc", blobs=[_delta_blob(bus, base, [b"patch"], "delta")]
+        )
+        # The base is still needed by jsc, so removing v8's oldest build
+        # cannot reduce the combined footprint to the requested cap.
+        assert bus.prune(130) == {"v8": K(100)}
+        bus.sweep_blobs()
+        assert bus.has_blob(base.id)
+        assert bus.keys("jsc") == K(200)
+
+    def test_global_cap_on_an_empty_bus(self, bus):
+        assert bus.prune(100) == {}
+
     def test_drops_oldest_first_to_fit_the_budget(self, bus):
         entries = {
             cid: _publish(bus, cid, _bytes(cid, 100)) for cid in (100, 200, 300, 400)
         }
-        dropped = bus.prune("v8", 250)
+        dropped = bus.prune(250).get("v8", [])
         assert dropped == K(100, 200)
         assert bus.keys("v8") == K(300, 400)
         assert bus.lowest_retained("v8") == K1(300)
@@ -368,13 +436,13 @@ class TestRetention:
     def test_the_newest_entry_is_never_dropped(self, bus):
         """A budget smaller than one artifact must not empty the topic."""
         _publish(bus, 100, b"x" * 1000)
-        assert bus.prune("v8", 10) == K()
+        assert bus.prune(10).get("v8", []) == K()
         assert bus.keys("v8") == K(100)
 
     def test_nothing_to_do_under_budget(self, bus):
         for cid in (100, 200):
             _publish(bus, cid, _bytes(cid, 10))
-        assert bus.prune("v8", 10_000) == K()
+        assert bus.prune(10_000).get("v8", []) == K()
         assert bus.footprint("v8") == 20
 
     def test_gc_reclaims_a_blob_with_no_entry(self, bus):
@@ -413,7 +481,7 @@ class TestSharedBlobs:
         for cid in (200, 300):
             _publish(bus, cid, blobs=[_store(bus, _bytes(cid, 50)), icu])
         # Newest first: 300 costs 150, 200 another 50, 100 another 50.
-        assert bus.prune("v8", 220) == K(100)
+        assert bus.prune(220).get("v8", []) == K(100)
         assert bus.sweep_blobs() == [bus.blob_path(old.blobs[0].id)]
         assert bus.has_blob(icu.id)
 
@@ -421,7 +489,7 @@ class TestSharedBlobs:
         same = [_store(bus, b"x" * 100)]
         for cid in (100, 200, 300):
             _publish(bus, cid, blobs=same)
-        assert bus.prune("v8", 100) == K()
+        assert bus.prune(100).get("v8", []) == K()
         assert bus.footprint("v8") == 100
 
     def test_blobs_are_shared_across_engines(self, bus):
@@ -542,7 +610,7 @@ class TestDeltaBlobs:
         assert bus.footprint("v8") == 115
         # Newest first: 103 costs 105 (base + patch), 102 and 101 5 each,
         # 100 nothing more. A budget of 112 keeps 103 and 102.
-        assert bus.prune("v8", 112) == K(100, 101)
+        assert bus.prune(112).get("v8", []) == K(100, 101)
         bus.sweep_blobs()
         assert bus.has_blob(base.id), "two deltas still name it"
         assert bus.footprint("v8") == 110
@@ -585,7 +653,7 @@ class TestRetentionLeavesNoHole:
         the budget, but it holds lowest_retained down and hides the hole."""
         for cid, size in ((100, 40), (200, 100), (300, 200)):
             _publish(bus, cid, _bytes(cid, size))
-        assert bus.prune("v8", 250) == K(100, 200)
+        assert bus.prune(250).get("v8", []) == K(100, 200)
         assert bus.keys("v8") == K(300)
         assert bus.lowest_retained("v8") == K1(300)
 
@@ -594,32 +662,32 @@ class TestRetentionLeavesNoHole:
         oldest and the same cycle would otherwise delete it."""
         for cid in (100, 200, 300):
             _publish(bus, cid, _bytes(cid, 100))
-        bus.prune("v8", 250)
+        bus.prune(250).get("v8", [])
         _publish(bus, 50, _bytes(50, 100))
-        assert bus.prune("v8", 250, keep=50) == K()
+        assert bus.prune(250, keep=("v8", 50)).get("v8", []) == K()
         assert K1(50) in bus.keys("v8")
 
     def test_keep_does_not_protect_an_unrelated_entry(self, bus):
         for cid in (100, 200, 300):
             _publish(bus, cid, _bytes(cid, 100))
-        assert bus.prune("v8", 250, keep=300) == K(100)
+        assert bus.prune(250, keep=("v8", 300)).get("v8", []) == K(100)
 
     def test_keep_lowers_the_floor_rather_than_punching_a_hole(self, bus):
         """Exempting one entry would leave a gap below lowest_retained, which
         is the signal a consumer uses to notice entries went missing."""
         for cid in (100, 200, 201, 202):
             _publish(bus, cid, _bytes(cid, 100))
-        assert bus.prune("v8", 250, keep=100) == K()
+        assert bus.prune(250, keep=("v8", 100)).get("v8", []) == K()
         assert bus.keys("v8") == K(100, 200, 201, 202)
         assert bus.lowest_retained("v8") == K1(100)
 
     def test_the_overshoot_lasts_one_cycle(self, bus):
         for cid in (100, 200, 201, 202):
             _publish(bus, cid, _bytes(cid, 100))
-        bus.prune("v8", 250, keep=100)
+        bus.prune(250, keep=("v8", 100)).get("v8", [])
         # The next publish prunes normally and drops it with its neighbours.
         _publish(bus, 203, _bytes(203, 100))
-        assert bus.prune("v8", 250, keep=203) == K(100, 200, 201)
+        assert bus.prune(250, keep=("v8", 203)).get("v8", []) == K(100, 200, 201)
         assert bus.keys("v8") == K(202, 203)
 
 
@@ -764,7 +832,7 @@ class TestKeySpellingOnDisk:
             CommitKey(2, 5),
         ]
         # Retention walks the same order: the lowest key goes first.
-        assert bus.prune("chrome", 1) == [CommitKey(1, 10), CommitKey(1, 900)]
+        assert bus.prune(1).get("chrome", []) == [CommitKey(1, 10), CommitKey(1, 900)]
 
     def test_a_state_file_with_a_bad_key_is_a_bus_error(self, bus):
         bus.write_builder_state("v8", BuilderState(frontier=1))

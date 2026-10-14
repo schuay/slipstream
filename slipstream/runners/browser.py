@@ -61,6 +61,7 @@ class Verdict:
 
 class BrowserRunner:
     runtime = "browser"
+    shutdown_signal = signal.SIGTERM
 
     def __init__(self, *, log: Log, progress: Progress):
         self._log = log
@@ -104,12 +105,15 @@ class BrowserRunner:
         """After the browser is gone, whatever ``command`` set up."""
 
     def terminate(self, proc: subprocess.Popen) -> None:
-        """SIGTERM to the browser's process group, SIGKILL after a grace
-        period. The group, because a browser is a tree of helpers and the
-        launcher dying does not take them all with it."""
+        """Request shutdown of the browser's group, then SIGKILL if it hangs.
+
+        Runtimes choose the signal that runs their normal cleanup. The group,
+        because a browser is a tree of helpers and the launcher dying does
+        not take them all with it.
+        """
         if proc.poll() is not None:
             return
-        _signal_group(proc, signal.SIGTERM)
+        _signal_group(proc, self.shutdown_signal)
         try:
             proc.wait(GRACE_SECONDS)
         except subprocess.TimeoutExpired:

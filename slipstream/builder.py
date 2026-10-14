@@ -511,10 +511,11 @@ class Builder:
         engine.require_run_set()
         state = self.bus.read_builder_state(engine_name)
 
+        # Enforce the cap even while idle, stalled or below the disk floor.
+        self._retain(engine_name, state)
+
         if self.free_gb() < self.cfg.build.min_free_gb:
-            # Publishing stops rather than retention shrinking: a budget that
-            # silently shrank under disk pressure would delete unread entries
-            # exactly when nobody is watching.
+            # The artifact cap is fixed; unrelated disk use can still pause us.
             state.publishing_paused_by_floor = True
             state.last_error = f"only {self.free_gb():.0f}GB free"
             state.in_flight = None
@@ -604,18 +605,7 @@ class Builder:
             cleanup_error = f"published {key}; database cleanup deferred: {e}"
             self.log(f"{engine_name}: {cleanup_error}")
         state.stall_retry_after = None
-        dropped = self.bus.prune(
-            engine_name, self.cfg.build.retain_gb * GB, keep=entry.key
-        )
-        if dropped:
-            self.log(f"{engine_name}: retention dropped {len(dropped)} entries")
-            state.highest_dropped = max(
-                k for k in (state.highest_dropped, *dropped) if k is not None
-            )
-        # After the prune of every publish, not only ones that dropped
-        # something: a retry republishes under new blob ids and leaves the
-        # old ones with no manifest.
-        self.bus.sweep_blobs()
+        self._retain(engine_name, state, keep=entry.key)
         state.stalled_since = None
         state.last_error = cleanup_error
         state.in_flight = None
@@ -627,6 +617,27 @@ class Builder:
             + f", {entry.build_secs}s)"
         )
         return BuildResult(key=key, published=True)
+
+    def _retain(self, engine_name: str, state: BuilderState, *, keep=None) -> None:
+        dropped = self.bus.prune(
+            self.cfg.build.retain_gb * GB,
+            keep=(engine_name, keep) if keep is not None else None,
+        )
+        # Sweep even with no drops: interrupted publishes and retries orphan
+        # objects too. Reclaim before writing state in case the disk is full.
+        self.bus.gc()
+        for name, keys in dropped.items():
+            retained_state = (
+                state if name == engine_name else self.bus.read_builder_state(name)
+            )
+            retained_state.highest_dropped = max(
+                key
+                for key in (retained_state.highest_dropped, *keys)
+                if key is not None
+            )
+            self.log(f"{name}: global retention dropped {len(keys)} entries")
+            if name != engine_name:
+                self._publish_state(name, retained_state)
 
     @staticmethod
     def _in_flight(job: BuildJob, phase: str) -> dict:

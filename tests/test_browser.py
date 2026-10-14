@@ -585,6 +585,62 @@ class TestChromiumRunner:
     def test_cleanup_without_a_command_is_fine(self, req):
         self._runner().cleanup(req)
 
+    def test_shutdown_runs_sigint_cleanup(self, tmp_path):
+        """Chromium's SIGTERM path bypasses the normal exit cleanup."""
+        import subprocess
+
+        cleaned = tmp_path / "cleaned"
+        script = """
+import signal, sys
+from pathlib import Path
+signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+try:
+    print('ready', flush=True)
+    while True:
+        signal.pause()
+finally:
+    Path(sys.argv[1]).write_text('cleaned')
+"""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script, str(cleaned)],
+            stdout=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            assert proc.stdout.readline() == b"ready\n"
+            self._runner().terminate(proc)
+            assert proc.returncode == 0
+            assert cleaned.read_text() == "cleaned"
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+
+    def test_shutdown_kills_a_browser_that_ignores_sigint(self, monkeypatch):
+        import subprocess
+
+        import slipstream.runners.browser as browser
+
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import signal,time;signal.signal(signal.SIGINT,signal.SIG_IGN);"
+                "print('ready',flush=True);time.sleep(60)",
+            ],
+            stdout=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            assert proc.stdout.readline() == b"ready\n"
+            monkeypatch.setattr(browser, "GRACE_SECONDS", 0.2)
+            self._runner().terminate(proc)
+            assert proc.returncode == -signal.SIGKILL
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+
     def test_a_real_run_through_the_fake_browser(self, req, monkeypatch):
         """The whole path with ChromiumRunner's command: the fake stands in
         for the binary at binary_path."""

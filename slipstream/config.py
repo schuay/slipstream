@@ -319,7 +319,7 @@ class BuildConfig:
     """What ``slipstream build`` publishes, and how much of it is kept."""
 
     engines: list[str] = field(default_factory=list)
-    retain_gb: float = 400.0  # per engine, oldest entries dropped first
+    retain_gb: float = 400.0  # global artifact cap, oldest builds dropped first
     min_free_gb: float = 100.0
     max_infra_attempts: int = 5
     max_consecutive_burns: int = 3

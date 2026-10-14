@@ -186,7 +186,9 @@ suite = "js3"
 #
 # [build]
 # engines = ["v8", "jsc"]
-# retain_gb = 400                    # per engine, oldest entries dropped first
+# retain_gb = 400                    # global artifact cap across all engines
+#                                    # oldest builds dropped first; shared blobs
+#                                    # count once; newest build per engine kept
 # min_free_gb = 100                  # stop publishing below this
 # max_infra_attempts = 5             # before a stuck sync is blamed on the commit
 # max_consecutive_burns = 3          # before the builder stalls instead

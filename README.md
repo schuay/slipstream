@@ -86,6 +86,18 @@ stall deadline. `--once` performs one bounded scan/drain without subscribing.
 Notifications wake discovery immediately; local benchmarking still waits for
 the builder's configured batch and the existing machine lock.
 
+`[build] retain_gb` is one global cap on published artifacts across every engine
+in the local bus (default 400 GB, decimal). Retention runs before the free-space
+check and after each publish, removing the oldest eligible builds by build time
+until their combined footprint fits. Shared archives and delta dependencies
+count once. Each engine keeps its newest build; a just-published retry also
+keeps the suffix starting at that commit for the current operation. Those
+protections can exceed a cap smaller than the required artifacts. Retention
+does not wait for consumers; status reports builds dropped before measurement.
+Compiler caches, source checkouts and unpacked benchmark roots are outside this
+cap, and cached artifacts still referenced by benchmark state remain protected.
+`bus gc` removes unreferenced files; it does not retire published builds.
+
 V8 selection skips commits whose changes are entirely in `tools/`, `test/`,
 `agents/`, `docs/`, ownership metadata, or CPU backends unused by the host and
 target build. DEPS changes are skipped when limited to test dependencies,

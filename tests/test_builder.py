@@ -686,6 +686,46 @@ class TestDiskFloor:
 
 
 class TestRetention:
+    def test_global_retention_updates_all_engines_while_paused(
+        self, builder, tmp_path, monkeypatch
+    ):
+        builder.cfg.engines["jsc"] = replace(builder.cfg.engines["v8"], name="jsc")
+        builder.cfg.build.start_from["jsc"] = K1(100)
+        for engine in ("v8", "jsc"):
+            for index in range(2):
+                (tmp_path / "src/out/d8").write_bytes(f"{engine}-{index}".encode())
+                builder.build_one(engine)
+        # Neither engine exceeds the budget individually, but together they do.
+        builder.cfg.build.retain_gb = builder.bus.footprint("v8") / 1e9
+        monkeypatch.setattr(builder, "free_gb", lambda: 5.0)
+        builder.cfg.build.min_free_gb = 100
+        assert not builder.build_one("v8").published
+        for engine in ("v8", "jsc"):
+            assert builder.bus.keys(engine) == K(102)
+            state = builder.bus.read_builder_state(engine)
+            assert state.highest_dropped == K1(101)
+            assert state.lowest_retained == state.frontier == K1(102)
+        assert builder.bus.read_builder_state("v8").publishing_paused_by_floor
+
+    def test_quota_cleanup_can_clear_the_disk_floor_without_a_new_build(
+        self, builder, tmp_path, monkeypatch
+    ):
+        for index in range(3):
+            (tmp_path / "src/out/d8").write_bytes(f"binary-{index}".encode())
+            builder.build_one("v8")
+        old = builder.bus.read_entry("v8", 101).blobs[0]
+        builder.cfg.build.retain_gb = old.bytes / 1e9
+        builder.cfg.build.min_free_gb = 10
+        builder.history = [100, 101, 102, 103]  # already caught up
+        monkeypatch.setattr(
+            builder, "free_gb", lambda: 5.0 if builder.bus.has_blob(old.id) else 20.0
+        )
+        assert builder.build_one("v8").key is None
+        assert builder.bus.keys("v8") == K(103)
+        assert not builder.bus.has_blob(old.id)
+        assert not builder.bus.read_builder_state("v8").publishing_paused_by_floor
+        assert len(builder.built) == 3
+
     def test_prunes_after_publishing(self, builder):
         builder.cfg.build.retain_gb = 30 / 1_000_000_000  # 30 bytes
         for _ in range(3):

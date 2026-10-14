@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import shutil
+import signal
 import tempfile
 from pathlib import Path
 
@@ -57,6 +58,10 @@ CHROMIUM_FLAGS = (
 
 class ChromiumRunner(BrowserRunner):
     runtime = "chromium"
+    # On macOS SIGTERM takes Chromium's SessionEnding path, which exits
+    # immediately without running the code-sign clone manager's destructor.
+    # SIGINT runs normal shutdown and launches the clone cleanup helper.
+    shutdown_signal = signal.SIGINT
 
     def __init__(self, **kw):
         super().__init__(**kw)
