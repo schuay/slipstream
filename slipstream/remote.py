@@ -21,6 +21,7 @@ from pathlib import Path
 
 from .bus import (
     BLOB_SUFFIX,
+    BusError,
     BenchState,
     Bus,
     BuilderState,
@@ -163,6 +164,15 @@ class SshSource:
         (rsync KB/s, scp Kbit/s), so the tool is pinned to keep the config
         value meaningful.
         """
+        if into.protocol or entry.version >= 4:
+            raise BusError(
+                "legacy SSH fetch cannot access migrated buses; use transfer and a local source"
+            )
+        check = self._ssh(f"test ! -e {quote_remote(self.root + '/ready.json')}")
+        if check.returncode:
+            raise BusError(
+                "legacy SSH fetch preflight failed or remote bus is migrated"
+            )
         label = f"{entry.engine} {entry.key}"
         paths = {}
         for obj in entry.objects():

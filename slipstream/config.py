@@ -274,9 +274,24 @@ class BusSource:
 
 
 @dataclass
+class TransferRoute:
+    name: str
+    engines: list[str]
+    source: BusSource
+    destination: BusSource
+    source_uuid: str
+    destination_uuid: str
+
+
+@dataclass
 class BusConfig:
     root: Path
     sources: list[BusSource] = field(default_factory=list)
+    owners: dict[str, str] = field(default_factory=dict)
+    routes: list[TransferRoute] = field(default_factory=list)
+    transfer_handshake: float = 30
+    transfer_inactivity: float = 120
+    transfer_deadline: float = 3600
 
     def source_for(self, engine: str) -> BusSource | None:
         """The source an engine is benched from, or None if it is git-driven."""
@@ -908,7 +923,19 @@ def _parse_run_set(engine: str, entries) -> list[str]:
 def _parse_bus(data, engines: dict[str, EngineConfig]) -> BusConfig | None:
     if data is None:
         return None
-    _reject_unknown(data, ("root", "sources"), "[bus]")
+    _reject_unknown(
+        data,
+        (
+            "root",
+            "sources",
+            "owners",
+            "routes",
+            "transfer_handshake",
+            "transfer_inactivity",
+            "transfer_deadline",
+        ),
+        "[bus]",
+    )
     if "root" not in data:
         raise ValueError("[bus] needs a root")
     sources: list[BusSource] = []
@@ -954,7 +981,75 @@ def _parse_bus(data, engines: dict[str, EngineConfig]) -> BusConfig | None:
             "[[bus.sources]] only one source may omit engines, and then it must "
             "be the only one"
         )
-    return BusConfig(root=Path(data["root"]).expanduser(), sources=sources)
+    import uuid
+
+    root = Path(data["root"]).expanduser().resolve()
+    owners = {
+        name: str(uuid.UUID(value)) for name, value in data.get("owners", {}).items()
+    }
+    if set(owners) - engines.keys():
+        raise ValueError("bus owners names an unconfigured engine")
+    routes = []
+    routed = set()
+    for item in data.get("routes", []):
+        _reject_unknown(
+            item,
+            (
+                "name",
+                "engines",
+                "source",
+                "destination",
+                "source_uuid",
+                "destination_uuid",
+            ),
+            "[[bus.routes]]",
+        )
+
+        def endpoint(label):
+            spec = item[label]
+            _reject_unknown(spec, ("root", "ssh_host"), "bus route endpoint")
+            return BusSource(
+                name=item["name"] + "-" + label,
+                root=spec["root"],
+                ssh_host=spec.get("ssh_host"),
+            )
+
+        source, destination = endpoint("source"), endpoint("destination")
+        names = item["engines"]
+        src_id, dst_id = (
+            str(uuid.UUID(item["source_uuid"])),
+            str(uuid.UUID(item["destination_uuid"])),
+        )
+        if source.is_local == destination.is_local or src_id == dst_id:
+            raise ValueError(
+                "transfer route needs exactly one local endpoint and distinct bus UUIDs"
+            )
+        local = source if source.is_local else destination
+        if local.local_root.resolve() != root:
+            raise ValueError("route local endpoint must be the configured bus root")
+        if not names or len(set(names)) != len(names) or routed.intersection(names):
+            raise ValueError("empty or duplicate engine routes")
+        if any(owners.get(name) != src_id for name in names):
+            raise ValueError("route conflicts with configured ownership")
+        if any(route.name == item["name"] for route in routes):
+            raise ValueError("duplicate route name")
+        routed.update(names)
+        routes.append(
+            TransferRoute(item["name"], names, source, destination, src_id, dst_id)
+        )
+    if owners and any(
+        not source.is_local or source.local_root.resolve() != root for source in sources
+    ):
+        raise ValueError("migrated buses require bencher sources at the local bus root")
+    return BusConfig(
+        root=root,
+        sources=sources,
+        owners=owners,
+        routes=routes,
+        transfer_handshake=_positive(data, "transfer_handshake", 30, "[bus]"),
+        transfer_inactivity=_positive(data, "transfer_inactivity", 120, "[bus]"),
+        transfer_deadline=_positive(data, "transfer_deadline", 3600, "[bus]"),
+    )
 
 
 def _parse_build(data: dict, engines: dict[str, EngineConfig]) -> BuildConfig:

@@ -928,3 +928,48 @@ class TestBuildDir:
         assert chrome.build_dir == "out/release-lto"
         assert chrome.binary_path.startswith(chrome.build_dir + "/")
         assert f"-C {chrome.build_dir} " in chrome.build_cmd
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "duplicate",
+        "self",
+        "two_local",
+        "two_remote",
+        "owner",
+        "wrong_root",
+        "legacy_source",
+    ],
+)
+def test_transfer_route_validation(tmp_path, invalid):
+    import copy
+    from slipstream.config import _parse_bus
+
+    source_id = "00000000-0000-0000-0000-000000000001"
+    destination_id = "00000000-0000-0000-0000-000000000002"
+    route = {
+        "name": "m3-to-m6",
+        "engines": ["v8"],
+        "source_uuid": source_id,
+        "destination_uuid": destination_id,
+        "source": {"root": str(tmp_path)},
+        "destination": {"root": "/remote", "ssh_host": "m6"},
+    }
+    data = {"root": str(tmp_path), "owners": {"v8": source_id}, "routes": [route]}
+    if invalid == "duplicate":
+        data["routes"].append(copy.deepcopy(route))
+    elif invalid == "self":
+        route["destination_uuid"] = source_id
+    elif invalid == "two_local":
+        del route["destination"]["ssh_host"]
+    elif invalid == "two_remote":
+        route["source"]["ssh_host"] = "m3"
+    elif invalid == "owner":
+        data["owners"]["v8"] = destination_id
+    elif invalid == "wrong_root":
+        route["source"]["root"] = "/another"
+    else:
+        data["sources"] = [{"name": "legacy", "root": "/remote", "ssh_host": "m6"}]
+    with pytest.raises(ValueError):
+        _parse_bus(data, {"v8": object()})

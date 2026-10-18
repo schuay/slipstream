@@ -182,6 +182,21 @@ suite = "js3"
 # engines = ["v8", "jsc"]            # optional subset; omit to take everything
 # # bwlimit = "20000"                # rsync --bwlimit, KB/s
 #
+# Independent artifact transfer (offline migration required on both buses):
+# See docs/build-transfer.md. Both benchers use local sources in this mode.
+# [bus.owners]
+# v8 = "<UUID printed by bus identity on the builder>"
+# jsc = "<UUID printed by bus identity on the builder>"
+# [[bus.routes]]                    # coordinator config on m3 only
+# name = "m3-to-m6"
+# engines = ["v8", "jsc"]
+# source_uuid = "<m3 UUID>"
+# destination_uuid = "<m6 UUID>"
+# source = { root = "~/slipstream/bus" }
+# destination = { root = "~/slipstream/bus", ssh_host = "m6" }
+# Optional fields in [bus]: transfer_handshake=30, transfer_inactivity=120,
+# transfer_deadline=3600 (seconds). m3 can reverse endpoints for pull routes.
+#
 # What this machine builds and publishes:
 #
 # [build]

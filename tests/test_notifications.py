@@ -331,3 +331,34 @@ def test_subscription_command_stream_and_client_exit(tmp_path):
         process.stdout.close()
         process.stderr.close()
         process.stdin.close()
+
+
+def test_role_specific_state_notifications_do_not_loop(tmp_path):
+    if not hasattr(select, "kqueue"):
+        pytest.skip("requires kqueue")
+    root = tmp_path / "bus"
+    bench = n.DirectorySubscription(root, ["v8"], role="bench")
+    transfer = n.DirectorySubscription(root, ["v8"], role="transfer")
+    try:
+        _atomic_write(root / "state/builds/v8.json", '{"failed": true}')
+        changed(transfer)
+        assert bench.changes(0.1) == set()
+        _atomic_write(root / "state/bench/v8.json", '{"env": {}}')
+        changed(transfer)
+        assert bench.changes(0.1) == set()
+        _atomic_write(root / "state/peer-health/v8.json", "{}")
+        assert transfer.changes(0.1) == set()
+        _atomic_write(root / "state/transfer/v8.json", "{}")
+        assert transfer.changes(0.1) == set()
+        _atomic_write(root / "state/upstream-loss/v8.json", '{"highest_dropped": "10"}')
+        changed(bench)
+        assert transfer.changes(0.1) == set()
+        _atomic_write(root / "state/retention/v8.json", "{}")
+        changed(bench)
+        changed(transfer)
+        # Atomic replacement must keep watching the parent, not the old inode.
+        _atomic_write(root / "state/builds/v8.json", '{"failed": false}')
+        changed(transfer)
+    finally:
+        bench.close()
+        transfer.close()

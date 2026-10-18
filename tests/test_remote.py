@@ -198,7 +198,9 @@ class TestFetch:
         source = SshSource(BusSource(name="box2", root="~/a dir/bus", ssh_host="box2"))
         blob = Blob("out", "abc", hashlib.sha256(b"x").hexdigest(), 1)
         source.fetch(_entry(100, [blob]), local)
-        (remote_arg,) = [c for c in calls[0] if c.startswith("box2:")]
+        (remote_arg,) = [
+            c for command in calls for c in command if c.startswith("box2:")
+        ]
         assert remote_arg == "box2:~/'a dir/bus/blobs/abc.tar.zst'"
 
     def test_a_version_one_entry_is_fetched_from_its_old_path(self, remote, local):

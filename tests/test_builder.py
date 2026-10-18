@@ -1420,3 +1420,75 @@ class TestDerivedEngine:
         )
         with pytest.raises(ValueError, match=r"no \[engines.jsc\]"):
             builder.resolver("safari")
+
+
+class TestMigratedBus:
+    @pytest.fixture
+    def migrated(self, builder):
+        from slipstream.bus_protocol import BusProtocol
+
+        protocol = BusProtocol(builder.bus.root)
+        protocol.migrate({"v8": protocol.bus_uuid()})
+        builder.bus = Bus(builder.bus.root)
+        return builder, protocol
+
+    def test_builder_reinstalls_reuse_captured_before_prune(
+        self, migrated, monkeypatch
+    ):
+        builder, protocol = migrated
+        binary = builder.cfg.engines["v8"].src_dir / "out/d8"
+        builder.build_one("v8")
+        first = builder.bus.read_entry("v8", 101)
+        binary.write_bytes(b"different tree")
+        # Distinct fake archive bytes as well as distinct trees.
+        monkeypatch.setattr(
+            "slipstream.builder.package",
+            lambda src, rs, dest, **kw: dest.write_bytes(binary.read_bytes()),
+        )
+        builder.build_one("v8")
+        binary.write_bytes(b"binary")
+        from slipstream.bus import tree_hash
+
+        original = tree_hash
+
+        def hash_during_gc(src, rel):
+            protocol.prune(0)
+            protocol.sweep_blobs()
+            assert not builder.bus.object_path(first.objects()[0].name).exists()
+            return original(src, rel)
+
+        monkeypatch.setattr("slipstream.builder.tree_hash", hash_during_gc)
+        assert builder.build_one("v8").published
+        third = builder.bus.read_entry("v8", 103)
+        assert third.version == 4 and third.blobs == first.blobs
+        assert third.publication_uuid != first.publication_uuid
+        assert builder.bus.object_path(first.objects()[0].name).exists()
+        assert not list((protocol.root / "staging").glob("*"))
+
+    def test_real_delta_uses_byte_named_base(self, migrated, monkeypatch):
+        builder, protocol = migrated
+        monkeypatch.setattr("slipstream.builder.package", package)
+        builder.cfg.build.delta = DeltaConfig(
+            block_mb=1, max_ratio=0.5, min_mb=0, workers=1
+        )
+        binary = builder.cfg.engines["v8"].src_dir / "out/d8"
+        binary.write_bytes(_payload(seed=1))
+        assert builder.build_one("v8").published
+        first = builder.bus.read_entry("v8", 101)
+        binary.write_bytes(_payload(seed=1, edits=20))
+        assert builder.build_one("v8").published
+        second = builder.bus.read_entry("v8", 102)
+        assert second.blobs[0].is_delta
+        assert second.objects()[0].name == first.blobs[0].sha256 + ".tar.zst"
+        from slipstream.consumer import _unpack_delta
+
+        with protocol.capture("v8", 102) as capture:
+            output = protocol.root / "test-unpack"
+            output.mkdir()
+            _unpack_delta(
+                capture.paths[second.objects()[0].name],
+                second.blobs[0].delta,
+                lambda sha: capture.paths[sha + ".bsdiff"].read_bytes(),
+                output,
+            )
+        assert (output / "out/d8").read_bytes() == binary.read_bytes()

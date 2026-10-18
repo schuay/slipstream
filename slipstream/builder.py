@@ -21,6 +21,7 @@ import shutil
 import sqlite3
 import subprocess
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,7 @@ from .bus import (
     sha256_file,
     tree_hash,
 )
+from .bus_protocol import staging_fds
 from .collector import BenchCollector, BuildStepError, FetchError
 from .config import Config, DeltaConfig, EngineConfig
 from .delta import DeltaError
@@ -141,12 +143,14 @@ def package(
         [*prefix, "tar", "-cf", "-", "-C", str(src_dir), *run_set],
         stdout=subprocess.PIPE,
         env=env,
+        pass_fds=staging_fds(),
     )
     try:
         zstd = subprocess.Popen(
             [*prefix, "zstd", "-T0", "-3", "-q", "-o", str(dest)],
             stdin=tar.stdout,
             env=env,
+            pass_fds=staging_fds(),
         )
     except OSError:
         tar.kill()
@@ -154,8 +158,14 @@ def package(
         raise
     # Let tar see EPIPE if zstd dies.
     tar.stdout.close()
-    zstd_rc = zstd.wait()
-    tar_rc = tar.wait()
+    try:
+        zstd_rc = zstd.wait()
+        tar_rc = tar.wait()
+    finally:
+        for proc in (zstd, tar):
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
     if tar_rc != 0 or zstd_rc != 0:
         dest.unlink(missing_ok=True)
         raise BuildError(f"packaging failed (tar {tar_rc}, zstd {zstd_rc})")
@@ -202,7 +212,9 @@ class _Stored:
         blob = self.blobs.get(blob_id)
         if blob is None:
             return None
-        if all(self.bus.has_object(o.name) for o in blob.objects()):
+        if all(
+            self.bus.has_object(o.name) for o in blob.objects(self.bus.format_version)
+        ):
             return blob
         return None
 
@@ -211,7 +223,13 @@ class _Stored:
         if blob is None:
             return None
         base = _Base.of(blob)
-        return base if self.bus.has_blob(base.id) else None
+        return (
+            base
+            if self.bus.has_blob(
+                base.sha256 if self.bus.format_version >= 4 else base.id
+            )
+            else None
+        )
 
 
 def store_run_set(
@@ -236,6 +254,8 @@ def store_run_set(
     in it is logged and the archive stored whole. The returned blobs are
     what the manifest names, in run set order.
     """
+    if bus.protocol:
+        raise BuildError("migrated bus packaging requires a private publication stage")
     missing = [entry for entry in run_set if not (src_dir / entry).exists()]
     if missing:
         raise BuildError(f"run_set entries missing from the build: {missing}")
@@ -244,7 +264,7 @@ def store_run_set(
     for entry in run_set:
         blob_id = tree_hash(src_dir, entry)
         dest = bus.blob_path(blob_id)
-        if dest.exists():
+        if bus.format_version < 4 and dest.exists():
             blobs.append(Blob(entry, blob_id, sha256_file(dest), dest.stat().st_size))
             continue
         known = stored.known(blob_id)
@@ -262,8 +282,10 @@ def store_run_set(
             tmp.unlink()
             blobs.append(Blob(entry, blob_id, delta=planned))
         else:
-            bus.store_blob(tmp, blob_id)
-            blobs.append(Blob(entry, blob_id, sha256_file(dest), dest.stat().st_size))
+            sha = sha256_file(tmp)
+            size = tmp.stat().st_size
+            bus.store_blob(tmp, sha if bus.format_version >= 4 else blob_id)
+            blobs.append(Blob(entry, blob_id, sha, size))
     return blobs
 
 
@@ -298,13 +320,26 @@ def _try_delta(
         bus.store_object(tmp, name)
 
     t0 = time.monotonic()
+    base_proc = target_proc = None
     try:
         with (
             subprocess.Popen(
-                ["zstd", "-dc", str(bus.blob_path(base.id))], stdout=subprocess.PIPE
+                [
+                    "zstd",
+                    "-dc",
+                    str(
+                        bus.blob_path(
+                            base.sha256 if bus.format_version >= 4 else base.id
+                        )
+                    ),
+                ],
+                stdout=subprocess.PIPE,
+                pass_fds=staging_fds(),
             ) as base_proc,
             subprocess.Popen(
-                ["zstd", "-dc", str(archive)], stdout=subprocess.PIPE
+                ["zstd", "-dc", str(archive)],
+                stdout=subprocess.PIPE,
+                pass_fds=staging_fds(),
             ) as target_proc,
         ):
             plan = delta.plan(
@@ -330,6 +365,14 @@ def _try_delta(
     except Exception as e:  # noqa: BLE001 -- the delta path may not fail a publish
         log(f"{label}: delta against {base.id[:12]} failed, stored whole: {e}")
         return None
+    finally:
+        # Popen's KeyboardInterrupt context exit can return before the child
+        # exits. Reap both readers before the owner removes private staging.
+        for proc in (base_proc, target_proc):
+            if proc is not None:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
     secs = time.monotonic() - t0
     if plan is None:
         log(
@@ -356,6 +399,16 @@ class Builder:
     ):
         self.cfg = cfg
         self.bus = bus
+        if cfg.bus and cfg.bus.owners:
+            if not bus.protocol or bus.protocol.ready()["owners"] != cfg.bus.owners:
+                raise BusError(
+                    "configured bus needs offline migration or ownership reconciliation"
+                )
+            ready = bus.protocol.ready()
+            if any(
+                ready["owners"].get(name) != ready["uuid"] for name in cfg.build.engines
+            ):
+                raise BusError("builder configured for an engine owned by another bus")
         self.interval_secs = interval_secs
         self.collector = BenchCollector(cfg, verbose=verbose, role="build")
         self.store = self.collector.store
@@ -509,6 +562,10 @@ class Builder:
         """Resolve, build, package and publish one commit."""
         engine = self.cfg.engines[engine_name]
         engine.require_run_set()
+        if protocol := self.bus.protocol:
+            ready = protocol.ready()
+            if ready["owners"].get(engine_name) != ready["uuid"]:
+                raise BuildError(f"{engine_name} is owned by another bus")
         state = self.bus.read_builder_state(engine_name)
 
         # Enforce the cap even while idle, stalled or below the disk floor.
@@ -637,7 +694,12 @@ class Builder:
             )
             self.log(f"{name}: global retention dropped {len(keys)} entries")
             if name != engine_name:
-                self._publish_state(name, retained_state)
+                protocol = self.bus.protocol
+                if (
+                    protocol is None
+                    or protocol.ready()["owners"][name] == protocol.ready()["uuid"]
+                ):
+                    self._publish_state(name, retained_state)
 
     @staticmethod
     def _in_flight(job: BuildJob, phase: str) -> dict:
@@ -658,13 +720,17 @@ class Builder:
         return record
 
     def _package_and_publish(
-        self, engine: EngineConfig, job: BuildJob, build_secs: int
+        self, engine: EngineConfig, job: BuildJob, build_secs: int, *, storage=None
     ) -> Entry:
+        if storage is None:
+            if protocol := self.bus.protocol:
+                return self._package_transaction(protocol, engine, job, build_secs)
+            storage = self.bus
         key = job.key
         commit = job.commit
         inherited = None
         if job.compiles:
-            blobs = self._store(engine)
+            blobs = self._store(engine, storage)
         else:
             # The inner entry's blobs by reference, then this engine's own.
             # The app can be replaced under us by its updater: its identity
@@ -674,7 +740,7 @@ class Builder:
             # on the floor (the sweep reclaims it) and the cycle retries.
             resolver = self.resolver(engine.name)
             before, _ = resolver.installed()
-            own = self._store(engine)
+            own = self._store(engine, storage)
             after, _ = resolver.installed()
             if after != before:
                 raise BuildError(
@@ -698,14 +764,51 @@ class Builder:
             builder=dict(self.identity),
             built_at=int(time.time()),
             build_secs=build_secs,
+            version=storage.format_version,
         )
-        self.bus.publish(entry)
+        storage.publish(entry)
         return entry
 
-    def _store(self, engine: EngineConfig) -> list[Blob]:
+    def _package_transaction(self, protocol, engine, job, build_secs):
+        # A private bus snapshot lets the existing packager reuse and delta-plan
+        # captured objects, while every shared operation stays a short transaction.
+        with protocol.stage() as stage:
+            private = Bus(stage.path / "work", _raw=True)
+            private.format_version = 4
+            with protocol.lock():
+                protocol._recover_all_locked()
+                if job.inherits:
+                    parent = protocol.bus.read_entry(
+                        job.inherits.engine, job.inherits.key
+                    )
+                    if parent is None or parent != job.inherits:
+                        raise BuildError(
+                            "derived parent changed or was retained away; retry"
+                        )
+                for name in protocol.bus.engines():
+                    for entry in protocol.bus.entries(name):
+                        for obj in entry.objects():
+                            dest = private.object_path(obj.name)
+                            dest.parent.mkdir(parents=True, exist_ok=True)
+                            if not dest.exists():
+                                os.link(
+                                    protocol.bus.entry_object_path(entry, obj), dest
+                                )
+                        private.publish(entry)
+            entry = self._package_and_publish(engine, job, build_secs, storage=private)
+            entry.owner_uuid = protocol.ready()["uuid"]
+            entry.publication_uuid = str(uuid.uuid4())
+            stage.entry, stage.text = entry, entry.to_json()
+            stage.paths = {
+                obj.name: private.object_path(obj.name) for obj in entry.objects()
+            }
+            protocol.publish_staged(stage)
+            return entry
+
+    def _store(self, engine: EngineConfig, storage=None) -> list[Blob]:
         """This engine's own run set into the store, under its delta policy."""
         return store_run_set(
-            self.bus,
+            storage or self.bus,
             engine.require_src_dir(),
             engine.require_run_set(),
             engine=engine.name,

@@ -10,7 +10,15 @@ import hashlib
 import os
 import tempfile
 import time
+import sys
 from pathlib import Path
+
+
+def flush_file(fd: int) -> None:
+    """Flush file data to stable storage, including the macOS device cache."""
+    os.fsync(fd)
+    if sys.platform == "darwin":
+        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
 
 
 def fsync_dir(path: Path) -> None:
@@ -39,9 +47,14 @@ def atomic_write(path: Path, data: str) -> None:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
             stream.write(data)
             stream.flush()
-            os.fsync(stream.fileno())
+            flush_file(stream.fileno())
         os.replace(name, path)
         fsync_dir(path.parent)
+        # fsync of a directory persists the rename to the filesystem. Flush
+        # the device cache after that metadata operation on macOS as well.
+        if sys.platform == "darwin":
+            with path.open("rb") as persisted:
+                flush_file(persisted.fileno())
     finally:
         Path(name).unlink(missing_ok=True)
 

@@ -35,7 +35,6 @@ from .bus import (
     Delta,
     Entry,
     StoredObject,
-    archive_name,
     cursor_path,
     parse_key_stem,
     patch_name,
@@ -136,6 +135,10 @@ class LocalSource:
     def fetch(self, entry: Entry, into: Bus) -> dict[str, Path]:
         """Readable, verified paths to the entry's stored objects, by name."""
         del into
+        if self.bus.protocol:
+            raise ConsumerError(
+                "migrated local provisioning requires a protected capture"
+            )
         paths = {}
         for obj in entry.objects():
             path = self.bus.entry_object_path(entry, obj)
@@ -144,9 +147,41 @@ class LocalSource:
         return paths
 
     def builder_state(self, engine: str):
-        return self.bus.read_builder_state(engine)
+        state = self.bus.read_builder_state(engine)
+        if protocol := self.bus.protocol:
+            from .bus_protocol import read
+            from .bus import state_from_json, BuilderState
+
+            peer = protocol.state_path("peer-health", engine)
+            if (
+                protocol.ready()["owners"][engine] != protocol.ready()["uuid"]
+                and peer.exists()
+            ):
+                snapshot_state = read(peer).get("source", {}).get("builds")
+                if snapshot_state:
+                    import json
+
+                    state = state_from_json(json.dumps(snapshot_state), BuilderState)
+            snapshot = protocol.snapshot(engine)
+            from .bus_protocol import read
+
+            drop = snapshot["retention"]["highest_dropped"]
+            state.highest_dropped = CommitKey.parse(drop) if drop else None
+            lowest = snapshot["retention"]["lowest_retained"]
+            state.lowest_retained = CommitKey.parse(lowest) if lowest else None
+        return state
 
     def bench_state(self, engine: str):
+        if protocol := self.bus.protocol:
+            from .bus_protocol import read
+            from .bus import state_from_json, BenchState
+            import json
+
+            path = protocol.state_path("peer-health", engine)
+            if path.exists():
+                snapshot = read(path).get("source", {}).get("bench")
+                if snapshot:
+                    return state_from_json(json.dumps(snapshot), BenchState)
         return self.bus.read_bench_state(engine)
 
 
@@ -175,6 +210,13 @@ class BusConsumer:
         if cfg.bus is None:
             raise ConsumerError("no [bus] section in config")
         self.bus = Bus(cfg.bus.root)
+        if cfg.bus.owners and (
+            not self.bus.protocol
+            or self.bus.protocol.ready()["owners"] != cfg.bus.owners
+        ):
+            raise ConsumerError(
+                "configured bus needs offline migration or ownership reconciliation"
+            )
         self.identity = host.identity()
 
     # --- cursors ---
@@ -197,7 +239,13 @@ class BusConsumer:
             return None
 
     def set_cursor(self, source: BusSource, engine: str, key) -> None:
-        write_cursor(self.cursor_file(source, engine), key)
+        if protocol := self.bus.protocol:
+            from .durability import atomic_write
+
+            with protocol.lock():
+                atomic_write(self.cursor_file(source, engine), f"{CommitKey.of(key)}\n")
+        else:
+            write_cursor(self.cursor_file(source, engine), key)
 
     # --- one entry ---
 
@@ -211,6 +259,17 @@ class BusConsumer:
         a different run set entry, so the union is the run root and nothing
         in it is written twice.
         """
+        if isinstance(source, LocalSource) and source.bus.protocol:
+            with source.bus.protocol.capture(entry.engine, entry.key) as capture:
+                if capture.entry != entry:
+                    raise ConsumerError("publication changed before provisioning")
+                capture.verify()
+
+                class CapturedSource:
+                    def fetch(self, entry, into):
+                        return capture.paths
+
+                return self.provision(CapturedSource(), engine, entry)
         root = self.run_root(engine.name, entry.key)
         if root.exists():
             shutil.rmtree(root)
@@ -224,10 +283,10 @@ class BusConsumer:
         tmp_root.mkdir(parents=True)
         for blob in entry.blobs:
             if blob.delta is None:
-                _unpack(paths[archive_name(blob.id)], tmp_root)
+                _unpack(paths[blob.objects(entry.version)[0].name], tmp_root)
             else:
                 _unpack_delta(
-                    paths[archive_name(blob.delta.base_id)],
+                    paths[blob.objects(entry.version)[0].name],
                     blob.delta,
                     lambda sha: paths[patch_name(sha)].read_bytes(),
                     tmp_root,
@@ -407,7 +466,13 @@ class BusConsumer:
         # Before the floor check below, not only inside provision: a kill
         # mid-unpack leaves a multi-GB directory, and if that is what filled
         # the disk then the sweep that removes it would never be reached.
-        self._trim_run_roots(engine_name)
+        if (self.bus.root / "roots" / engine_name).exists():
+            if not take_lock():
+                return DrainResult(0, None)
+            try:
+                self._trim_run_roots(engine_name)
+            finally:
+                release_lock()
         self._note_dropped_entries(handle, engine_name, state, cursor)
         # While stalled, one commit per window: a machine problem then costs a
         # commit per backoff instead of the whole backlog in one pass.
@@ -605,6 +670,24 @@ class BusConsumer:
         nothing that says one was ever there.
         """
         try:
+            if isinstance(handle, LocalSource) and handle.bus.protocol:
+                from .bus_protocol import read
+
+                protocol = handle.bus.protocol
+                protocol.snapshot(engine_name)  # recover skip before reading loss
+                upstream = read(protocol.state_path("upstream-loss", engine_name))[
+                    "highest_dropped"
+                ]
+                if upstream:
+                    upstream = CommitKey.parse(upstream)
+                    if (cursor is None or upstream > cursor) and (
+                        state.skipped_upstream is None
+                        or upstream > state.skipped_upstream
+                    ):
+                        state.skipped_upstream = upstream
+                        self.log(
+                            f"{engine_name}: source retention prevented transfer through {upstream}"
+                        )
             dropped = handle.builder_state(engine_name).highest_dropped
         except TRANSPORT_ERRORS:
             return  # the cycle will report the failure on its own
@@ -707,8 +790,12 @@ class _decompress:
 
     def __init__(self, payload: Path):
         self.payload = payload
+        from .bus_protocol import staging_fds
+
         self.proc = subprocess.Popen(
-            ["zstd", "-dc", str(payload)], stdout=subprocess.PIPE
+            ["zstd", "-dc", str(payload)],
+            stdout=subprocess.PIPE,
+            pass_fds=staging_fds(),
         )
 
     def __enter__(self):

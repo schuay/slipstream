@@ -38,6 +38,11 @@ Entries written as version 1 named one payload per entry under
 single blob whose id is its sha256, found at the old path until the builder
 has migrated it (``Bus.migrate``), which is a hardlink and a rewrite.
 
+Migrated roots write version 4, resolving archives and delta bases by their
+compressed-byte SHA-256. The tree IDs still recognize reusable build output.
+``bus_protocol.py`` owns locking, captures, publication and recovery for these
+roots. Unmigrated roots retain the version 3 machine-lock-only behavior.
+
 Version 3 adds the delta shape of a blob: the same tree, stored as a base
 archive plus one bsdiff patch per changed 8 MiB block of the tar stream
 (``delta.py``). Patches are files beside the archives, ``blobs/<sha>.bsdiff``,
@@ -67,7 +72,7 @@ from .models import CommitKey
 VERSION = 1
 # Entries. Versions 1 and 2 are read, version 3 is written.
 ENTRY_VERSION = 3
-READABLE_ENTRY_VERSIONS = (1, 2, 3)
+READABLE_ENTRY_VERSIONS = (1, 2, 3, 4)
 
 BLOB_SUFFIX = ".tar.zst"
 PATCH_SUFFIX = ".bsdiff"
@@ -236,14 +241,24 @@ class Blob:
     def is_delta(self) -> bool:
         return self.delta is not None
 
-    def objects(self) -> list[StoredObject]:
+    def objects(self, version: int = 3) -> list[StoredObject]:
         """The files this blob needs, base first for a delta. Patches shared
         between blocks appear once."""
         if self.delta is None:
-            return [StoredObject(archive_name(self.id), self.sha256, self.bytes)]
+            return [
+                StoredObject(
+                    archive_name(self.sha256 if version >= 4 else self.id),
+                    self.sha256,
+                    self.bytes,
+                )
+            ]
         d = self.delta
         return [
-            StoredObject(archive_name(d.base_id), d.base_sha256, d.base_bytes),
+            StoredObject(
+                archive_name(d.base_sha256 if version >= 4 else d.base_id),
+                d.base_sha256,
+                d.base_bytes,
+            ),
             *(StoredObject(patch_name(s), s, n) for s, n in d.plan.patches().items()),
         ]
 
@@ -282,11 +297,13 @@ def _parse_blobs(raw, where: str) -> list[Blob]:
     return [Blob.from_json(item, where) for item in raw]
 
 
-def distinct_objects(blobs) -> dict[str, StoredObject]:
+def distinct_objects(blobs, version=3) -> dict[str, StoredObject]:
     """name -> object over every blob given, each object once."""
     out: dict[str, StoredObject] = {}
     for blob in blobs:
-        for obj in blob.objects():
+        for obj in blob.objects(version):
+            if obj.name in out and out[obj.name] != obj:
+                raise BusError(f"conflicting metadata for object {obj.name}")
             out.setdefault(obj.name, obj)
     return out
 
@@ -325,6 +342,8 @@ class Entry:
     built_at: int = 0
     build_secs: int = 0
     version: int = ENTRY_VERSION
+    owner_uuid: str = ""
+    publication_uuid: str = ""
 
     @property
     def key(self) -> CommitKey:
@@ -338,11 +357,11 @@ class Entry:
     def blob_bytes(self) -> int:
         """Bytes of the distinct stored objects this entry needs. A delta
         entry counts its base here: it is what a cold consumer fetches."""
-        return sum(o.bytes for o in distinct_objects(self.blobs).values())
+        return sum(o.bytes for o in distinct_objects(self.blobs, self.version).values())
 
     def objects(self) -> list[StoredObject]:
         """Every stored object this entry needs, each once, in blob order."""
-        return list(distinct_objects(self.blobs).values())
+        return list(distinct_objects(self.blobs, self.version).values())
 
     def to_json(self) -> str:
         data = asdict(self)
@@ -443,7 +462,7 @@ class BenchState:
     than only that they currently agree.
     """
 
-    KEY_FIELDS = ("cursor", "skipped_dropped")
+    KEY_FIELDS = ("cursor", "skipped_dropped", "skipped_upstream")
 
     bot: str | None = None
     cursor: CommitKey | None = None
@@ -458,6 +477,7 @@ class BenchState:
     # it. Its own record, because the builder's highest_dropped stops being
     # evidence the moment the cursor passes it.
     skipped_dropped: CommitKey | None = None
+    skipped_upstream: CommitKey | None = None
     # Carry the breaker across round-robin turns and daemon restarts.
     consecutive_failures: int = 0
     benching_paused_by_floor: bool = False
@@ -483,8 +503,26 @@ def state_to_json(state) -> str:
 class Bus:
     """A bus root on this machine."""
 
-    def __init__(self, root: Path):
-        self.root = Path(root).expanduser()
+    def __init__(self, root: Path, *, _raw=False):
+        self.root = Path(root).expanduser().resolve()
+        self._raw = _raw
+        identity_path = self.root / "identity.json"
+        if (
+            not _raw
+            and identity_path.exists()
+            and not (self.root / "ready.json").exists()
+        ):
+            if json.loads(identity_path.read_text()).get("initialized"):
+                raise BusError("initialized bus is missing its readiness marker")
+        self.format_version = 4 if (self.root / "ready.json").exists() else 3
+
+    @property
+    def protocol(self):
+        if self._raw or not (self.root / "ready.json").exists():
+            return None
+        from .bus_protocol import BusProtocol
+
+        return BusProtocol(self.root)
 
     # --- paths ---
 
@@ -553,6 +591,8 @@ class Bus:
 
     def keys(self, engine: str) -> list[CommitKey]:
         """Published keys, ascending. Ignores tmp files still being written."""
+        if protocol := self.protocol:
+            return protocol.keys(engine)
         try:
             names = os.listdir(self.topic_dir(engine))
         except FileNotFoundError:
@@ -574,6 +614,8 @@ class Bus:
 
     def read_entry(self, engine: str, key) -> Entry | None:
         """The entry, or None if retention dropped it between listing and now."""
+        if protocol := self.protocol:
+            return protocol.read_entry(engine, key)
         path = self.entry_path(engine, key)
         try:
             text = path.read_text()
@@ -598,6 +640,8 @@ class Bus:
         which is the harmless direction -- the sweep reclaims them, and the
         builder's retry of that commit finds them already stored.
         """
+        if protocol := self.protocol:
+            return protocol.publish(entry)
         _atomic_write(self.entry_path(entry.engine, entry.key), entry.to_json())
 
     def tmp_object(self, name: str) -> Path:
@@ -615,6 +659,10 @@ class Bus:
 
     def store_object(self, tmp: Path, name: str) -> Path:
         """Rename a complete, verified object into the store."""
+        if self.protocol:
+            raise BusError(
+                "migrated bus objects require a staging publication transaction"
+            )
         dest = self.object_path(name)
         dest.parent.mkdir(parents=True, exist_ok=True)
         os.replace(tmp, dest)
@@ -630,6 +678,8 @@ class Bus:
         return _read_state(self.builder_state_path(engine), BuilderState)
 
     def write_builder_state(self, engine: str, state: BuilderState) -> None:
+        if protocol := self.protocol:
+            return protocol.write_builder_state(engine, state)
         state.updated_at = time.time()
         _atomic_write(self.builder_state_path(engine), state_to_json(state))
 
@@ -637,6 +687,8 @@ class Bus:
         return _read_state(self.bench_state_path(engine), BenchState)
 
     def write_bench_state(self, engine: str, state: BenchState) -> None:
+        if protocol := self.protocol:
+            return protocol.write_bench_state(engine, state)
         state.updated_at = time.time()
         _atomic_write(self.bench_state_path(engine), state_to_json(state))
 
@@ -653,12 +705,14 @@ class Bus:
         These protections can exceed a budget smaller than the required blobs.
         The caller holds the machine lock, records drops and sweeps blobs.
         """
+        if protocol := self.protocol:
+            return protocol.prune(retain_bytes, keep)
         topics = {engine: self.entries(engine) for engine in self.engines()}
         refs: Counter[str] = Counter()
         sizes: dict[str, int] = {}
         for entries in topics.values():
             for entry in entries:
-                objects = distinct_objects(entry.blobs)
+                objects = distinct_objects(entry.blobs, entry.version)
                 refs.update(objects.keys())
                 sizes.update({name: obj.bytes for name, obj in objects.items()})
         used = sum(sizes.values())
@@ -685,14 +739,17 @@ class Bus:
         while used > retain_bytes and candidates:
             _, engine, index = heapq.heappop(candidates)
             entry = topics[engine][index]
-            self.entry_path(engine, entry.key).unlink(missing_ok=True)
+            self._delete_pruned(engine, entry.key)
             dropped.setdefault(engine, []).append(entry.key)
-            for name in distinct_objects(entry.blobs):
+            for name in distinct_objects(entry.blobs, entry.version):
                 refs[name] -= 1
                 if refs[name] == 0:
                     used -= sizes[name]
             offer(engine, index + 1)
         return dropped
+
+    def _delete_pruned(self, engine, key):
+        self.entry_path(engine, key).unlink(missing_ok=True)
 
     def lowest_retained(self, engine: str) -> CommitKey | None:
         keys = self.keys(engine)
@@ -731,6 +788,8 @@ class Bus:
         its manifest being written, or between being fetched and unpacked,
         is unreferenced too, and only the lock says nobody is in that window.
         """
+        if protocol := self.protocol:
+            return protocol.sweep_blobs()
         refs = self.referenced_objects()
         removed = []
         for path in sorted(self.blobs_dir.iterdir()) if self.blobs_dir.exists() else []:
@@ -749,6 +808,8 @@ class Bus:
         Returns what it removed. The caller holds the machine lock, so nothing
         here can be in use.
         """
+        if protocol := self.protocol:
+            return protocol.gc()
         removed = []
         # _atomic_write leaves these anywhere it is used, including under
         # state/, which nothing else looked at.
@@ -810,6 +871,8 @@ class Bus:
         reports it exactly as it did before. The caller holds the machine
         lock. Returns the keys rewritten.
         """
+        if self.protocol:
+            return []
         migrated = []
         legacy_root = self.root / "blobs" / "builds"
         for engine in self.engines():

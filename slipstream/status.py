@@ -53,6 +53,7 @@ class EngineStatus:
     bench_age: float | None = None
     bench_stalled_since: float | None = None
     bench_skipped_dropped: CommitKey | None = None
+    bench_skipped_upstream: CommitKey | None = None
     status_counts: dict = field(default_factory=dict)
     orphan_scores: int = 0
     provenance: dict = field(default_factory=dict)
@@ -61,6 +62,8 @@ class EngineStatus:
     blob_gb: float = 0.0
     roots_gb: float = 0.0
     error: str | None = None
+    transfer: dict = field(default_factory=dict)
+    peer_age: float | None = None
 
 
 @dataclass
@@ -158,6 +161,27 @@ def collect_status(
 
     for name in names:
         st = EngineStatus(engine=name)
+        if bus and bus.protocol:
+            from .bus_protocol import read
+
+            progress = bus.protocol.state_path("transfer", name)
+            peer = bus.protocol.state_path("peer-health", name)
+            try:
+                if progress.exists():
+                    st.transfer = read(progress)
+                    route = next((r for r in cfg.bus.routes if name in r.engines), None)
+                    if route:
+                        st.transfer["destination_label"] = (
+                            f"{route.destination.ssh_host or 'local'}:{route.destination.root}"
+                        )
+                        if route.source.is_local:
+                            st.transfer["backlog"] = len(
+                                bus.keys_above(name, st.transfer["cursor"])
+                            )
+                if peer.exists():
+                    st.peer_age = time.time() - read(peer)["fetched_at"]
+            except (OSError, BusError) as exc:
+                st.error = str(exc)
         st.status_counts = store.status_counts(name, cfg.platform)
         st.orphan_scores = len(store.commit_ids_missing_commit_row(name, cfg.platform))
         st.provenance = store.run_env_source_counts(name)
@@ -205,6 +229,7 @@ def _fill_bus_status(cfg, bus, store, source, name, st, mine):
     st.bench_in_flight = mine_state.in_flight
     st.bench_stalled_since = mine_state.stalled_since
     st.bench_skipped_dropped = mine_state.skipped_dropped
+    st.bench_skipped_upstream = mine_state.skipped_upstream
     st.bench_age = (
         time.time() - mine_state.updated_at if mine_state.updated_at else None
     )
@@ -258,6 +283,25 @@ def render(report: BusStatus, echo) -> None:
         echo(f"{st.engine} ({st.driven_by}{f' from {st.source}' if st.source else ''})")
         if st.error:
             echo(f"  error: {st.error}")
+        if st.bench_skipped_upstream:
+            echo(
+                f"  source retention prevented transfer through {st.bench_skipped_upstream}"
+            )
+        if st.transfer:
+            progress = st.transfer
+            acknowledged = (progress.get("acknowledged") or {}).get("key", "none")
+            echo(
+                f"  transfer to {progress.get('destination_label', progress['destination'])}: acknowledged {acknowledged}, backlog {progress.get('backlog', 'unknown')}"
+            )
+            echo(
+                f"  transfer skipped through {progress.get('highest_skipped') or 'none'}, pending {progress.get('pending') or 'none'}"
+            )
+            if progress.get("last_error"):
+                echo(f"  transfer error: {progress['last_error']}")
+        if st.peer_age is not None:
+            echo(
+                f"  peer snapshot fetched {int(st.peer_age)}s ago (source timestamps preserved)"
+            )
         if st.driven_by == "bus":
             echo(f"  frontier {st.frontier}, cursor {st.cursor}, lag {st.lag}")
             if st.builder_age is not None:

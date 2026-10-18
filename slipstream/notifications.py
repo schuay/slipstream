@@ -25,11 +25,21 @@ RETRY_SECS = 60.0
 class DirectorySubscription:
     """Read-only watches, including ancestors of topics that don't exist yet."""
 
-    def __init__(self, root: Path, engines: list[str], input_fd=None):
+    def __init__(self, root: Path, engines: list[str], input_fd=None, role="bench"):
         if not hasattr(select, "kqueue"):
             raise RuntimeError("build notifications require macOS/BSD kqueue")
         root = root.expanduser().absolute()
         self.topics = {name: root / "topics" / "builds" / name for name in engines}
+        kinds = (
+            ("retention", "builds", "bench")
+            if role == "transfer"
+            else ("retention", "upstream-loss")
+        )
+        self.state_files = {
+            name: [root / "state" / kind / f"{name}.json" for kind in kinds]
+            for name in engines
+        }
+        self.state_identities = self._state_identities()
         self.queue = select.kqueue()
         self.watches = {}  # path -> (fd, device, inode)
         self.input_fd = input_fd
@@ -51,11 +61,27 @@ class DirectorySubscription:
             self.close()
             raise
 
+    def _state_identities(self):
+        identities = {}
+        for name, paths in self.state_files.items():
+            values = []
+            for path in paths:
+                try:
+                    st = path.stat()
+                    values.append((st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size))
+                except FileNotFoundError:
+                    values.append(None)
+            identities[name] = values
+        return identities
+
     def _refresh(self):
         # Register parents first: creation racing a missing-child lookup leaves
         # an event on an already registered parent, so we will try again.
         paths = set()
-        for topic in self.topics.values():
+        for topic in [
+            *self.topics.values(),
+            *(p.parent for paths in self.state_files.values() for p in paths),
+        ]:
             paths.update(topic.parents)
             paths.add(topic)
         for path in sorted(paths, key=lambda p: len(p.parts)):
@@ -106,10 +132,13 @@ class DirectorySubscription:
         before = {name: self.watches.get(path) for name, path in self.topics.items()}
         changed_fds = {event.ident for event in events}
         self._refresh()
+        prior_state = self.state_identities
+        self.state_identities = self._state_identities()
         return {
             name
             for name, path in self.topics.items()
-            if before[name] != self.watches.get(path)
+            if prior_state[name] != self.state_identities[name]
+            or before[name] != self.watches.get(path)
             or (before[name] and before[name][0] in changed_fds)
         }
 
@@ -120,9 +149,9 @@ class DirectorySubscription:
         self.queue.close()
 
 
-def serve(root, engines, should_stop, output, input_fd=None):
+def serve(root, engines, should_stop, output, input_fd=None, role="bench"):
     """The SSH endpoint; no config, database or machine lock is needed."""
-    subscription = DirectorySubscription(Path(root), engines, input_fd)
+    subscription = DirectorySubscription(Path(root), engines, input_fd, role=role)
     try:
 
         def send(kind, names):
@@ -162,6 +191,8 @@ class WorkSchedule:
             for name in names:
                 self.generation[name] += 1
                 self.pending.add(name)
+                if getattr(self, "wake_on_change", False):
+                    self.deadlines.pop(name, None)
             self.condition.notify_all()
 
     def snapshot(self, name):
@@ -206,7 +237,8 @@ class WorkSchedule:
 class Subscriptions:
     """One reader per bus source; no reader touches consumer or lock state."""
 
-    def __init__(self, sources, schedule, log):
+    def __init__(self, sources, schedule, log, role="bench"):
+        self.role = role
         self.stop = threading.Event()
         self.threads = []
         self.schedule = schedule
@@ -237,7 +269,9 @@ class Subscriptions:
 
             try:
                 if source.is_local:
-                    subscription = DirectorySubscription(source.local_root, engines)
+                    subscription = DirectorySubscription(
+                        source.local_root, engines, role=self.role
+                    )
                     try:
                         receive(engines)
                         while not self.stop.is_set():
@@ -268,6 +302,8 @@ class Subscriptions:
             'export PATH="$PATH:$HOME/.local/bin"; '
             f"exec slipstream bus subscribe {quote_remote(source.root)}"
         )
+        if getattr(self, "role", "bench") == "transfer":
+            command += " --role transfer"
         for engine in engines:
             command += f" --engine {shlex.quote(engine)}"
         process = subprocess.Popen(

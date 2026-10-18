@@ -750,12 +750,85 @@ bus_app = typer.Typer(
 app.add_typer(bus_app)
 
 
+@bus_app.command("identity")
+def bus_identity(root: Annotated[Path, typer.Argument(help="Bus root")]):
+    """Create or print this bus's persistent UUID, before configuring owners."""
+    from .bus_protocol import BusProtocol
+
+    typer.echo(BusProtocol(root).bus_uuid())
+
+
+@bus_app.command("migrate")
+def bus_migrate(config: Optional[Path] = typer.Option(None, help="User config path")):
+    """Offline migration. Stop all builders, consumers and endpoint sessions first."""
+    from .bus_protocol import BusProtocol
+    from .durability import FileLock
+    from .lock import MachineLock
+
+    cfg = _load_config(config)
+    if cfg.bus is None or not cfg.bus.owners:
+        raise typer.BadParameter("migration requires [bus.owners]")
+    machine = MachineLock("bus migration")
+    machine.acquire(wait=False)
+    protocol = BusProtocol(cfg.bus.root)
+    try:
+        with FileLock(protocol.root / ".coordinator.lock", timeout=0):
+            migrated = protocol.migrate(cfg.bus.owners, cfg.bus.routes)
+    finally:
+        machine.release()
+    typer.echo(f"Migrated {len(migrated)} entries; bus {protocol.ready()['uuid']}")
+
+
+@bus_app.command("endpoint", hidden=True)
+def bus_endpoint(
+    root: Path,
+    retain_bytes: int = 400_000_000_000,
+    deadline: float = 3600,
+    inactivity: float = 120,
+    handshake: float = 30,
+):
+    """Serve one bounded transfer session; never takes the machine lock."""
+    import sys
+    from .transfer import serve
+
+    serve(
+        root,
+        sys.stdin.fileno(),
+        sys.stdout.fileno(),
+        retain_bytes,
+        deadline=deadline,
+        inactivity=inactivity,
+        handshake=handshake,
+    )
+
+
+@app.command("transfer")
+def transfer(config: Optional[Path] = typer.Option(None), once: bool = False):
+    """Transfer owned artifacts independently of building and benchmarking."""
+    from .transfer import Coordinator
+
+    cfg = _load_config(config)
+    if cfg.bus is None or not cfg.bus.routes:
+        raise typer.BadParameter("transfer requires [[bus.routes]]")
+    stopped = _shutdown_flag("transfer", log=lambda msg: typer.echo(msg, err=True))
+    try:
+        success = Coordinator(cfg, log=lambda msg: typer.echo(msg, err=True)).run(
+            once=once, should_stop=stopped
+        )
+    except (OSError, RuntimeError) as exc:
+        typer.echo(f"Transfer failed: {exc}", err=True)
+        raise typer.Exit(1)
+    if once and not success:
+        raise typer.Exit(1)
+
+
 @bus_app.command("subscribe")
 def bus_subscribe(
     root: Annotated[Path, typer.Argument(help="Bus root on this machine")],
     engine: Annotated[
         list[str], typer.Option("--engine", help="Engine to watch; repeatable")
     ],
+    role: str = "bench",
 ):
     """Stream build-directory changes as JSON lines (macOS/BSD)."""
     import sys
@@ -768,7 +841,7 @@ def bus_subscribe(
         "subscription", log=lambda msg: typer.echo(msg, err=True)
     )
     try:
-        serve(root, engine, should_stop, sys.stdout, sys.stdin.fileno())
+        serve(root, engine, should_stop, sys.stdout, sys.stdin.fileno(), role=role)
     except EOFError:
         pass
     except BrokenPipeError:

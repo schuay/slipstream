@@ -46,8 +46,8 @@ per engine with its `src_dir`, a `[benchmarks.*]` table per suite with its
 is closed -- an unknown key is a startup error, not a comment -- so the template
 is the reference for what can be set.
 
-For upgrades, stop all running `build`, `watch`, and `deliver` processes before
-`uv tool install --force .`, then restart all three. A running process keeps
+For upgrades, stop all running `build`, `watch`, `transfer`, and `deliver` processes before
+`uv tool install --force .`, then restart them. A running process keeps
 its loaded code after reinstalling; leaving an old daemon running across a
 schema migration can cause incompatible writes and retained SQLite locks.
 
@@ -60,6 +60,11 @@ use the pointer-authentication ABI and JIT paths used by Safari on Apple Silicon
 Results keep the host architecture label `arm64` and the existing series. The
 build command and archived set are in `slipstream/data/engines.toml` and can be
 overridden per engine in `config.toml`.
+
+## Independent artifact transfer
+
+`slipstream transfer` supports building on either machine while both benchmark
+local artifacts. It requires a coordinated offline bus migration.
 
 ## Measuring
 
