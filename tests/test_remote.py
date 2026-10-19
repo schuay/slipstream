@@ -315,8 +315,6 @@ def test_a_remote_source_drives_the_consumer(config, tmp_path, monkeypatch, remo
         bus_source,
         "v8",
         lambda: False,
-        lambda: collector.lock.try_acquire(),
-        collector.lock.release,
     )
     assert result.benched == 1 and result.error is None
     assert (roots[0] / "out" / "d8").read_bytes() == b"binary"

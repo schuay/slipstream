@@ -59,18 +59,26 @@ class Admission:
             yield
             return
         try:
+            cancellation = None
 
             def cancelled():
-                return should_stop() or not self.decision().allowed
+                nonlocal cancellation
+                try:
+                    self.check(should_stop)
+                except AdmissionStopped as exc:
+                    cancellation = exc
+                    return True
+                return False
 
             if not self.machine.acquire(
                 cancelled, wait=self.wait, log=self.log, job=job
             ):
+                if cancellation is not None:
+                    raise cancellation
                 self.check(should_stop)
                 raise AdmissionStopped(StopReason.SHUTDOWN, "lock wait cancelled")
-            self.check(
-                should_stop
-            )  # Final race boundary; never checked during the commit.
+            # Final race boundary; never checked during the commit.
+            self.check(should_stop)
             yield
         finally:
             self.machine.release()

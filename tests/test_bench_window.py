@@ -169,3 +169,10 @@ def test_next_change_is_permission_change_even_when_override_expiry_is_not():
     override = Override("close", now, now + timedelta(hours=12))
     result = evaluate("Europe/Berlin", ["22:00-06:00"], override, now)
     assert result.next_change == at("2026-10-20T20:00Z")
+
+
+def test_unreadable_state_blocks_admission(tmp_path):
+    path = tmp_path / "bench-window.json"
+    path.mkdir()  # A directory is not a readable override document.
+    result = evaluate(None, None, read_override(path), datetime.now(UTC))
+    assert not result.allowed and result.error

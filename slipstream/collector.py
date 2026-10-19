@@ -867,8 +867,8 @@ class BenchCollector:
     ):
         """Benchmark commits in (start_id, end_id].
 
-        Returns the count and an explicit stop reason. ``max_commits`` bounds attempts per turn
-        so watch can hand the next lock acquisition to another engine.
+        Returns the count and an explicit stop reason. ``max_commits`` bounds
+        attempts per turn so watch can hand the next lock acquisition to another engine.
 
         ``should_stop`` lets a shutdown request reach the per-commit path,
         where the wait for the machine lock can otherwise last hours. It

@@ -896,7 +896,14 @@ def test_watch_has_no_delivery_side_effects(config, store, monkeypatch):
     config.engines["v8"] = EngineConfig("v8", None, "", "", "")
     monkeypatch.setattr("slipstream.cli._load_config", lambda path: config)
     monkeypatch.setattr("slipstream.cli._host_preflight", lambda cfg: None)
-    collector = SimpleNamespace(store=store, find_frontier=lambda name: (1, 1))
+    from slipstream.admission import Admission
+    from slipstream.lock import MachineLock
+
+    collector = SimpleNamespace(
+        store=store,
+        find_frontier=lambda name: (1, 1),
+        admission=lambda: Admission(config.bench, MachineLock("watch")),
+    )
     monkeypatch.setattr("slipstream.cli._open_collector", lambda *a, **kw: collector)
     monkeypatch.setattr(
         "slipstream.delivery_targets.open_session",
@@ -978,7 +985,9 @@ def _score_dict():
     }
 
 
-def test_embedded_key_is_discovered_delivered_and_acknowledged_as_a_pair(tmp_path, store):
+def test_embedded_key_is_discovered_delivered_and_acknowledged_as_a_pair(
+    tmp_path, store
+):
     key = _seed_embedded(store)
     _seed(store, [1])  # a v8 key on the same box, embedder 0
     chrome, v8 = local(store, "chrome"), local(store)
@@ -1080,7 +1089,7 @@ def test_spool_csv_requires_the_embedder_pair_to_agree(tmp_path):
 def test_old_spool_header_without_the_pair_is_refused(tmp_path):
     text = _csv({})
     lines = text.splitlines()
-    text = "\n".join(",".join(l.split(",")[:-2]) for l in lines) + "\n"
+    text = "\n".join(",".join(line.split(",")[:-2]) for line in lines) + "\n"
     source = remote(tmp_path, "remote", {1: text})
     c = coordinator(tmp_path, [source])
     assert cycle(c) == 0

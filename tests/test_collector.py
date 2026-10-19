@@ -1006,7 +1006,9 @@ class TestAMidRunFailureExportsNothing:
         )
 
 
-class TestWindowClear(TestMachineLockInCollect):
+class TestWindowClear:
+    _collector = TestMachineLockInCollect._collector
+
     def test_deferred_clear_preserves_scores_and_results(
         self, config, tmp_path, monkeypatch
     ):
@@ -1015,6 +1017,22 @@ class TestWindowClear(TestMachineLockInCollect):
 
         collector = self._collector(config, tmp_path, monkeypatch)
         collector.store.mark_done("v8", config.platform, 100)
+        collector.store.insert_scores(
+            "v8",
+            config.platform,
+            100,
+            0,
+            [
+                {
+                    "suite": "js3",
+                    "flags": "default",
+                    "benchmark": "test-bench",
+                    "metric": "Total-Score",
+                    "run": 1,
+                    "score": 42.0,
+                }
+            ],
+        )
         output = config.commit_results_dir("v8", K1(100))
         output.mkdir(parents=True)
         (output / "result").write_text("keep me")
@@ -1023,6 +1041,10 @@ class TestWindowClear(TestMachineLockInCollect):
         assert result.reason == StopReason.DEFERRED and result.benched == 0
         assert collector.store.is_done("v8", config.platform, 100)
         assert (output / "result").read_text() == "keep me"
+        series = collector.store.get_series(
+            "v8", "js3", "default", "test-bench", "Total-Score"
+        )
+        assert [row["score"] for row in series] == [42.0]
         assert not collector.lock.path.exists()
 
     def test_clear_is_limited_to_admitted_commit(self, config, tmp_path, monkeypatch):

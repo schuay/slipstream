@@ -79,23 +79,40 @@ def test_queued_close_withdraws_ticket_and_does_not_block_builder(
             errors.append(exc)
 
     thread = threading.Thread(target=wait_bench)
+    builder_done = threading.Event()
+    cancel_builder = threading.Event()
+
+    def wait_builder():
+        try:
+            if builder.acquire(cancel_builder.is_set, wait=True):
+                builder_done.set()
+        finally:
+            builder.release()
+
+    successor = threading.Thread(target=wait_builder)
     thread.start()
     try:
         deadline = time.monotonic() + 2
         while len(holder.waiters()) < 1 and time.monotonic() < deadline:
             time.sleep(0.005)
         assert len(holder.waiters()) == 1
+        successor.start()
+        while len(holder.waiters()) < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert len(holder.waiters()) == 2
         write_override("close")
         thread.join(2)
         assert not thread.is_alive()
         assert reasons == [StopReason.DEFERRED] and not errors
-        assert holder.waiters() == []
+        assert [w.role for w in holder.waiters()] == ["build"]
+        holder.release()
+        assert builder_done.wait(2), "cancelled bencher blocked its FIFO successor"
     finally:
         holder.release()
+        cancel_builder.set()
         thread.join(2)
-    # The abandoned kernel wait must not retain the bencher's queue ticket.
-    assert builder.acquire(wait=True)
-    builder.release()
+        if successor.ident is not None:
+            successor.join(2)
 
 
 def test_predicate_exception_releases_ticket_and_abandoned_fd(tmp_path, monkeypatch):
@@ -131,3 +148,19 @@ def test_exception_inside_commit_releases(tmp_path):
         with Admission(BenchProcessConfig(), machine).commit("v8 123"):
             raise RuntimeError("provisioning")
     assert not machine.held
+
+
+def test_cancel_reason_survives_immediate_reopening(tmp_path, monkeypatch):
+    machine = MachineLock("watch", tmp_path / "machine.lock")
+
+    def acquire(cancelled, **kwargs):
+        write_override("close")
+        assert cancelled()
+        write_override(None)
+        return False
+
+    monkeypatch.setattr(machine, "acquire", acquire)
+    with pytest.raises(AdmissionStopped) as stopped:
+        with Admission(BenchProcessConfig(), machine, wait=True).commit("v8 123"):
+            pytest.fail("cancelled work admitted")
+    assert stopped.value.reason == StopReason.DEFERRED

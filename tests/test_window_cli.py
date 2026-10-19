@@ -244,3 +244,41 @@ def test_partial_bounded_deferral_retains_completed_work(
         assert not with_store.is_done("v8", config.platform, 101)
     finally:
         with_store.close()
+
+
+def test_concurrent_cli_mutations_are_serialized(window_config, tmp_path):
+    import subprocess
+    import sys
+
+    from slipstream.bench_window import Override
+
+    locks = tmp_path / "concurrent-locks"
+    script = """
+import sys
+from pathlib import Path
+from typer.testing import CliRunner
+from slipstream import cli, lock
+lock.LOCKS_DIR = Path(sys.argv[1])
+lock.MACHINE_LOCK = lock.LOCKS_DIR / 'machine.lock'
+lock.PAUSE_FILE = lock.LOCKS_DIR / 'pause'
+result = CliRunner().invoke(cli.app, ['window', *sys.argv[3:], '--config', sys.argv[2]])
+assert result.exit_code == 0, (result.output, result.exception)
+"""
+    commands = [["open", "--for", "1h"], ["close", "--for", "2h"], ["reset"], ["close"]]
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(locks), str(window_config), *args]
+        )
+        for args in commands
+    ]
+    try:
+        assert [process.wait(timeout=10) for process in processes] == [0] * 4
+        assert isinstance(
+            bench_window.read_override(locks / "bench-window.json"),
+            (Override, type(None)),
+        )
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
