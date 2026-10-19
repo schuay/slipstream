@@ -29,6 +29,7 @@ def isolated_machine_lock(tmp_path_factory, monkeypatch):
     """
     locks = tmp_path_factory.mktemp("locks")
     monkeypatch.setenv("XDG_CACHE_HOME", str(locks))
+    monkeypatch.setattr(lock_mod, "LOCKS_DIR", locks)
     monkeypatch.setattr(lock_mod, "MACHINE_LOCK", locks / "machine.lock")
     monkeypatch.setattr(lock_mod, "PAUSE_FILE", locks / "pause")
     monkeypatch.setattr(lock_mod, "own_process_group", lambda: None)

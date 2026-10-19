@@ -352,6 +352,8 @@ class BuildConfig:
 class BenchProcessConfig:
     """Limits on the bencher, per role rather than per source."""
 
+    timezone: str | None = None
+    allowed_windows: list[str] | None = None
     min_free_gb: float = 100.0
     run_roots: int = 2  # unpacked roots kept per engine
     # Consecutive commits that produced no scores at all before the consumer
@@ -1136,10 +1138,21 @@ def _parse_delta(data: dict) -> DeltaConfig:
 def _parse_bench(data: dict) -> BenchProcessConfig:
     _reject_unknown(
         data,
-        ("min_free_gb", "run_roots", "max_consecutive_failures"),
+        (
+            "min_free_gb",
+            "run_roots",
+            "max_consecutive_failures",
+            "timezone",
+            "allowed_windows",
+        ),
         "[bench]",
     )
+    from .bench_window import validate
+
+    validate(data.get("timezone"), data.get("allowed_windows"))
     return BenchProcessConfig(
+        timezone=data.get("timezone"),
+        allowed_windows=data.get("allowed_windows"),
         min_free_gb=_positive(data, "min_free_gb", 100.0, "[bench]"),
         run_roots=int(_positive(data, "run_roots", 2, "[bench]")),
         max_consecutive_failures=int(
