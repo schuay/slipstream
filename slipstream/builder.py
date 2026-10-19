@@ -481,8 +481,9 @@ class Builder:
         """The highest key this builder has finished with.
 
         Published entries and terminal build failures both count, so a compile
-        failure at the head is not rebuilt every cycle. [build] from is
-        consulted only when there is neither, so a restart cannot rewind.
+        failure at the head is not rebuilt every cycle. [build] from is an
+        exclusive lower bound: a cutover can advance past older local history,
+        but lowering the bound cannot rewind completed work.
 
         A derived engine with no history starts at the bottom: its candidates
         are the inner entries on this bus that carry the full run set, a
@@ -492,13 +493,13 @@ class Builder:
         keys = self.bus.keys(engine_name)
         published = keys[-1] if keys else None
         failed = self.store.max_terminal_build_key(engine_name)
-        candidates = [c for c in (published, failed) if c is not None]
+        start = self.cfg.build.start_from.get(engine_name)
+        candidates = [c for c in (published, failed, start) if c is not None]
         if candidates:
             return max(candidates)
-        start = self.cfg.build.start_from.get(engine_name)
-        if start is None and self.cfg.engines[engine_name].derives:
+        if self.cfg.engines[engine_name].derives:
             return CommitKey(0, 0)
-        return start
+        return None
 
     def consecutive_burns(self, engine_name: str) -> int:
         """Infrastructure burns with no successful publish between them.
@@ -508,7 +509,9 @@ class Builder:
         unrelated outages months apart and stall a healthy engine.
         """
         keys = self.bus.keys(engine_name)
-        floor = keys[-1] if keys else self.cfg.build.start_from.get(engine_name)
+        start = self.cfg.build.start_from.get(engine_name)
+        floors = [key for key in (keys[-1] if keys else None, start) if key is not None]
+        floor = max(floors) if floors else None
         if floor is None:
             # Nothing published and nowhere told to start: there is no history
             # to be consecutive with, and build_failures with no bound would

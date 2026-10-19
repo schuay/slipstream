@@ -342,8 +342,8 @@ class BuildConfig:
     # 0 holds it until the known work is built: a roll's commits share a warm
     # build cache, and a bench-only peer box is waiting on the bus for them.
     batch: int = 0
-    # Only consulted when an engine has neither published entries nor terminal
-    # build failures, so a restart cannot rewind the frontier.
+    # Exclusive lower bounds for automatic builds, including with older local
+    # history. Published entries and terminal failures can advance them further.
     start_from: dict[str, CommitKey] = field(default_factory=dict)
     delta: DeltaConfig = field(default_factory=DeltaConfig)
 

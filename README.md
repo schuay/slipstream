@@ -61,6 +61,12 @@ Results keep the host architecture label `arm64` and the existing series. The
 build command and archived set are in `slipstream/data/engines.toml` and can be
 overridden per engine in `config.toml`.
 
+`[build.from]` sets an exclusive lower bound per engine, including when older
+local build history exists. Automatic builds start above the newest of that
+bound, published builds, and terminal build failures. Lowering the bound does
+not rewind completed work; explicit `build --retry ENGINE=KEY` requests can
+still select historical failures below it.
+
 ## Independent artifact transfer
 
 `slipstream transfer` supports building on either machine while both benchmark

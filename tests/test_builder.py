@@ -358,13 +358,31 @@ def _payload(seed: int, edits: int = 0) -> bytes:
 
 
 class TestFrontier:
-    def test_from_is_only_consulted_when_there_is_no_state(self, builder):
+    def test_lowering_from_cannot_rewind_published_work(self, builder):
         assert builder.frontier("v8") == K1(100)
         builder.build_one("v8")
         assert builder.frontier("v8") == K1(101)
         # A restart must not rewind past what was published.
         builder.cfg.build.start_from = {"v8": K1(50)}
         assert builder.frontier("v8") == K1(101)
+
+    @pytest.mark.parametrize("failure", [False, True])
+    def test_cutover_advances_past_existing_history(self, builder, failure):
+        if failure:
+            builder.failures = [BuildStepError("compile", 1)]
+        builder.build_one("v8")  # 101 is published or terminal.
+        builder.cfg.build.start_from["v8"] = K1(103)
+        assert builder.frontier("v8") == K1(103)
+        assert builder.next_job("v8").key == K1(104)
+        assert builder.build_one("v8").key == K1(104)
+        assert builder.built == [("hash101", {}), ("hash104", {})]
+
+    def test_explicit_retry_can_cross_cutover_bound(self, builder):
+        builder.failures = [BuildStepError("compile", 1)]
+        builder.build_one("v8")
+        builder.cfg.build.start_from["v8"] = K1(103)
+        assert builder.store.request_build_retry("v8", 101)
+        assert builder.next_job("v8").key == K1(101)
 
     def test_a_terminal_failure_advances_it(self, builder):
         """Otherwise a compile failure at the head is rebuilt every cycle."""
@@ -572,6 +590,16 @@ class TestCircuitBreaker:
         for _ in range(count):
             builder.failures = [BuildStepError("sync", 1)]
             builder.build_one("v8")
+
+    @pytest.mark.parametrize("published", [False, True])
+    def test_cutover_excludes_old_infrastructure_burns(self, builder, published):
+        if published:
+            builder.build_one("v8")
+        self._burn(builder, 2)
+        assert builder.consecutive_burns("v8") == 2
+        builder.cfg.build.start_from["v8"] = K1(103)
+        assert builder.consecutive_burns("v8") == 0
+        assert builder.build_one("v8").key == K1(104)
 
     def test_stalls_after_consecutive_burns(self, builder):
         """Three commits failing sync in a row is the machine, not the tree."""
