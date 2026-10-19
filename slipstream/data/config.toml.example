@@ -220,6 +220,12 @@ suite = "js3"
 # delta_workers = 0                  # bsdiff processes; 0 = one per core, capped
 #
 # [bench]
+# timezone = "Europe/Berlin"         # required when allowed_windows is set
+# allowed_windows = ["22:00-06:00"]  # union of daily local windows; [] = closed
+#                                    # omitted = unrestricted; restart watch
+#                                    # after changes. An admitted commit finishes.
+# Live override: window open --for 6h, window close [--for 2h], window reset
+# Overrides are shared by every local-user config; bus pause is independent.
 # min_free_gb = 100                  # a payload plus its unpacked root at once
 # run_roots = 2                      # unpacked roots kept per engine
 # max_consecutive_failures = 3       # commits with no scores before it stalls

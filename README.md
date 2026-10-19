@@ -91,6 +91,54 @@ stall deadline. `--once` performs one bounded scan/drain without subscribing.
 Notifications wake discovery immediately; local benchmarking still waits for
 the builder's configured batch and the existing machine lock.
 
+Daily benchmark admission is optional. Configure each bencher with an explicit
+IANA timezone and a union of local daily windows:
+
+```toml
+[bench]
+timezone = "Europe/Berlin"
+allowed_windows = ["22:00-06:00"]
+```
+
+Starts are inclusive and ends exclusive; overnight windows cross midnight.
+Omitting `allowed_windows` permits benchmarking at any time; `[]` permits none
+until an override opens admission. DST follows the local clock, including both
+occurrences of a repeated time. Restart affected watches after changing TOML.
+Every bencher must use the intended policy; schedules are per config.
+
+```sh
+slipstream window close               # until reset or replaced
+slipstream window close --for 2h
+slipstream window open --for 6h        # duration required; does not start watch
+slipstream window reset               # return to the configured schedule
+slipstream window status --config /path/to/config.toml
+```
+
+The single override applies to all configs/out_dirs for this local user. It is
+stored durably in `~/.cache/slipstream/locks/bench-window.json`; a new override
+replaces the old one, and expiry returns to the schedule. Durations are elapsed
+time, stored as UTC expiry instants. A corrupt/unreadable override closes
+admission and is reported until repaired with `window reset`.
+
+Closing prevents the next engine commit. An admitted commit finishes its build
+or unpacking, all rounds, cooldown and teardown under the machine lock, so it
+can overrun the window end. Queued benchmark requests withdraw when admission
+closes. `watch` keeps subscriptions alive while closed and rescans on reopening,
+including when no new artifact arrived. `bench` and `watch --once` return exit
+75 if work is deferred, preserving any completed commits. `--dry-run` reports
+the policy without executing; `bench --clear` clears only admitted commits.
+
+`window status` and `bus status` identify the selected config and distinguish
+benchmarking permitted, finishing a current commit, and normal use permitted
+while admission is closed. Actual activity comes from the machine lock;
+unknown ownership is reported as unknown. Watches retain their startup
+configuration until restarted, so the configured-policy summary assumes all
+benchers use that policy. `bus pause` remains an independent daemon blocker;
+opening a window does not resume a pause. Ad-hoc `bench` still bypasses that
+pause but respects windows. Builds, transfer, delivery and artifact retention
+continue outside benchmark windows. Ensure bus capacity covers the backlog;
+retention can drop builds before a closed bencher reads them.
+
 `[build] retain_gb` is one global cap on published artifacts across every engine
 in the local bus (default 400 GB, decimal). Retention runs before the free-space
 check and after each publish, removing the oldest eligible builds by build time

@@ -170,6 +170,8 @@ def render_window(report, echo):
             if next_time
             else "until reset or replaced"
             if decision.reason == "forced close"
+            and isinstance(report.override, bench_window.Override)
+            and report.override.expires_at is None
             else "(no scheduled opening)"
         )
     echo(f"{summary} — for {report.config}")

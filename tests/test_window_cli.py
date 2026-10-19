@@ -282,3 +282,10 @@ assert result.exit_code == 0, (result.output, result.exception)
             if process.poll() is None:
                 process.kill()
                 process.wait()
+
+
+def test_timed_close_on_empty_schedule_does_not_claim_reset_will_open(window_config):
+    result = invoke(window_config, "window", "close", "--for", "2h")
+    assert result.exit_code == 0, result.output
+    assert "Normal use permitted (no scheduled opening)" in result.output
+    assert "expires 20" in result.output
