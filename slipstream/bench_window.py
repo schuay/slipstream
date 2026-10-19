@@ -192,11 +192,11 @@ def write_override(
     ):
         raise ValueError("override duration must be positive and finite")
     path = path or override_path()
-    now = (now or datetime.now(UTC)).astimezone(UTC)
     with FileLock(path.with_suffix(".lock")):
         if mode is None:
             durable_unlink(path)
             return None
+        now = (now or datetime.now(UTC)).astimezone(UTC)
         expiry = now + timedelta(seconds=seconds) if seconds is not None else None
         atomic_write(
             path,

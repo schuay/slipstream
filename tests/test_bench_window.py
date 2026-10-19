@@ -176,3 +176,39 @@ def test_unreadable_state_blocks_admission(tmp_path):
     path.mkdir()  # A directory is not a readable override document.
     result = evaluate(None, None, read_override(path), datetime.now(UTC))
     assert not result.allowed and result.error
+
+
+@pytest.mark.parametrize("mode", ["open", "close"])
+@pytest.mark.parametrize("injected", [False, True])
+def test_override_duration_starts_after_mutation_lock(
+    mode, injected, tmp_path, monkeypatch
+):
+    import slipstream.bench_window as mod
+
+    before = at("2026-10-19T12:00Z")
+    after = before + timedelta(seconds=30)
+    clock = [before]
+
+    class Clock:
+        @staticmethod
+        def now(zone):
+            return clock[0]
+
+    class ContendedLock:
+        def __init__(self, path):
+            pass
+
+        def __enter__(self):
+            clock[0] = after
+
+        def __exit__(self, *args):
+            pass
+
+    monkeypatch.setattr(mod, "datetime", Clock)
+    monkeypatch.setattr(mod, "FileLock", ContendedLock)
+    result = write_override(
+        mode, 1, path=tmp_path / "state.json", now=before if injected else None
+    )
+    expected = before if injected else after
+    assert result.written_at == expected
+    assert result.expires_at == expected + timedelta(seconds=1)

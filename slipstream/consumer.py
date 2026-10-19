@@ -457,159 +457,164 @@ class BusConsumer:
         state.benching_paused_by_floor = False
         state.last_error = None
         benched = 0
-        # Before the floor check below, not only inside provision: a kill
-        # mid-unpack leaves a multi-GB directory, and if that is what filled
-        # the disk then the sweep that removes it would never be reached.
-        if (self.bus.root / "roots" / engine_name).exists():
-            with admission.commit(
-                f"maintenance: trim {engine_name} roots", should_stop
-            ):
-                self._trim_run_roots(engine_name)
-        self._note_dropped_entries(handle, engine_name, state, cursor)
-        # While stalled, one commit per window: a machine problem then costs a
-        # commit per backoff instead of the whole backlog in one pass.
-        limit = self.cfg.bench.max_consecutive_failures
-        consecutive_failures = limit - 1 if stalled else state.consecutive_failures
-        budget = MAX_BENCHES_PER_CYCLE
-        if max_benches is not None:
-            budget = min(budget, max_benches)
-        while not should_stop() and benched < budget:
-            admission.check(should_stop)
-            try:
-                batch = handle.keys_above(engine_name, cursor)
-            except TRANSPORT_ERRORS as e:
-                # Listing failed, so there is nothing to skip past. Leave the
-                # cursor and try again next cycle.
-                state.last_error = f"listing {source.name}: {e}"
-                self.log(f"{engine_name}: {state.last_error}")
-                break
-            if not batch:
-                # Nothing above the cursor and nothing went wrong this cycle.
-                # The per-entry success path is the only other place these are
-                # cleared, and it is unreachable from here, so a stall fixed
-                # while the topic was idle would be reported forever with no
-                # error line beside it.
-                if state.last_error is None:
-                    state.stalled_since = None
-                    state.stall_retry_after = None
-                break
-            key, cursor = self._skip_done(
-                source, engine_name, batch, cursor, should_stop
-            )
-            if key is None:
-                # The whole batch was already benched. Re-list rather than
-                # stopping: entries published while we skipped are still ours.
-                continue
-            try:
-                entry = handle.read_entry(engine_name, key)
-            except TRANSPORT_ERRORS as e:
-                # Only a source that says "not there" advances the cursor; a
-                # source that could not answer must not, or an outage would
-                # silently skip unbenched commits.
-                state.last_error = f"reading entry {key}: {e}"
-                self.log(f"{engine_name}: {state.last_error}")
-                break
-            if entry is None:
-                # Retention dropped it, which is not an error but is a hole in
-                # this machine's series. Persist a high-water mark: the
-                # builder's highest_dropped signal self-erases as soon as the
-                # cursor passes it, so nothing else would report this after the
-                # next successful bench.
-                self.log(
-                    f"{engine_name}: entry {key} was dropped by retention "
-                    f"before this machine benched it"
+        stop_reason = StopReason.COMPLETE
+        try:
+            # Before the floor check below, not only inside provision: a kill
+            # mid-unpack leaves a multi-GB directory, and if that is what filled
+            # the disk then the sweep that removes it would never be reached.
+            if (self.bus.root / "roots" / engine_name).exists():
+                with admission.commit(
+                    f"maintenance: trim {engine_name} roots", should_stop
+                ):
+                    self._trim_run_roots(engine_name)
+            self._note_dropped_entries(handle, engine_name, state, cursor)
+            # While stalled, one commit per window: a machine problem then costs a
+            # commit per backoff instead of the whole backlog in one pass.
+            limit = self.cfg.bench.max_consecutive_failures
+            consecutive_failures = limit - 1 if stalled else state.consecutive_failures
+            budget = MAX_BENCHES_PER_CYCLE
+            if max_benches is not None:
+                budget = min(budget, max_benches)
+            while not should_stop() and benched < budget:
+                admission.check(should_stop)
+                try:
+                    batch = handle.keys_above(engine_name, cursor)
+                except TRANSPORT_ERRORS as e:
+                    # Listing failed, so there is nothing to skip past. Leave the
+                    # cursor and try again next cycle.
+                    state.last_error = f"listing {source.name}: {e}"
+                    self.log(f"{engine_name}: {state.last_error}")
+                    break
+                if not batch:
+                    # Nothing above the cursor and nothing went wrong this cycle.
+                    # The per-entry success path is the only other place these are
+                    # cleared, and it is unreachable from here, so a stall fixed
+                    # while the topic was idle would be reported forever with no
+                    # error line beside it.
+                    if state.last_error is None:
+                        state.stalled_since = None
+                        state.stall_retry_after = None
+                    break
+                key, cursor = self._skip_done(
+                    source, engine_name, batch, cursor, should_stop
                 )
-                state.skipped_dropped = _max_key(state.skipped_dropped, key)
+                if key is None:
+                    # The whole batch was already benched. Re-list rather than
+                    # stopping: entries published while we skipped are still ours.
+                    continue
+                try:
+                    entry = handle.read_entry(engine_name, key)
+                except TRANSPORT_ERRORS as e:
+                    # Only a source that says "not there" advances the cursor; a
+                    # source that could not answer must not, or an outage would
+                    # silently skip unbenched commits.
+                    state.last_error = f"reading entry {key}: {e}"
+                    self.log(f"{engine_name}: {state.last_error}")
+                    break
+                if entry is None:
+                    # Retention dropped it, which is not an error but is a hole in
+                    # this machine's series. Persist a high-water mark: the
+                    # builder's highest_dropped signal self-erases as soon as the
+                    # cursor passes it, so nothing else would report this after the
+                    # next successful bench.
+                    self.log(
+                        f"{engine_name}: entry {key} was dropped by retention "
+                        f"before this machine benched it"
+                    )
+                    state.skipped_dropped = _max_key(state.skipped_dropped, key)
+                    cursor = key
+                    self.set_cursor(source, engine_name, cursor)
+                    continue
+                if self.free_gb() < self.cfg.bench.min_free_gb:
+                    state.benching_paused_by_floor = True
+                    state.last_error = f"only {self.free_gb():.0f}GB free"
+                    self.log(f"{engine_name}: paused, {self.free_gb():.0f}GB free")
+                    break
+                try:
+                    with admission.commit(f"{engine_name} {key}", should_stop):
+                        # Re-read after the wait: admission can block for hours behind
+                        # a builder on a box that does both, and retention may have
+                        # dropped the entry meanwhile. Without this the payload is
+                        # simply missing, which the consumer is right to treat as a
+                        # real error -- but here it is ordinary retention.
+                        fresh = handle.read_entry(engine_name, key)
+                        if fresh is None:
+                            self.log(
+                                f"{engine_name}: entry {key} was dropped by "
+                                f"retention while waiting for the machine"
+                            )
+                            state.skipped_dropped = _max_key(state.skipped_dropped, key)
+                            cursor = key
+                            self.set_cursor(source, engine_name, cursor)
+                            continue
+                        entry = fresh
+                        state.in_flight = {
+                            "commit_id": key.commit_id,
+                            "embedder_id": key.embedder_id,
+                            "phase": "bench",
+                            "started_at": time.time(),
+                        }
+                        # Written before provisioning, so the sweep inside it counts
+                        # these as held and reclaims the previous entry's instead.
+                        state.blobs = [o.name for o in entry.objects()]
+                        # Inside the try: it writes to the filesystem this path is
+                        # about running out of, and escaping here would leave the
+                        # machine lock held and kill the daemon.
+                        self._publish_state(engine_name, state, cursor, handle)
+                        # The queue depth is the batch this cycle listed, so it does
+                        # not count entries published since; the hash is what matches
+                        # the run against a build without opening the state file.
+                        queued = (
+                            len(batch)
+                            if cursor is None
+                            else sum(1 for k in batch if k > cursor)
+                        )
+                        self.log(
+                            f"{engine_name}: benching {key} ({entry.hash[:8]}), "
+                            f"{queued} above the cursor"
+                        )
+                        outcome = self.bench_entry(handle, engine, entry)
+                except TRANSPORT_ERRORS as e:
+                    state.last_error = str(e)
+                    state.in_flight = None
+                    self.log(f"{engine_name}: {e}")
+                    break
+                state.in_flight = None
+                benched += 1
+                self._benched = benched
+                # After the commit is recorded, so a crash between the two
+                # re-benches one commit, which is_done absorbs.
                 cursor = key
                 self.set_cursor(source, engine_name, cursor)
-                continue
-            if self.free_gb() < self.cfg.bench.min_free_gb:
-                state.benching_paused_by_floor = True
-                state.last_error = f"only {self.free_gb():.0f}GB free"
-                self.log(f"{engine_name}: paused, {self.free_gb():.0f}GB free")
-                break
-            try:
-                with admission.commit(f"{engine_name} {key}", should_stop):
-                    # Re-read after the wait: admission can block for hours behind
-                    # a builder on a box that does both, and retention may have
-                    # dropped the entry meanwhile. Without this the payload is
-                    # simply missing, which the consumer is right to treat as a
-                    # real error -- but here it is ordinary retention.
-                    fresh = handle.read_entry(engine_name, key)
-                    if fresh is None:
-                        self.log(
-                            f"{engine_name}: entry {key} was dropped by "
-                            f"retention while waiting for the machine"
-                        )
-                        state.skipped_dropped = _max_key(state.skipped_dropped, key)
-                        cursor = key
-                        self.set_cursor(source, engine_name, cursor)
-                        continue
-                    entry = fresh
-                    state.in_flight = {
-                        "commit_id": key.commit_id,
-                        "embedder_id": key.embedder_id,
-                        "phase": "bench",
-                        "started_at": time.time(),
-                    }
-                    # Written before provisioning, so the sweep inside it counts
-                    # these as held and reclaims the previous entry's instead.
-                    state.blobs = [o.name for o in entry.objects()]
-                    # Inside the try: it writes to the filesystem this path is
-                    # about running out of, and escaping here would leave the
-                    # machine lock held and kill the daemon.
-                    self._publish_state(engine_name, state, cursor, handle)
-                    # The queue depth is the batch this cycle listed, so it does
-                    # not count entries published since; the hash is what matches
-                    # the run against a build without opening the state file.
-                    queued = (
-                        len(batch)
-                        if cursor is None
-                        else sum(1 for k in batch if k > cursor)
-                    )
-                    self.log(
-                        f"{engine_name}: benching {key} ({entry.hash[:8]}), "
-                        f"{queued} above the cursor"
-                    )
-                    outcome = self.bench_entry(handle, engine, entry)
-            except TRANSPORT_ERRORS as e:
-                state.last_error = str(e)
-                state.in_flight = None
-                self.log(f"{engine_name}: {e}")
-                break
-            state.in_flight = None
-            benched += 1
-            self._benched = benched
-            # After the commit is recorded, so a crash between the two
-            # re-benches one commit, which is_done absorbs.
-            cursor = key
-            self.set_cursor(source, engine_name, cursor)
 
-            if outcome_status(outcome) == "failed":
-                # Zero scores parsed, so the binary did not run at all. The
-                # likeliest cause is this machine or the run set, not the
-                # commit, and a cycle drains: without a breaker one pass marks
-                # every entry in the topic failed, and is_done is status-blind,
-                # so none of them is ever revisited.
-                consecutive_failures += 1
-                state.consecutive_failures = consecutive_failures
-                if consecutive_failures >= limit:
-                    state.stalled_since = state.stalled_since or time.time()
-                    state.stall_retry_after = time.time() + STALL_RETRY_SECS
-                    state.last_error = (
-                        f"{consecutive_failures} commits in a row produced no "
-                        f"scores; this is the machine or the run set, not the "
-                        f"tree. Check the run set, then "
-                        f"'slipstream clear {engine_name} <first> <last>' and "
-                        f"'watch --reset-cursor {engine_name}=<first-1>'."
-                    )
-                    self.log(f"{engine_name}: stalled -- {state.last_error}")
-                    break
-            else:
-                consecutive_failures = 0
-                state.consecutive_failures = 0
-                state.stalled_since = None
-                state.stall_retry_after = None
+                if outcome_status(outcome) == "failed":
+                    # Zero scores parsed, so the binary did not run at all. The
+                    # likeliest cause is this machine or the run set, not the
+                    # commit, and a cycle drains: without a breaker one pass marks
+                    # every entry in the topic failed, and is_done is status-blind,
+                    # so none of them is ever revisited.
+                    consecutive_failures += 1
+                    state.consecutive_failures = consecutive_failures
+                    if consecutive_failures >= limit:
+                        state.stalled_since = state.stalled_since or time.time()
+                        state.stall_retry_after = time.time() + STALL_RETRY_SECS
+                        state.last_error = (
+                            f"{consecutive_failures} commits in a row produced no "
+                            f"scores; this is the machine or the run set, not the "
+                            f"tree. Check the run set, then "
+                            f"'slipstream clear {engine_name} <first> <last>' and "
+                            f"'watch --reset-cursor {engine_name}=<first-1>'."
+                        )
+                        self.log(f"{engine_name}: stalled -- {state.last_error}")
+                        break
+                else:
+                    consecutive_failures = 0
+                    state.consecutive_failures = 0
+                    state.stalled_since = None
+                    state.stall_retry_after = None
+        except AdmissionStopped as exc:
+            self.log(f"{engine_name}: {exc.reason.value}: {exc}")
+            stop_reason = exc.reason
         try:
             self._publish_state(engine_name, state, cursor, handle)
         except TRANSPORT_ERRORS as e:
@@ -625,7 +630,7 @@ class BusConsumer:
             if state.last_error
             else StopReason.SHUTDOWN
             if should_stop()
-            else StopReason.COMPLETE,
+            else stop_reason,
         )
 
     def _report_plan(self, source, handle, engine_name: str) -> DrainResult:

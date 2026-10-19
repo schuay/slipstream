@@ -1626,3 +1626,51 @@ class TestWindowAdmission:
             setup.collector, "_run_benchmarks", lambda *a: BenchOutcome(1, 1, 10)
         )
         assert _drain_result(setup).benched == 1
+
+
+class TestDeferredStatePublication:
+    def test_retention_gap_survives_deferral_and_reopening(self, setup, monkeypatch):
+        from slipstream.admission import StopReason
+        from slipstream.bench_window import write_override
+        from slipstream.bus import BuilderState
+        from slipstream.consumer import LocalSource
+
+        setup.publish(100)
+        original = LocalSource.read_entry
+
+        def retained(self, engine, key):
+            setup.bus.entry_path(engine, key).unlink()
+            setup.bus.write_builder_state(engine, BuilderState(highest_dropped=key))
+            write_override("close")
+            return None
+
+        monkeypatch.setattr(LocalSource, "read_entry", retained)
+        result = setup.consumer.drain(setup.source, "v8", lambda: False, max_benches=1)
+        assert result.reason == StopReason.DEFERRED and result.benched == 0
+        assert setup.consumer.cursor(setup.source, "v8") == K1(100)
+        assert setup.bus.read_bench_state("v8").skipped_dropped == K1(100)
+        write_override(None)
+        monkeypatch.setattr(LocalSource, "read_entry", original)
+        result = setup.consumer.drain(setup.source, "v8", lambda: False, max_benches=1)
+        assert result.reason == StopReason.COMPLETE
+        assert setup.bus.read_bench_state("v8").skipped_dropped == K1(100)
+
+    def test_completed_commit_state_is_saved_on_deferral(self, setup, monkeypatch):
+        from slipstream.admission import StopReason
+        from slipstream.bench_window import write_override
+
+        setup.publish(100)
+        setup.publish(101)
+
+        def run(*args):
+            write_override("close")
+            return BenchOutcome(0, 1, 0)
+
+        monkeypatch.setattr(setup.collector, "_run_benchmarks", run)
+        result = _drain_result(setup)
+        assert result.reason == StopReason.DEFERRED and result.benched == 1
+        state = setup.bus.read_bench_state("v8")
+        assert state.in_flight is None
+        assert state.consecutive_failures == 1
+        assert state.cursor == K1(100)
+        assert state.lag == 1
