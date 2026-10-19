@@ -75,8 +75,10 @@ slipstream watch
 
 `bench` walks a commit range, building and measuring each commit. `watch` is
 the same thing as a daemon: it picks up where the last run left off,
-measures each new commit, and persists the scores. Run `slipstream deliver`
-separately to send them onward.
+measures each new commit, and persists the scores. Without engine arguments,
+`watch` selects engines named by `[[run]]` entries, leaving build-only engines
+out of collection. An explicitly requested engine must have a run entry.
+Run `slipstream deliver` separately to send scores onward.
 
 Bus-driven `watch` uses macOS/BSD filesystem notifications for new builds.
 Local sources are watched directly; SSH sources use a persistent

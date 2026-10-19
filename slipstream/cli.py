@@ -239,7 +239,7 @@ def _parse_interval(value: str) -> int:
 def watch(
     engines: Annotated[
         Optional[list[str]],
-        typer.Argument(help="Engines to watch (default: all configured)"),
+        typer.Argument(help="Engines to watch (default: engines with [[run]] entries)"),
     ] = None,
     interval: str = typer.Option(
         "30m", help="Git fetch interval; bus builds use notifications"
@@ -272,12 +272,24 @@ def watch(
 
     cfg = _load_config(config)
     interval_secs = _parse_interval(interval)
-    engine_names = engines or list(cfg.engines.keys())
+    measured = {run.engine for run in cfg.runs}
+    engine_names = engines or [name for name in cfg.engines if name in measured]
 
     for name in engine_names:
         if name not in cfg.engines:
             typer.echo(f"Error: engine '{name}' not configured.", err=True)
             raise typer.Exit(1)
+
+    if reset_cursor is None:
+        if not engine_names:
+            typer.echo("Error: no engines with [[run]] entries to watch.", err=True)
+            raise typer.Exit(1)
+        for name in engine_names:
+            try:
+                cfg.require_runs(name)
+            except ValueError as exc:
+                typer.echo(f"Error: {exc}", err=True)
+                raise typer.Exit(1)
 
     def source_for(name):
         return cfg.bus.source_for(name) if cfg.bus else None

@@ -584,3 +584,81 @@ class TestCheckoutlessEngine:
         assert res.exit_code == 1
         assert "no checkout on this machine" in res.output
         assert "Traceback" not in res.output
+
+
+class TestWatchMeasuredEngines:
+    @pytest.mark.parametrize("bus_driven", [False, True])
+    def test_default_watch_ignores_build_only_engines(
+        self, config, tmp_path, monkeypatch, bus_driven
+    ):
+        from typer.testing import CliRunner
+        from slipstream import cli
+        from slipstream.admission import CollectionResult
+        from slipstream.collector import BenchCollector
+        from slipstream.config import BusConfig, BusSource, EngineConfig
+
+        config.engines = {
+            name: EngineConfig(name, tmp_path, "true", "d8", r"#([0-9]+)")
+            for name in ("v8", "jsc", "chrome", "safari")
+        }
+        if bus_driven:
+            config.bus = BusConfig(
+                root=tmp_path / "bus",
+                sources=[
+                    BusSource(
+                        "local", str(tmp_path / "bus"), engines=list(config.engines)
+                    )
+                ],
+            )
+        collector = BenchCollector(config)
+        for name in ("v8", "jsc"):
+            collector.store.mark_done(name, config.platform, 100)
+        monkeypatch.setattr(cli, "_load_config", lambda _: config)
+        monkeypatch.setattr(cli, "_open_collector", lambda *a, **kw: collector)
+        monkeypatch.setattr(cli, "_host_preflight", lambda _: None)
+        monkeypatch.setattr(cli, "_shutdown_flag", lambda: lambda: False)
+        scanned = []
+
+        def frontier(name):
+            scanned.append(name)
+            return 100, 100
+
+        def drain(self, source, name, should_stop, **kw):
+            scanned.append(name)
+            return CollectionResult()
+
+        monkeypatch.setattr(collector, "find_frontier", frontier)
+        monkeypatch.setattr("slipstream.consumer.BusConsumer.drain", drain)
+        result = CliRunner().invoke(cli.app, ["watch", "--once"])
+        assert result.exit_code == 0, result.output
+        assert scanned == ["v8", "jsc"]
+        assert "Watching v8, jsc " in result.output
+        assert "would measure nothing" not in result.output
+
+    @pytest.mark.parametrize("explicit", [False, True])
+    def test_no_runs_is_one_startup_error_before_opening_collector(
+        self, config, monkeypatch, explicit
+    ):
+        from typer.testing import CliRunner
+        from slipstream import cli
+        from slipstream.config import EngineConfig
+
+        config.engines["v8"] = EngineConfig("v8", None, "", "", "")
+        config.runs = []
+        monkeypatch.setattr(cli, "_load_config", lambda _: config)
+        monkeypatch.setattr(
+            cli,
+            "_open_collector",
+            lambda *a, **kw: pytest.fail(
+                "opened a collector for an engine with no runs"
+            ),
+        )
+        args = ["watch", "v8"] if explicit else ["watch"]
+        result = CliRunner().invoke(cli.app, args)
+        assert result.exit_code == 1, result.output
+        assert result.output.count("Error:") == 1
+        assert (
+            "would measure nothing" in result.output
+            if explicit
+            else "no engines with [[run]] entries to watch" in result.output
+        )
