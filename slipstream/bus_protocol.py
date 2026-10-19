@@ -111,10 +111,33 @@ class Staging:
         self.text = None
         self.entry = None
         self.paths = {}
+        self.reused = {}
+
+    def reuse(self, text):
+        """Pin immutable, previously verified objects before negotiating bytes."""
+        identity(text)
+        self.text, self.entry = text, Entry.from_json(text)
+        with self.protocol.lock():
+            ready = self.protocol.ready()
+            if ready["owners"].get(self.entry.engine) != self.entry.owner_uuid:
+                raise BusError("source is not configured owner")
+            for obj in self.entry.objects():
+                path = self.path / obj.name
+                try:
+                    os.link(self.protocol.bus.object_path(obj.name), path)
+                except FileNotFoundError:
+                    continue
+                if path.stat().st_size != obj.bytes:
+                    raise BusError(f"existing object size mismatch: {obj.name}")
+                self.paths[obj.name] = path
+                self.reused[obj.name] = path
+        return [o.name for o in self.entry.objects() if o.name not in self.paths]
 
     def verify(self):
         for obj in self.entry.objects():
             path = self.paths[obj.name]
+            if obj.name in self.reused:
+                continue
             if path.stat().st_size != obj.bytes or sha256_file(path) != obj.sha256:
                 raise BusError(f"object checksum mismatch: {obj.name}")
             with path.open("rb") as stream:
@@ -387,6 +410,9 @@ class BusProtocol:
         stage.verify()
         for obj in stage.entry.objects():
             path = stage.existing.get(obj.name)
+            reused = stage.reused.get(obj.name)
+            if path and reused and os.path.samestat(path.stat(), reused.stat()):
+                continue
             if path and (
                 path.stat().st_size != obj.bytes or sha256_file(path) != obj.sha256
             ):

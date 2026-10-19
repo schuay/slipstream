@@ -19,12 +19,15 @@ import time
 import threading
 from contextlib import contextmanager
 
-from .bus import BusError, Entry
+from .bus import BusError
 from .bus_protocol import BusProtocol, encoded, identity, read
 from .durability import FileLock, atomic_write
 from .models import CommitKey
 from .notifications import Subscriptions, WorkSchedule
 from .remote import SSH_OPTIONS, quote_remote
+
+
+TRANSFER_VERSION = 2
 
 
 @contextmanager
@@ -148,16 +151,24 @@ class Wire:
             raise BusError(value["error"])
         return value
 
-    def send_objects(self, stage):
-        for obj in stage.entry.objects():
+    def send_objects(self, stage, names):
+        objects = {obj.name: obj for obj in stage.entry.objects()}
+        if (
+            not isinstance(names, list)
+            or any(not isinstance(name, str) or name not in objects for name in names)
+            or len(set(names)) != len(names)
+        ):
+            raise BusError("invalid missing-object request")
+        for name in names:
+            obj = objects[name]
             with stage.paths[obj.name].open("rb") as stream:
                 while data := stream.read(65536):
                     self.send(data)
 
-    def receive_objects(self, stage, text):
-        identity(text)
-        stage.entry, stage.text = Entry.from_json(text), text
+    def receive_objects(self, stage):
         for obj in stage.entry.objects():
+            if obj.name in stage.paths:
+                continue
             path = stage.path / (obj.name + ".partial")
             with path.open("xb") as stream:
                 remaining = obj.bytes
@@ -204,16 +215,26 @@ class LocalEndpoint:
     @contextmanager
     def capture(self, engine, key, local):
         with self.protocol.capture(engine, key) as stage:
-            stage.verify()
             yield stage
 
     def accept(self, capture):
+        if capture.protocol.root == self.protocol.root:
+            # A pull already received directly into destination-owned staging.
+            receipt = self.protocol.accept(capture)
+            self.protocol.prune(self.retain_bytes)
+            self.protocol.sweep_blobs()
+            return receipt
         # Link/copy into destination-owned staging before touching its bus.
         with self.protocol.stage() as stage:
-            stage.text, stage.entry = capture.text, capture.entry
+            receipt = self.protocol.receipt(capture.entry.engine)
+            if receipt.get("identity") == identity(capture.text):
+                return receipt
+            missing = stage.reuse(capture.text)
             import shutil
 
             for obj in stage.entry.objects():
+                if obj.name not in missing:
+                    continue
                 dest = stage.path / (obj.name + ".partial")
                 shutil.copyfile(capture.paths[obj.name], dest)
                 stage.paths[obj.name] = dest
@@ -289,18 +310,37 @@ class RemoteEndpoint:
 
     @contextmanager
     def capture(self, engine, key, local):
-        with self.session({"op": "capture", "engine": engine, "key": str(key)}) as wire:
+        with self.session(
+            {
+                "op": "capture",
+                "engine": engine,
+                "key": str(key),
+                "transfer_version": TRANSFER_VERSION,
+            }
+        ) as wire:
             header = wire.message()
+            if header.get("transfer_version") != TRANSFER_VERSION:
+                raise BusError("transfer protocol changed; update both endpoints")
             with local.stage() as stage:
-                wire.receive_objects(stage, header["manifest"])
-                stage.verify()
+                wire.json({"missing": stage.reuse(header["manifest"])})
+                wire.receive_objects(stage)
                 yield stage
                 wire.json({"done": True})
 
     def accept(self, stage):
-        with self.session({"op": "accept", "manifest": stage.text}) as wire:
-            wire.message()  # destination staging exists before any bytes flow
-            wire.send_objects(stage)
+        with self.session(
+            {
+                "op": "accept",
+                "manifest": stage.text,
+                "transfer_version": TRANSFER_VERSION,
+            }
+        ) as wire:
+            header = wire.message()
+            if header.get("transfer_version") != TRANSFER_VERSION:
+                raise BusError("transfer protocol changed; update both endpoints")
+            if "receipt" in header:
+                return header["receipt"]
+            wire.send_objects(stage, header["missing"])
             return wire.message()
 
 
@@ -317,10 +357,25 @@ def serve(
             endpoint.protocol.expected_uuid = request.get("expected_uuid")
             endpoint.info()
             op = request["op"]
+            if (
+                op in ("accept", "capture")
+                and request.get("transfer_version") != TRANSFER_VERSION
+            ):
+                raise BusError("transfer protocol changed; update both endpoints")
             if op == "accept":
+                ident = identity(request["manifest"])
+                receipt = endpoint.receipt(ident["engine"])
+                if receipt.get("identity") == ident:
+                    wire.json(
+                        {"transfer_version": TRANSFER_VERSION, "receipt": receipt}
+                    )
+                    return
                 with endpoint.protocol.stage() as stage:
-                    wire.json({"ready": True})
-                    wire.receive_objects(stage, request["manifest"])
+                    missing = stage.reuse(request["manifest"])
+                    wire.json(
+                        {"transfer_version": TRANSFER_VERSION, "missing": missing}
+                    )
+                    wire.receive_objects(stage)
                     with disconnected_client(reader):
                         receipt = endpoint.protocol.accept(stage)
                         endpoint.protocol.prune(retain_bytes)
@@ -330,10 +385,10 @@ def serve(
                 with endpoint.protocol.capture(
                     request["engine"], request["key"]
                 ) as stage:
-                    wire.json({"manifest": stage.text})
-                    with disconnected_client(reader):
-                        stage.verify()
-                    wire.send_objects(stage)
+                    wire.json(
+                        {"transfer_version": TRANSFER_VERSION, "manifest": stage.text}
+                    )
+                    wire.send_objects(stage, wire.message()["missing"])
                     wire.message()
             elif op in ("snapshot", "receipt", "health"):
                 wire.json(getattr(endpoint, op)(request["engine"]))

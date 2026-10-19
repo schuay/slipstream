@@ -65,6 +65,14 @@ overridden per engine in `config.toml`.
 
 `slipstream transfer` supports building on either machine while both benchmark
 local artifacts. It requires a coordinated offline bus migration.
+Transfer negotiates missing SHA-addressed objects for each publication: shared
+bases and patches already installed at the destination are reused without
+resending or rehashing them. Newly received objects are verified and durably
+stored before publication. Objects are immutable; transfer trusts objects
+verified at installation rather than checking for later disk corruption.
+Both endpoints must run the same transfer protocol version; update both
+machines before restarting transfer. This upgrade does not require another
+bus migration.
 
 ## Measuring
 

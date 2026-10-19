@@ -462,7 +462,7 @@ def test_endpoint_control_eof_cancels_verification(pair):
     from slipstream.transfer import Wire
 
     src, _ = pair
-    publication(src, 1)
+    entry = publication(src, 1)
     script = """
 import sys, time
 from slipstream.bus_protocol import Staging
@@ -477,8 +477,10 @@ serve(sys.argv[1], sys.stdin.fileno(), sys.stdout.fileno(), 1000000)
     )
     try:
         wire = Wire(process.stdout.fileno(), process.stdin.fileno(), handshake=3)
-        wire.json({"op": "capture", "engine": "v8", "key": "1"})
-        assert wire.message()["manifest"]
+        wire.json({"op": "accept", "manifest": entry.to_json(), "transfer_version": 2})
+        assert wire.message()["missing"] == []
+        # Verification is deliberately stalled in the child.
+        time.sleep(0.1)
         started = time.monotonic()
         process.stdin.close()
         assert process.wait(timeout=3) == 0
@@ -812,3 +814,163 @@ def test_transfer_preserves_exact_noncanonical_manifest_bytes(pair):
     assert dst.bus.entry_path("v8", 1).read_bytes() == raw
     assert receipt["identity"]["sha256"] == hashlib.sha256(raw).hexdigest()
     assert deliver(src, dst, 1) == receipt
+
+
+@pytest.mark.parametrize("direction", ["push", "pull"])
+def test_shared_delta_base_only_crosses_wire_once(pair, monkeypatch, direction):
+    import uuid
+    from slipstream.bus import Delta
+    from slipstream.delta import Block, DeltaPlan
+    from slipstream.transfer import Wire
+
+    src, dst = pair
+    base = publication(src, 1, b"large base" * 10000)
+    patch = b"small patch"
+    sha = hashlib.sha256(patch).hexdigest()
+    plan = DeltaPlan(1, "target", 1, (Block("block", 1, sha, len(patch)),))
+    delta = replace(
+        base,
+        commit_id=2,
+        publication_uuid=str(uuid.uuid4()),
+        blobs=[
+            Blob(
+                "out",
+                "new-tree",
+                delta=Delta(
+                    base.blobs[0].id, base.blobs[0].sha256, base.blobs[0].bytes, plan
+                ),
+            )
+        ],
+    )
+    with src.stage() as stage:
+        stage.entry, stage.text = delta, delta.to_json()
+        for obj in delta.objects():
+            path = stage.path / obj.name
+            path.write_bytes(patch if obj.sha256 == sha else b"large base" * 10000)
+            stage.paths[obj.name] = path
+        src.publish_staged(stage)
+
+    # Count payload bytes across real endpoint processes, not control messages.
+    transferred = []
+    if direction == "push":
+        original = Wire.send_objects
+
+        def send(self, stage, names):
+            transferred.append(
+                sum(o.bytes for o in stage.entry.objects() if o.name in names)
+            )
+            return original(self, stage, names)
+
+        monkeypatch.setattr(Wire, "send_objects", send)
+        remote, _ = remote_endpoint(dst, monkeypatch)
+
+        def transfer(key):
+            with LocalEndpoint(src.root, 1e9).capture("v8", key, dst) as stage:
+                remote.accept(stage)
+    else:
+        original = Wire.receive_objects
+
+        def receive(self, stage):
+            transferred.append(
+                sum(o.bytes for o in stage.entry.objects() if o.name not in stage.paths)
+            )
+            return original(self, stage)
+
+        monkeypatch.setattr(Wire, "receive_objects", receive)
+        remote, _ = remote_endpoint(src, monkeypatch)
+
+        def transfer(key):
+            with remote.capture("v8", key, dst) as stage:
+                LocalEndpoint(dst.root, 1e9).accept(stage)
+
+    transfer(1)
+    transfer(2)
+    assert transferred == [base.blobs[0].bytes, len(patch)]
+    assert dst.read_entry("v8", 2).to_json() == delta.to_json()
+
+
+def test_reused_objects_are_pinned_and_not_rehashed(pair, monkeypatch):
+    src, dst = pair
+    first = publication(src, 1)
+    deliver(src, dst, 1)
+    second = publication(src, 2)
+    with dst.stage() as stage:
+        assert stage.reuse(second.to_json()) == []
+        dst.prune(0)
+        dst.sweep_blobs()
+        assert stage.paths[first.objects()[0].name].read_bytes() == b"archive"
+
+        def unexpected(*args):
+            pytest.fail("reused object was hashed or flushed")
+
+        monkeypatch.setattr("slipstream.bus_protocol.sha256_file", unexpected)
+        import os
+        from slipstream.bus_protocol import flush_file
+
+        inode = stage.paths[first.objects()[0].name].stat().st_ino
+
+        def flush(fd):
+            if os.fstat(fd).st_ino == inode:
+                unexpected()
+            flush_file(fd)
+
+        monkeypatch.setattr("slipstream.bus_protocol.flush_file", flush)
+        dst.accept(stage)
+    assert dst.read_entry("v8", 2)
+
+
+def test_new_transfer_bytes_are_verified(pair):
+    src, dst = pair
+    entry = publication(src, 1)
+    with dst.stage() as stage:
+        assert stage.reuse(entry.to_json()) == [entry.objects()[0].name]
+        path = stage.path / "received"
+        path.write_bytes(b"corrupt")
+        stage.paths[entry.objects()[0].name] = path
+        with pytest.raises(BusError, match="checksum"):
+            dst.accept(stage)
+    assert dst.snapshot("v8")["keys"] == []
+
+
+def test_replay_returns_receipt_without_reading_source_objects(pair, monkeypatch):
+    src, dst = pair
+    publication(src, 1)
+    receipt = deliver(src, dst, 1)
+    remote, _ = remote_endpoint(dst, monkeypatch)
+    with src.capture("v8", 1) as stage:
+        stage.paths.clear()
+        assert remote.accept(stage) == receipt
+        assert LocalEndpoint(dst.root, 1e9).accept(stage) == receipt
+
+
+@pytest.mark.parametrize(
+    "names", [["unknown"], ["duplicate", "duplicate"], [None], "all"]
+)
+def test_invalid_missing_object_request(pair, names):
+    from slipstream.transfer import Wire
+
+    src, _ = pair
+    publication(src, 1)
+    with src.capture("v8", 1) as stage:
+        with pytest.raises(BusError, match="missing-object"):
+            Wire.send_objects(None, stage, names)
+
+
+@pytest.mark.parametrize("op", ["capture", "accept"])
+def test_old_transfer_protocol_fails_before_payload(pair, monkeypatch, op):
+    src, _ = pair
+    entry = publication(src, 1)
+    remote, _ = remote_endpoint(src, monkeypatch)
+    with pytest.raises(BusError, match="update both endpoints"):
+        remote.call(op, engine="v8", key="1", manifest=entry.to_json())
+
+
+def test_reuse_rejects_wrong_size(pair):
+    src, dst = pair
+    entry = publication(src, 1)
+    deliver(src, dst, 1)
+    # A known filename with a wrong size is never trusted or requested anew.
+    dst.bus.object_path(entry.objects()[0].name).write_bytes(b"truncated")
+    with dst.stage() as stage:
+        with pytest.raises(BusError, match="existing object size mismatch"):
+            stage.reuse(entry.to_json())
