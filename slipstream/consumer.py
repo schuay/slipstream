@@ -24,9 +24,9 @@ import subprocess
 import tarfile
 import time
 from collections.abc import Callable
-from typing import NamedTuple
 from pathlib import Path
 
+from .admission import AdmissionStopped, CollectionResult, StopReason
 from . import __version__, host
 from .bus import (
     BenchState,
@@ -58,15 +58,7 @@ STALL_RETRY_SECS = 2 * 3600
 MAX_BENCHES_PER_CYCLE = 50
 
 
-class DrainResult(NamedTuple):
-    """What one cycle did, and why it stopped.
-
-    A bare count conflates "nothing to do" with "the source was unreachable",
-    which is the conflation the drain loop itself was fixed to avoid.
-    """
-
-    benched: int = 0
-    error: str | None = None
+DrainResult = CollectionResult
 
 
 class ConsumerError(RuntimeError):
@@ -377,8 +369,6 @@ class BusConsumer:
         source: BusSource,
         engine_name: str,
         should_stop: Callable[[], bool],
-        take_lock: Callable[[], bool],
-        release_lock: Callable[[], None],
         *,
         max_benches: int | None = None,
     ) -> DrainResult:
@@ -394,22 +384,26 @@ class BusConsumer:
         """
         self._benched = 0
         try:
-            return self._drain(
-                source, engine_name, should_stop, take_lock, release_lock, max_benches
-            )
+            return self._drain(source, engine_name, should_stop, max_benches)
+        except AdmissionStopped as exc:
+            self.log(f"{engine_name}: {exc.reason.value}: {exc}")
+            return DrainResult(self._benched, reason=exc.reason)
         except TRANSPORT_ERRORS as e:
             self.log(f"{engine_name}: {e}")
-            return DrainResult(self._benched, str(e))
+            return DrainResult(self._benched, str(e), StopReason.FAILURE)
 
     def _drain(
         self,
         source: BusSource,
         engine_name: str,
         should_stop: Callable[[], bool],
-        take_lock: Callable[[], bool],
-        release_lock: Callable[[], None],
         max_benches: int | None,
     ) -> DrainResult:
+        admission = self.collector.admission()
+        if self.dry_run:
+            decision = admission.decision()
+            self.log(f"Window: {decision.error or decision.reason}")
+        admission.check(should_stop)
         engine = self.cfg.engines[engine_name]
         handle = open_source(source)
         if self.dry_run:
@@ -420,7 +414,7 @@ class BusConsumer:
             # A state file this version cannot read (a rollback across a
             # version bump) must not kill the daemon at its first line.
             self.log(f"{engine_name}: {e}")
-            return DrainResult(0, str(e))
+            return DrainResult(0, str(e), StopReason.FAILURE)
         try:
             self.cfg.require_runs(engine_name)
         except ValueError as e:
@@ -432,7 +426,7 @@ class BusConsumer:
             self._publish_state(
                 engine_name, state, self.cursor(source, engine_name), handle
             )
-            return DrainResult(0, state.last_error)
+            return DrainResult(0, state.last_error, StopReason.FAILURE)
 
         cursor = self.cursor(source, engine_name)
         # A killed bencher leaves this set, and every later cycle would
@@ -454,7 +448,7 @@ class BusConsumer:
                 f" -- {state.last_error}"
             )
             self._publish_state(engine_name, state, cursor, handle)
-            return DrainResult(0, state.last_error)
+            return DrainResult(0, state.last_error, StopReason.FAILURE)
 
         # Cleared once per cycle rather than only on the path that benches
         # something: once the consumer is caught up, that path is never taken,
@@ -467,12 +461,10 @@ class BusConsumer:
         # mid-unpack leaves a multi-GB directory, and if that is what filled
         # the disk then the sweep that removes it would never be reached.
         if (self.bus.root / "roots" / engine_name).exists():
-            if not take_lock():
-                return DrainResult(0, None)
-            try:
+            with admission.commit(
+                f"maintenance: trim {engine_name} roots", should_stop
+            ):
                 self._trim_run_roots(engine_name)
-            finally:
-                release_lock()
         self._note_dropped_entries(handle, engine_name, state, cursor)
         # While stalled, one commit per window: a machine problem then costs a
         # commit per backoff instead of the whole backlog in one pass.
@@ -482,6 +474,7 @@ class BusConsumer:
         if max_benches is not None:
             budget = min(budget, max_benches)
         while not should_stop() and benched < budget:
+            admission.check(should_stop)
             try:
                 batch = handle.keys_above(engine_name, cursor)
             except TRANSPORT_ERRORS as e:
@@ -535,65 +528,55 @@ class BusConsumer:
                 state.last_error = f"only {self.free_gb():.0f}GB free"
                 self.log(f"{engine_name}: paused, {self.free_gb():.0f}GB free")
                 break
-            if not take_lock():
-                break
-            # Everything from here to the finally, not just the bench: the
-            # re-read and the cursor write below raise the same errors drain
-            # is written to survive (ssh dropping over an hours-long lock
-            # wait, a malformed entry, a full disk), and outside the try they
-            # would leave the machine lock held for the life of the daemon --
-            # blocking the builder and every ad-hoc command with it.
             try:
-                # Re-read after the wait: take_lock can block for hours behind
-                # a builder on a box that does both, and retention may have
-                # dropped the entry meanwhile. Without this the payload is
-                # simply missing, which the consumer is right to treat as a
-                # real error -- but here it is ordinary retention.
-                fresh = handle.read_entry(engine_name, key)
-                if fresh is None:
-                    self.log(
-                        f"{engine_name}: entry {key} was dropped by "
-                        f"retention while waiting for the machine"
+                with admission.commit(f"{engine_name} {key}", should_stop):
+                    # Re-read after the wait: admission can block for hours behind
+                    # a builder on a box that does both, and retention may have
+                    # dropped the entry meanwhile. Without this the payload is
+                    # simply missing, which the consumer is right to treat as a
+                    # real error -- but here it is ordinary retention.
+                    fresh = handle.read_entry(engine_name, key)
+                    if fresh is None:
+                        self.log(
+                            f"{engine_name}: entry {key} was dropped by "
+                            f"retention while waiting for the machine"
+                        )
+                        state.skipped_dropped = _max_key(state.skipped_dropped, key)
+                        cursor = key
+                        self.set_cursor(source, engine_name, cursor)
+                        continue
+                    entry = fresh
+                    state.in_flight = {
+                        "commit_id": key.commit_id,
+                        "embedder_id": key.embedder_id,
+                        "phase": "bench",
+                        "started_at": time.time(),
+                    }
+                    # Written before provisioning, so the sweep inside it counts
+                    # these as held and reclaims the previous entry's instead.
+                    state.blobs = [o.name for o in entry.objects()]
+                    # Inside the try: it writes to the filesystem this path is
+                    # about running out of, and escaping here would leave the
+                    # machine lock held and kill the daemon.
+                    self._publish_state(engine_name, state, cursor, handle)
+                    # The queue depth is the batch this cycle listed, so it does
+                    # not count entries published since; the hash is what matches
+                    # the run against a build without opening the state file.
+                    queued = (
+                        len(batch)
+                        if cursor is None
+                        else sum(1 for k in batch if k > cursor)
                     )
-                    state.skipped_dropped = _max_key(state.skipped_dropped, key)
-                    cursor = key
-                    self.set_cursor(source, engine_name, cursor)
-                    continue
-                entry = fresh
-                self.collector.lock.set_job(f"{engine_name} {key}")
-                state.in_flight = {
-                    "commit_id": key.commit_id,
-                    "embedder_id": key.embedder_id,
-                    "phase": "bench",
-                    "started_at": time.time(),
-                }
-                # Written before provisioning, so the sweep inside it counts
-                # these as held and reclaims the previous entry's instead.
-                state.blobs = [o.name for o in entry.objects()]
-                # Inside the try: it writes to the filesystem this path is
-                # about running out of, and escaping here would leave the
-                # machine lock held and kill the daemon.
-                self._publish_state(engine_name, state, cursor, handle)
-                # The queue depth is the batch this cycle listed, so it does
-                # not count entries published since; the hash is what matches
-                # the run against a build without opening the state file.
-                queued = (
-                    len(batch)
-                    if cursor is None
-                    else sum(1 for k in batch if k > cursor)
-                )
-                self.log(
-                    f"{engine_name}: benching {key} ({entry.hash[:8]}), "
-                    f"{queued} above the cursor"
-                )
-                outcome = self.bench_entry(handle, engine, entry)
+                    self.log(
+                        f"{engine_name}: benching {key} ({entry.hash[:8]}), "
+                        f"{queued} above the cursor"
+                    )
+                    outcome = self.bench_entry(handle, engine, entry)
             except TRANSPORT_ERRORS as e:
                 state.last_error = str(e)
                 state.in_flight = None
                 self.log(f"{engine_name}: {e}")
                 break
-            finally:
-                release_lock()
             state.in_flight = None
             benched += 1
             self._benched = benched
@@ -634,8 +617,16 @@ class BusConsumer:
             # the same reason: it writes to the filesystem this path is about
             # running out of, and the caught-up path does no floor check at all.
             self.log(f"{engine_name}: writing bench state: {e}")
-            return DrainResult(benched, str(e))
-        return DrainResult(benched, state.last_error)
+            return DrainResult(benched, str(e), StopReason.FAILURE)
+        return DrainResult(
+            benched,
+            state.last_error,
+            StopReason.FAILURE
+            if state.last_error
+            else StopReason.SHUTDOWN
+            if should_stop()
+            else StopReason.COMPLETE,
+        )
 
     def _report_plan(self, source, handle, engine_name: str) -> DrainResult:
         """Say what a real cycle would bench, and write nothing.
@@ -649,7 +640,7 @@ class BusConsumer:
             keys = handle.keys_above(engine_name, cursor)
         except TRANSPORT_ERRORS as e:
             self.log(f"{engine_name}: listing {source.name}: {e}")
-            return DrainResult(0, str(e))
+            return DrainResult(0, str(e), StopReason.FAILURE)
         todo = [
             k for k in keys if not self.store.is_done(engine_name, self.cfg.platform, k)
         ]

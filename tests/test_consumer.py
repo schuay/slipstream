@@ -112,8 +112,6 @@ def _drain_result(setup, should_stop=None):
         setup.source,
         "v8",
         should_stop or (lambda: False),
-        lambda: setup.collector.lock.try_acquire(),
-        setup.collector.lock.release,
     )
 
 
@@ -141,8 +139,6 @@ class TestBenchingLine:
                 setup.source,
                 "v8",
                 lambda: False,
-                lambda: setup.collector.lock.try_acquire(),
-                setup.collector.lock.release,
                 max_benches=1,
             )
             assert result.benched == 1
@@ -162,8 +158,6 @@ class TestBenchingLine:
                 setup.source,
                 "v8",
                 lambda: False,
-                lambda: setup.collector.lock.try_acquire(),
-                setup.collector.lock.release,
                 max_benches=1,
             )
             assert result.benched == 1
@@ -663,8 +657,6 @@ def test_one_box_builds_and_benches_through_the_bus(config, tmp_path, monkeypatc
         config.bus.sources[0],
         "v8",
         lambda: False,
-        lambda: collector.lock.try_acquire(),
-        collector.lock.release,
     )
 
     assert result.benched == 1 and result.error is None
@@ -822,8 +814,6 @@ class TestDryRun:
             setup.source,
             "v8",
             lambda: False,
-            lambda: setup.collector.lock.try_acquire(),
-            setup.collector.lock.release,
         ).benched, c
 
     def test_nothing_is_fetched_cleared_or_advanced(self, setup, scored):
@@ -1465,17 +1455,18 @@ class TestEntryIsRevalidatedUnderTheLock:
         setup.publish(101)
         blob_100 = setup.blob_path(100)
 
-        def drop_100_while_waiting():
+        acquire = setup.collector.lock.acquire
+
+        def drop_100_while_waiting(*args, **kwargs):
             setup.bus.entry_path("v8", 100).unlink(missing_ok=True)
             blob_100.unlink(missing_ok=True)
-            return setup.collector.lock.try_acquire()
+            return acquire(*args, **kwargs)
 
+        monkeypatch.setattr(setup.collector.lock, "acquire", drop_100_while_waiting)
         result = setup.consumer.drain(
             setup.source,
             "v8",
             lambda: False,
-            drop_100_while_waiting,
-            setup.collector.lock.release,
         )
         assert result.error is None, result.error
         assert [cid for cid, _ in scored] == [101]
@@ -1579,3 +1570,59 @@ class TestTheLockIsNeverLeaked:
         peer = MachineLock("build", setup.collector.lock.path)
         assert peer.try_acquire(), "the builder would block forever"
         peer.release()
+
+
+class TestWindowAdmission:
+    def test_closed_defers_without_cursor_scores_or_cleanup(
+        self, setup, scored, monkeypatch
+    ):
+        from slipstream.bench_window import write_override
+        from slipstream.admission import StopReason
+
+        setup.publish(100)
+        roots = setup.bus.root / "roots" / "v8"
+        roots.mkdir(parents=True)
+        left = roots / "interrupted"
+        left.mkdir()
+        write_override("close")
+        monkeypatch.setattr(
+            setup.consumer,
+            "_trim_run_roots",
+            lambda *a: pytest.fail("trimmed while closed"),
+        )
+        result = _drain_result(setup)
+        assert result.reason == StopReason.DEFERRED
+        assert result.error is None and result.benched == 0
+        assert setup.consumer.cursor(setup.source, "v8") is None
+        assert left.exists() and not setup.collector.lock.path.exists()
+        assert not scored
+
+    def test_close_during_commit_preserves_completed_count_and_pending_work(
+        self, setup, monkeypatch
+    ):
+        from slipstream.bench_window import write_override
+        from slipstream.admission import StopReason
+
+        setup.publish(100)
+        setup.publish(101)
+        runs = []
+
+        def run(*args):
+            write_override("close")
+            for i in range(3):
+                assert setup.collector.lock.held
+                assert setup.collector.lock.probe().job == "v8 100"
+                runs.append(i)
+            return BenchOutcome(3, 3, 30)
+
+        monkeypatch.setattr(setup.collector, "_run_benchmarks", run)
+        result = _drain_result(setup)
+        assert result.reason == StopReason.DEFERRED and result.benched == 1
+        assert result.error is None and runs == [0, 1, 2]
+        assert setup.consumer.cursor(setup.source, "v8") == K1(100)
+        assert not setup.collector.store.is_done("v8", setup.cfg.platform, 101)
+        write_override(None)
+        monkeypatch.setattr(
+            setup.collector, "_run_benchmarks", lambda *a: BenchOutcome(1, 1, 10)
+        )
+        assert _drain_result(setup).benched == 1

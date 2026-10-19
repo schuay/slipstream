@@ -111,16 +111,14 @@ class TestWatchRotation:
             counts[name] += 1
             return int(counts[name] <= 3)
 
-        def drain(
-            self, source, name, should_stop, take_lock, release_lock, *, max_benches
-        ):
+        def drain(self, source, name, should_stop, *, max_benches):
             assert max_benches == 1
             return DrainResult(turn(name))
 
         def collect(name, *args, **kwargs):
             assert kwargs["max_commits"] == 1
             assert args == (100, 200)
-            return turn(name)
+            return DrainResult(turn(name))
 
         monkeypatch.setattr("slipstream.consumer.BusConsumer.drain", drain)
         monkeypatch.setattr(collector, "find_frontier", lambda name: (100, 200))

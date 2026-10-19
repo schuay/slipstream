@@ -1004,3 +1004,47 @@ class TestAMidRunFailureExportsNothing:
         assert (
             c.store.export_scores("v8", config.platform, {"js3": {"test-bench"}}) == []
         )
+
+
+class TestWindowClear(TestMachineLockInCollect):
+    def test_deferred_clear_preserves_scores_and_results(
+        self, config, tmp_path, monkeypatch
+    ):
+        from slipstream.bench_window import write_override
+        from slipstream.admission import StopReason
+
+        collector = self._collector(config, tmp_path, monkeypatch)
+        collector.store.mark_done("v8", config.platform, 100)
+        output = config.commit_results_dir("v8", K1(100))
+        output.mkdir(parents=True)
+        (output / "result").write_text("keep me")
+        write_override("close")
+        result = collector.collect("v8", 99, 100, clear=True)
+        assert result.reason == StopReason.DEFERRED and result.benched == 0
+        assert collector.store.is_done("v8", config.platform, 100)
+        assert (output / "result").read_text() == "keep me"
+        assert not collector.lock.path.exists()
+
+    def test_clear_is_limited_to_admitted_commit(self, config, tmp_path, monkeypatch):
+        from slipstream.bench_window import write_override
+        from slipstream.admission import StopReason
+
+        collector = self._collector(config, tmp_path, monkeypatch)
+        collector.store.upsert_commit("v8", "def", 101, "2026-01-01", 18, "t")
+        for cid in (100, 101):
+            collector.store.mark_done("v8", config.platform, cid)
+        monkeypatch.setattr(
+            collector,
+            "get_commit_list",
+            lambda *a, **k: [{"hash": "abc"}, {"hash": "def"}],
+        )
+
+        def run(*args):
+            write_override("close")
+            return _outcome()
+
+        monkeypatch.setattr(collector, "_run_benchmarks", run)
+        result = collector.collect("v8", 99, 101, clear=True)
+        assert result.benched == 1 and result.reason == StopReason.DEFERRED
+        assert collector.store.is_done("v8", config.platform, 101)
+        assert collector.store.get_status("v8", config.platform, 100) == "ok"

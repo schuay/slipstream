@@ -261,15 +261,23 @@ def _block(fd: int, op: int, should_stop: Callable[[], bool]) -> bool:
         done.set()
 
     threading.Thread(target=run, daemon=True).start()
-    while not done.wait(STOP_POLL_SECS):
-        if should_stop():
-            with claim:
-                if owner[0] is None:
-                    owner[0] = "thread"
-                    return False
-            # The thread handed it over in the meantime; it is ours.
-            done.wait()
-            break
+    try:
+        while not done.wait(STOP_POLL_SECS):
+            if should_stop():
+                with claim:
+                    if owner[0] is None:
+                        owner[0] = "thread"
+                        return False
+                # The thread handed it over in the meantime; it is ours.
+                done.wait()
+                break
+    except BaseException:
+        with claim:
+            if owner[0] is None:
+                owner[0] = "thread"
+            else:
+                os.close(fd)
+        raise
     if failure[0] is not None:
         os.close(fd)
         raise failure[0]
@@ -303,6 +311,7 @@ class MachineLock:
         self._fd: int | None = None
         self._ticket: _Ticket | None = None
         self._job = ""
+        self._since = 0.0
 
     @property
     def queue_dir(self) -> Path:
@@ -334,7 +343,7 @@ class MachineLock:
         try:
             fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
-            return _read_holder(self.path)
+            return _read_holder(self.path) or Holder(0, "unknown", 0)
         else:
             fcntl.flock(fd, fcntl.LOCK_UN)
             return None
@@ -514,6 +523,7 @@ class MachineLock:
         # life, with no holder in the file to say why.
         previous = _read_holder(self.path)
         self._fd = fd
+        self._since = time.time()
         self._ticket = ticket
         self._job = job
         self._reap(previous)
@@ -522,7 +532,7 @@ class MachineLock:
     def _write_holder(self, fd: int, job: str) -> None:
         pid = os.getpid()
         pgid = os.getpgid(0)
-        record = {"pid": pid, "role": self.role, "since": time.time(), "job": job}
+        record = {"pid": pid, "role": self.role, "since": self._since, "job": job}
         if pgid == pid:
             # Only a group we lead: killing it then reaches our descendants
             # and nothing else.

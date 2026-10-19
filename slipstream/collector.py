@@ -19,6 +19,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.markup import escape
 
+from .admission import Admission, AdmissionStopped, CollectionResult, StopReason
 from . import host
 from .commit_filter import V8CommitFilter
 from .config import Config, EngineConfig, RunSpec
@@ -602,17 +603,13 @@ class BenchCollector:
 
         return BenchOutcome(configs_ok, configs_total, score_total)
 
-    def _take_machine_lock(
-        self, should_stop: Callable[[], bool], job: str = ""
-    ) -> bool:
-        """Acquire for one commit. False means a shutdown was requested."""
-        if self.dry_run:
-            return True
-        return self.lock.acquire(
-            should_stop,
+    def admission(self):
+        return Admission(
+            self.cfg.bench,
+            self.lock,
             wait=self.wait_for_lock,
+            dry_run=self.dry_run,
             log=lambda m: self._log(f"  {m}"),
-            job=job,
         )
 
     def bench_at_root(self, engine, commit, run_root, provenance=None):
@@ -870,7 +867,7 @@ class BenchCollector:
     ):
         """Benchmark commits in (start_id, end_id].
 
-        Returns the number measured. ``max_commits`` bounds attempts per turn
+        Returns the count and an explicit stop reason. ``max_commits`` bounds attempts per turn
         so watch can hand the next lock acquisition to another engine.
 
         ``should_stop`` lets a shutdown request reach the per-commit path,
@@ -880,6 +877,9 @@ class BenchCollector:
         should_stop = should_stop or (lambda: False)
         engine = self.cfg.engines[engine_name]
         self.cfg.require_runs(engine_name)
+        if self.dry_run:
+            decision = self.admission().decision()
+            self._log(f"Window: {decision.error or decision.reason}")
 
         commits = self.get_commit_list(
             engine, start_id, end_id, include_start=include_start
@@ -892,30 +892,11 @@ class BenchCollector:
             )
         )[::step]
 
-        # Commits a dry run would have cleared: nothing was, so is_done below
-        # would skip every one of them and the plan would show no work at all.
-        cleared: set[CommitKey] = set()
-        if clear:
-            clear_keys = [CommitKey.from_commit(r) for r in sampled]
-            self._log(
-                f"[yellow]Clearing results and state for {len(clear_keys)} commits...[/yellow]"
-            )
-            if not self.dry_run:
-                with self.store.result_locks(
-                    engine_name, self.cfg.platform, clear_keys
-                ):
-                    self.store.clear_range(engine_name, self.cfg.platform, clear_keys)
-                    for key in clear_keys:
-                        p = self.cfg.commit_results_dir(engine_name, key)
-                        if p.exists():
-                            shutil.rmtree(p)
-            else:
-                cleared = set(clear_keys)
-
         t_start = time.time()
         total = len(sampled)
         attempted = 0
         completed = 0
+        failed = False
         for idx, row in enumerate(sampled):
             if max_commits is not None and attempted >= max_commits:
                 break
@@ -933,31 +914,42 @@ class BenchCollector:
                 f"({commit_hash[:8]}) | ETA: {eta or 'N/A'}[/bold green]"
             )
 
-            if key not in cleared and self.store.is_done(
-                engine_name, self.cfg.platform, key
-            ):
+            if not clear and self.store.is_done(engine_name, self.cfg.platform, key):
                 self._log("  [yellow]Skipping: already done[/yellow]")
                 continue
 
             # The build and every run of this commit happen under one hold, so
             # a peer's build cannot land between two of its runs.
-            if not self._take_machine_lock(should_stop, f"{engine_name} {key}"):
-                break
-            attempted += 1
             try:
-                t0 = time.time()
-                console.print("  Building... ", end="")
-                run_root = self._provision(engine, commit_hash)
-                if run_root is None:
-                    console.print(f"[red]FAILED ({int(time.time() - t0)}s)[/red]")
-                    continue
-                console.print(f"[green]OK ({int(time.time() - t0)}s)[/green]")
-
-                self.bench_at_root(engine, dict(row), run_root)
-                completed += 1
-            finally:
-                self.lock.release()
-
+                with self.admission().commit(f"{engine_name} {key}", should_stop):
+                    attempted += 1
+                    if clear and not self.dry_run:
+                        with self.store.result_locks(
+                            engine_name, self.cfg.platform, [key]
+                        ):
+                            self.store.clear_range(
+                                engine_name, self.cfg.platform, [key]
+                            )
+                            path = self.cfg.commit_results_dir(engine_name, key)
+                            if path.exists():
+                                shutil.rmtree(path)
+                    t0 = time.time()
+                    console.print("  Building... ", end="")
+                    run_root = self._provision(engine, commit_hash)
+                    if run_root is None:
+                        console.print(f"[red]FAILED ({int(time.time() - t0)}s)[/red]")
+                        failed = True
+                        continue
+                    console.print(f"[green]OK ({int(time.time() - t0)}s)[/green]")
+                    self.bench_at_root(engine, dict(row), run_root)
+                    completed += 1
+            except AdmissionStopped as exc:
+                self._log(f"  {exc.reason.value}: {exc}")
+                return CollectionResult(completed, reason=exc.reason)
             if should_stop():
-                break
-        return completed
+                return CollectionResult(completed, reason=StopReason.SHUTDOWN)
+        return CollectionResult(
+            completed,
+            "provisioning failed" if failed else None,
+            StopReason.FAILURE if failed else StopReason.COMPLETE,
+        )

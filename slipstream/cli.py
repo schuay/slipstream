@@ -342,12 +342,6 @@ def watch(
                         source,
                         name,
                         should_stop,
-                        lambda: collector.lock.acquire(
-                            should_stop,
-                            wait=True,
-                            log=lambda m: typer.echo(f"  {m}"),
-                        ),
-                        collector.lock.release,
                         max_benches=1,
                     )
                     if schedule is not None:
@@ -402,7 +396,7 @@ def watch(
                     continue
 
                 typer.echo(f"  {name}: new commits {last_done + 1}..{head_id}")
-                completed = collector.collect(
+                result = collector.collect(
                     name,
                     last_done,
                     head_id,
@@ -411,8 +405,8 @@ def watch(
                     should_stop=should_stop,
                     max_commits=1,
                 )
-                if completed and not dry_run:
-                    turns[name] += completed
+                if result.benched and not dry_run:
+                    turns[name] += result.benched
                     if turns[name] < MAX_BENCHES_PER_CYCLE:
                         rotation.append(name)
 
