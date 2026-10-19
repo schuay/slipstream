@@ -158,3 +158,14 @@ def test_concurrent_atomic_reads_and_mutations(tmp_path):
 def test_invalid_override(mode, seconds, tmp_path):
     with pytest.raises(ValueError):
         write_override(mode, seconds, path=tmp_path / "state")
+
+
+def test_next_change_is_permission_change_even_when_override_expiry_is_not():
+    now = at("2026-10-19T20:00Z")  # 22:00 local
+    override = Override("open", now, now + timedelta(hours=1))
+    result = evaluate("Europe/Berlin", ["22:00-06:00"], override, now)
+    assert result.next_change == at("2026-10-20T04:00Z")
+    assert evaluate(None, None, override, now).next_change is None
+    override = Override("close", now, now + timedelta(hours=12))
+    result = evaluate("Europe/Berlin", ["22:00-06:00"], override, now)
+    assert result.next_change == at("2026-10-20T20:00Z")

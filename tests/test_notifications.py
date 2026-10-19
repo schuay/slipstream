@@ -362,3 +362,20 @@ def test_role_specific_state_notifications_do_not_loop(tmp_path):
     finally:
         bench.close()
         transfer.close()
+
+
+def test_rescan_preserves_retry_deadline_and_requests_idle_and_git_work(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(n.time, "monotonic", lambda: now[0])
+    schedule = n.WorkSchedule(["v8", "chrome"], ["jsc"], 1800)
+    schedule.changed(["v8", "chrome"])
+    schedule.finished("v8", schedule.snapshot("v8"), retry=60)
+    schedule.finished("chrome", schedule.snapshot("chrome"))
+    schedule.git_finished("jsc")
+    generation = schedule.snapshot("v8")
+    schedule.rescan()
+    assert schedule.snapshot("v8") == generation + 1
+    assert schedule.ready() == {"chrome", "jsc"}
+    assert schedule.deadlines["v8"] == 160.0
+    now[0] = 160.0
+    assert schedule.ready() == {"v8", "chrome", "jsc"}

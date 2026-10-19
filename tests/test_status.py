@@ -487,3 +487,88 @@ class TestDropReportWithNoCursor:
         lines = []
         render(collect_status(env.cfg, env.collector, ["v8"]), lines.append)
         assert "cursor unset" in "\n".join(lines)
+
+
+class TestWindowStatus:
+    def render_window(self, env):
+        from slipstream.status import window_status, render_window
+
+        lines = []
+        render_window(window_status(env.cfg, "/selected/config.toml"), lines.append)
+        return "\n".join(lines)
+
+    def test_closed_ignores_stale_bus_in_flight(self, env):
+        from slipstream.bench_window import write_override
+
+        write_override("close")
+        env.bus.write_bench_state(
+            "v8", BenchState(in_flight={"commit_id": 123, "started_at": 1})
+        )
+        _, report = _status(env)
+        assert report.bench_in_flight
+        lines = self.render_window(env)
+        assert "Normal use permitted" in lines
+        assert "Finishing current commit" not in lines
+        assert "for /selected/config.toml" in lines
+
+    @pytest.mark.parametrize("role", ["bench", "watch"])
+    def test_actual_git_manual_or_bus_holder_finishes(self, env, role):
+        from slipstream.bench_window import write_override
+
+        machine = MachineLock(role, env.collector.lock.path)
+        machine.try_acquire("v8 123")
+        try:
+            write_override("close")
+            lines = self.render_window(env)
+            assert "Finishing current commit" in lines
+            assert "v8 123" in lines and "started 20" in lines
+            assert "Normal use permitted" not in lines
+        finally:
+            machine.release()
+        assert "Normal use permitted" in self.render_window(env)
+
+    def test_builder_is_separate_activity(self, env):
+        from slipstream.bench_window import write_override
+
+        write_override("close")
+        machine = MachineLock("build", env.collector.lock.path)
+        machine.try_acquire("jsc 123")
+        try:
+            lines = self.render_window(env)
+            assert "Normal use permitted" in lines
+            assert "build pid" in lines and "jsc 123" in lines
+        finally:
+            machine.release()
+
+    def test_unidentified_holder_never_claims_normal_use(self, env):
+        from slipstream.bench_window import write_override
+
+        write_override("close")
+        machine = MachineLock("watch", env.collector.lock.path)
+        machine.try_acquire("v8 123")
+        try:
+            machine.path.write_text("corrupt metadata")
+            lines = self.render_window(env)
+            assert "activity unknown" in lines
+            assert "Normal use permitted" not in lines
+        finally:
+            machine.release()
+
+    def test_selected_config_changes_are_labeled_and_not_loaded_watch_policy(self, env):
+        env.cfg.bench.timezone = "UTC"
+        env.cfg.bench.allowed_windows = []
+        lines = self.render_window(env)
+        assert "Normal use permitted" in lines
+        assert "for /selected/config.toml" in lines
+        assert "watches retain startup configuration" in lines
+        env.cfg.bench.allowed_windows = None
+        assert "Benchmarking permitted" in self.render_window(env)
+
+    def test_other_blockers_do_not_reserve_normal_use_when_window_open(self, env):
+        env.bus.write_bench_state(
+            "v8", BenchState(last_error="stalled", updated_at=time.time())
+        )
+        lines = self.render_window(env)
+        assert "Benchmarking permitted" in lines
+        assert "last reported blocker" in lines and "stalled" in lines
+        assert "Normal use permitted" not in lines

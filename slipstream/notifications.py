@@ -224,6 +224,16 @@ class WorkSchedule:
                 if self.deadlines.get(name, 0) <= now
             }
 
+    def rescan(self):
+        """Request fresh work without shortening existing retry deadlines."""
+        with self.condition:
+            for name in self.generation:
+                self.generation[name] += 1
+                self.pending.add(name)
+            for name in self.deadlines.keys() - self.generation.keys():
+                self.deadlines[name] = 0.0
+            self.condition.notify_all()
+
     def wait(self, should_stop):
         with self.condition:
             while not should_stop() and not self.ready():

@@ -17,11 +17,14 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from datetime import UTC, datetime
+
 from . import __version__, host
+from . import bench_window
 from .bus import Bus, BusError, cursor_path, read_cursor
 from .config import BusSource, Config
 from .consumer import TRANSPORT_ERRORS, open_source
-from .lock import MachineLock, paused_until
+from .lock import Holder, MachineLock, paused_until
 from .models import CommitKey
 from .store import CommitStore
 
@@ -73,6 +76,136 @@ class BusStatus:
     lock_holder: str | None = None
     lock_waiters: list[str] = field(default_factory=list)
     paused_until: float | None = None
+    window: WindowStatus | None = None
+
+
+@dataclass
+class WindowStatus:
+    config: str
+    decision: bench_window.Decision
+    schedule: str
+    override: bench_window.Override | str | None
+    holder: Holder | None
+    paused: float | None
+    waiters: list[str]
+    blockers: list[str] = field(default_factory=list)
+
+
+def window_status(cfg, label):
+    config = cfg.bench
+    override = bench_window.read_override()
+
+    decision = bench_window.evaluate(
+        config.timezone, config.allowed_windows, override, datetime.now(UTC)
+    )
+    machine = MachineLock("status")
+    try:
+        holder = machine.probe()
+        waiters = [str(w) for w in machine.waiters()]
+    except OSError:
+        holder = Holder(0, "unknown", 0)
+        waiters = []
+    schedule = (
+        "unrestricted"
+        if config.allowed_windows is None
+        else (f"{config.allowed_windows or 'no scheduled opening'} ({config.timezone})")
+    )
+    blockers = []
+    root = cfg.bus.root if cfg.bus else cfg.out_dir
+    while not root.exists() and root != root.parent:
+        root = root.parent
+    try:
+        free = shutil.disk_usage(root).free / GB
+        if free < config.min_free_gb:
+            blockers.append(
+                f"disk floor: {free:.0f}GB free, {config.min_free_gb:g}GB required"
+            )
+        if cfg.bus:
+            bus = Bus(cfg.bus.root)
+            for name in cfg.engines:
+                state = bus.read_bench_state(name)
+                if state.last_error:
+                    age = (
+                        int(time.time() - state.updated_at)
+                        if state.updated_at
+                        else "unknown"
+                    )
+                    blockers.append(
+                        f"{name}: last reported blocker ({age}s ago): {state.last_error}"
+                    )
+    except (OSError, BusError) as exc:
+        blockers.append(f"cannot read other blockers: {exc}")
+    return WindowStatus(
+        label, decision, schedule, override, holder, paused_until(), waiters, blockers
+    )
+
+
+def render_window(report, echo):
+    def instant(value):
+        return value.astimezone().isoformat(timespec="seconds")
+
+    decision, holder = report.decision, report.holder
+    next_time = instant(decision.next_change) if decision.next_change else None
+    if decision.allowed:
+        summary = "Benchmarking permitted" + (
+            f" until {next_time}" if next_time else ""
+        )
+    elif holder is not None and (
+        holder.role not in ("bench", "watch", "build") or not holder.alive
+    ):
+        summary = "Admission closed; activity unknown"
+    elif (
+        holder is not None
+        and holder.role in ("bench", "watch")
+        and not holder.job.startswith("maintenance:")
+    ):
+        summary = "Finishing current commit"
+    elif decision.error:
+        summary = (
+            "Admission blocked; repair override before relying on normal-use status"
+        )
+    else:
+        summary = "Normal use permitted " + (
+            f"until {next_time}"
+            if next_time
+            else "until reset or replaced"
+            if decision.reason == "forced close"
+            else "(no scheduled opening)"
+        )
+    echo(f"{summary} — for {report.config}")
+    echo(f"  window: {decision.reason}; schedule: {report.schedule}")
+    if decision.error:
+        echo(f"  error: {decision.error}")
+    if next_time:
+        echo(f"  next policy change: {next_time}")
+    override = report.override
+    if isinstance(override, bench_window.Override):
+        expiry = (
+            instant(override.expires_at)
+            if override.expires_at
+            else "until reset or replaced"
+        )
+        echo(f"  override: {override.mode}, expires {expiry}")
+    if holder is not None:
+        started = (
+            datetime.fromtimestamp(holder.since)
+            .astimezone()
+            .isoformat(timespec="seconds")
+        )
+        echo(f"  machine activity: {holder}; started {started}")
+    else:
+        echo("  machine activity: no active holder")
+    if report.paused:
+        echo(
+            f"  PAUSED by operator until {instant(datetime.fromtimestamp(report.paused).astimezone())}; independent of window"
+        )
+    for blocker in report.blockers:
+        echo(f"  {blocker}")
+    for waiter in report.waiters:
+        echo(f"  queued: {waiter}")
+    echo(
+        "  Configured-policy view: benchers must use this policy. Restart affected watches after TOML changes; watches retain startup configuration."
+    )
 
 
 def _dir_bytes(path: Path) -> int:
@@ -141,9 +274,12 @@ def compare_env(local: dict, remote: dict) -> list[str]:
 
 
 def collect_status(
-    cfg: Config, collector, engines: list[str] | None = None
+    cfg: Config,
+    collector,
+    engines: list[str] | None = None,
+    config_label: str = "~/.config/slipstream/config.toml",
 ) -> BusStatus:
-    store: CommitStore = collector.store
+    store: CommitStore | None = collector.store if collector is not None else None
     bus = Bus(cfg.bus.root) if cfg.bus else None
     names = engines or list(cfg.engines)
     report = BusStatus()
@@ -153,11 +289,11 @@ def collect_status(
     while not probe.exists() and probe != probe.parent:
         probe = probe.parent
     report.free_gb = shutil.disk_usage(probe).free / GB
-    report.paused_until = paused_until()
-    lock = MachineLock("status")
-    holder = lock.probe()
+    report.window = window_status(cfg, config_label)
+    report.paused_until = report.window.paused
+    holder = report.window.holder
     report.lock_holder = str(holder) if holder else None
-    report.lock_waiters = [str(w) for w in lock.waiters()]
+    report.lock_waiters = report.window.waiters
 
     for name in names:
         st = EngineStatus(engine=name)
@@ -182,9 +318,12 @@ def collect_status(
                     st.peer_age = time.time() - read(peer)["fetched_at"]
             except (OSError, BusError) as exc:
                 st.error = str(exc)
-        st.status_counts = store.status_counts(name, cfg.platform)
-        st.orphan_scores = len(store.commit_ids_missing_commit_row(name, cfg.platform))
-        st.provenance = store.run_env_source_counts(name)
+        if store is not None:
+            st.status_counts = store.status_counts(name, cfg.platform)
+            st.orphan_scores = len(
+                store.commit_ids_missing_commit_row(name, cfg.platform)
+            )
+            st.provenance = store.run_env_source_counts(name)
         source: BusSource | None = cfg.bus.source_for(name) if cfg.bus else None
         if source is None:
             report.engines.append(st)
@@ -193,7 +332,12 @@ def collect_status(
         st.source = source.name
         try:
             _fill_bus_status(
-                cfg, bus, store, source, name, st, local_env(cfg, collector, name)
+                cfg,
+                bus,
+                source,
+                name,
+                st,
+                local_env(cfg, collector, name) if collector is not None else None,
             )
         except TRANSPORT_ERRORS as e:
             # An unreachable source is the case this command exists for, so it
@@ -204,7 +348,7 @@ def collect_status(
     return report
 
 
-def _fill_bus_status(cfg, bus, store, source, name, st, mine):
+def _fill_bus_status(cfg, bus, source, name, st, mine):
     handle = open_source(source)
     cursor_file = cursor_path(cfg.out_dir, source.name, name)
     try:
@@ -245,7 +389,7 @@ def _fill_bus_status(cfg, bus, store, source, name, st, mine):
     # The source's own bencher block, so a divergence is reported against the
     # box the artifacts came from rather than against nothing.
     theirs = handle.bench_state(name).env
-    if theirs:
+    if theirs and mine is not None:
         st.env_divergence = compare_env(mine, theirs)
         st.env_since = theirs.get("since")
 
@@ -268,6 +412,8 @@ def render(report: BusStatus, echo) -> None:
     def when(ts):
         return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
+    if report.window is not None:
+        render_window(report.window, echo)
     echo(f"free space: {report.free_gb:.0f}GB")
     if report.paused_until:
         echo(f"PAUSED by operator until {when(report.paused_until)}")
@@ -346,8 +492,8 @@ def render(report: BusStatus, echo) -> None:
                 echo(f"  bench state written {int(st.bench_age / 60)}m ago")
             if st.bench_in_flight:
                 echo(
-                    f"  benching {_key_of(st.bench_in_flight)} since "
-                    f"{when(st.bench_in_flight.get('started_at', 0))}"
+                    f"  last reported benching {_key_of(st.bench_in_flight)} since "
+                    f"{when(st.bench_in_flight.get('started_at', 0))} (snapshot; machine lock shows current activity)"
                 )
             if st.bench_error:
                 echo(f"  bencher last error: {st.bench_error}")

@@ -1,0 +1,246 @@
+# Copyright 2026 The slipstream developers
+# SPDX-License-Identifier: MIT
+
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+
+import pytest
+from typer.testing import CliRunner
+
+from slipstream import bench_window, cli
+from slipstream.admission import CollectionResult, StopReason
+from slipstream.collector import BenchCollector
+from slipstream.config import BusConfig, BusSource, EngineConfig
+
+
+@pytest.fixture
+def window_config(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        f'out_dir = "{tmp_path}/out"\n[bench]\ntimezone = "Europe/Berlin"\nallowed_windows = []\n'
+    )
+    return path
+
+
+def invoke(path, *args):
+    return CliRunner().invoke(cli.app, [*args, "--config", str(path)])
+
+
+def test_controls_and_status_without_daemon_bus_or_db(window_config, tmp_path):
+    result = invoke(window_config, "window", "status")
+    assert result.exit_code == 0, result.output
+    assert "Normal use permitted" in result.output
+    assert f"for {window_config}" in result.output
+    assert "Restart affected watches" in result.output
+    assert bench_window.read_override() is None
+    assert list(bench_window.override_path().parent.iterdir()) == []
+    result = invoke(window_config, "window", "open", "--for", "6h")
+    assert result.exit_code == 0 and "Benchmarking permitted" in result.output
+    assert "expires 20" in result.output
+    result = invoke(window_config, "window", "close")
+    assert result.exit_code == 0 and "until reset or replaced" in result.output
+    result = invoke(window_config, "window", "close", "--for", "2h")
+    assert result.exit_code == 0 and bench_window.read_override().expires_at
+    result = invoke(window_config, "window", "reset")
+    assert result.exit_code == 0 and bench_window.read_override() is None
+    result = invoke(window_config, "bus", "status")
+    assert result.exit_code == 0 and "Normal use permitted" in result.output
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("open",),
+        ("open", "--for", "0h"),
+        ("close", "--for", "0s"),
+        ("open", "--for", "-1h"),
+    ],
+)
+def test_invalid_duration(window_config, args):
+    assert invoke(window_config, "window", *args).exit_code != 0
+    assert bench_window.read_override() is None
+
+
+def test_corrupt_override_is_visible_and_reset_repairs(window_config):
+    path = bench_window.override_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{")
+    result = invoke(window_config, "window", "status")
+    assert result.exit_code == 0 and "invalid override" in result.output
+    assert "error:" in result.output
+    assert invoke(window_config, "window", "reset").exit_code == 0
+    assert bench_window.read_override() is None
+
+
+@pytest.fixture
+def watch_env(config, tmp_path, monkeypatch):
+    config.engines["v8"] = EngineConfig(
+        name="v8",
+        src_dir=tmp_path,
+        build_cmd="true",
+        binary_path="d8",
+        id_regex=r"#([0-9]+)",
+    )
+    config.bus = BusConfig(
+        root=tmp_path / "bus",
+        sources=[BusSource("local", str(tmp_path / "bus"), engines=["v8"])],
+    )
+    collector = BenchCollector(config, wait_for_lock=True)
+    monkeypatch.setattr(cli, "_load_config", lambda path: config)
+    monkeypatch.setattr(cli, "_open_collector", lambda *a, **kw: collector)
+    monkeypatch.setattr(cli, "_host_preflight", lambda cfg: None)
+    return config, collector
+
+
+@pytest.mark.parametrize("command", ["bench", "watch"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_bounded_commands_defer_without_destructive_work(
+    watch_env, monkeypatch, command, dry_run
+):
+    config, collector = watch_env
+    config.bench.timezone = "UTC"
+    config.bench.allowed_windows = []
+    monkeypatch.setattr(cli, "_shutdown_flag", lambda: lambda: False)
+    collector.store.upsert_commit("v8", "abc", 100, "2026-01-01", 1, "test")
+    collector.store.mark_done("v8", config.platform, 100)
+    monkeypatch.setattr(
+        collector, "get_commit_list", lambda *a, **kw: [{"hash": "abc"}]
+    )
+    monkeypatch.setattr(collector, "populate_commit_metadata", lambda *a: None)
+    monkeypatch.setattr(
+        collector, "_provision", lambda *a: pytest.fail("provisioned while closed")
+    )
+    args = (
+        ["bench", "v8", "100", "100", "--clear"]
+        if command == "bench"
+        else ["watch", "--once"]
+    )
+    if dry_run:
+        args += ["--dry-run"]
+    result = CliRunner().invoke(cli.app, args)
+    assert result.exit_code == (0 if dry_run else 75), result.output
+    assert "closed" in result.output
+    assert "up to date" not in result.output
+    assert not collector.lock.path.exists()
+
+
+@pytest.mark.parametrize("notification_while_closed", [False, True])
+@pytest.mark.parametrize("defer_during_drain", [False, True])
+def test_watch_reopens_on_expiry_without_new_publication(
+    watch_env, monkeypatch, notification_while_closed, defer_during_drain
+):
+    _, collector = watch_env
+    clock = [datetime(2026, 10, 19, 0, 0, tzinfo=UTC)]
+    current = bench_window.current
+    monkeypatch.setattr(
+        bench_window, "current", lambda config: current(config, now=clock[0])
+    )
+    stopped = [False]
+    monkeypatch.setattr(cli, "_shutdown_flag", lambda: lambda: stopped[0])
+    schedules, dispatch = [], []
+
+    def subscribe(sources, schedule, log):
+        schedules.append(schedule)
+        schedule.changed(["v8"])
+        return SimpleNamespace(close=lambda: None)
+
+    monkeypatch.setattr("slipstream.notifications.Subscriptions", subscribe)
+
+    def drain(self, source, name, should_stop, **kwargs):
+        dispatch.append(clock[0])
+        if len(dispatch) == 1:
+            bench_window.write_override("close", 1, now=clock[0])
+            return CollectionResult(
+                reason=StopReason.DEFERRED
+                if defer_during_drain
+                else StopReason.COMPLETE
+            )
+        stopped[0] = True
+        return CollectionResult(1)
+
+    monkeypatch.setattr("slipstream.consumer.BusConsumer.drain", drain)
+
+    def sleep(seconds):
+        assert len(dispatch) == 1, "dispatched while closed"
+        if defer_during_drain:
+            assert "v8" in schedules[0].pending
+            assert "v8" not in schedules[0].deadlines
+        if notification_while_closed:
+            schedules[0].changed(["v8"])
+        clock[0] += timedelta(seconds=seconds)
+
+    monkeypatch.setattr(cli.time_mod, "sleep", sleep)
+    result = CliRunner().invoke(cli.app, ["watch"])
+    assert result.exit_code == 0, result.output
+    assert dispatch == [
+        datetime(2026, 10, 19, tzinfo=UTC),
+        datetime(2026, 10, 19, 0, 0, 1, tzinfo=UTC),
+    ]
+    assert result.output.count("Benchmark window: forced close") == 1
+
+
+def test_open_does_not_resume_bus_pause(window_config):
+    from slipstream.lock import pause, paused_until
+
+    pause(60)
+    result = invoke(window_config, "window", "open", "--for", "1h")
+    assert result.exit_code == 0
+    assert (
+        "Benchmarking permitted" in result.output
+        and "PAUSED by operator" in result.output
+    )
+    assert paused_until() is not None
+
+
+@pytest.mark.parametrize("command", ["bench", "watch"])
+def test_partial_bounded_deferral_retains_completed_work(
+    watch_env, monkeypatch, command
+):
+    config, collector = watch_env
+    monkeypatch.setattr(cli, "_shutdown_flag", lambda: lambda: False)
+    counts = []
+    if command == "bench":
+        for key, sha in [(100, "abc"), (101, "def")]:
+            collector.store.upsert_commit("v8", sha, key, "2026-01-01", key, "test")
+        monkeypatch.setattr(
+            collector,
+            "get_commit_list",
+            lambda *a, **kw: [{"hash": "abc"}, {"hash": "def"}],
+        )
+        monkeypatch.setattr(collector, "populate_commit_metadata", lambda *a: None)
+        monkeypatch.setattr(collector, "_provision", lambda *a: config.out_dir)
+
+        def measured(engine, key, root):
+            from slipstream.collector import BenchOutcome
+
+            counts.append(key.commit_id)
+            bench_window.write_override("close")
+            return BenchOutcome(1, 1, 10)
+
+        monkeypatch.setattr(collector, "_run_benchmarks", measured)
+        args = ["bench", "v8", "100", "101"]
+    else:
+
+        def drain(self, source, name, should_stop, **kwargs):
+            if counts:
+                return CollectionResult(reason=StopReason.DEFERRED)
+            counts.append(100)
+            collector.store.mark_done("v8", config.platform, 100)
+            bench_window.write_override("close")
+            return CollectionResult(1)
+
+        monkeypatch.setattr("slipstream.consumer.BusConsumer.drain", drain)
+        args = ["watch", "--once"]
+    result = CliRunner().invoke(cli.app, args)
+    assert result.exit_code == 75, result.output
+    assert counts == [100]
+    # The command closed its connection. Read the persisted completion anew.
+    from slipstream.store import CommitStore
+
+    with_store = CommitStore(config.metadata_dir / "slipstream.db", backup=False)
+    try:
+        assert with_store.is_done("v8", config.platform, 100)
+        assert not with_store.is_done("v8", config.platform, 101)
+    finally:
+        with_store.close()

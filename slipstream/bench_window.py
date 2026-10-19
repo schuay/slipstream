@@ -120,9 +120,16 @@ def evaluate(timezone, windows, override, now: datetime) -> Decision:
     if override is not None and (
         override.expires_at is None or now < override.expires_at
     ):
-        return Decision(
-            override.mode == "open", f"forced {override.mode}", override.expires_at
-        )
+        allowed = override.mode == "open"
+        next_change = None
+        if override.expires_at is not None:
+            resumed = evaluate(timezone, windows, None, override.expires_at)
+            next_change = (
+                override.expires_at
+                if resumed.allowed != allowed
+                else resumed.next_change
+            )
+        return Decision(allowed, f"forced {override.mode}", next_change)
     if windows is None:
         return Decision(True, "unrestricted")
     intervals = [_interval(w) for w in windows]

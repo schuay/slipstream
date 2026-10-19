@@ -12,6 +12,7 @@ from typing import Annotated, Optional
 
 import typer
 
+from .admission import StopReason
 from .config import load_config
 from .models import CommitKey
 from .collector import BenchCollector, FetchError
@@ -136,7 +137,7 @@ def bench(
 
     collector = _open_collector(cfg, dry_run=dry_run, verbose=verbose, role="bench")
     try:
-        collector.collect(
+        result = collector.collect(
             engine,
             start,
             end,
@@ -144,6 +145,13 @@ def bench(
             clear=clear,
             should_stop=_shutdown_flag(),
         )
+        if result.reason == StopReason.DEFERRED and not dry_run:
+            typer.echo(
+                f"{result.benched} benched; remaining work deferred by benchmark window"
+            )
+            raise typer.Exit(75)
+        if result.reason == StopReason.FAILURE:
+            raise typer.Exit(1)
     except ValueError as e:
         # An engine configured without src_dir, on a box that only benches
         # artifacts. Every command that needs git says so by name.
@@ -156,6 +164,66 @@ def bench(
             "Run 'slipstream bus pause' to have the daemons stand down.", err=True
         )
         raise typer.Exit(EXIT_BUSY)
+    finally:
+        collector.store.close()
+
+
+window_app = typer.Typer(
+    help="Control benchmark admission; admitted commits finish normally."
+)
+app.add_typer(window_app, name="window")
+
+
+def _show_window(cfg, path):
+    from .status import window_status, render_window
+
+    render_window(
+        window_status(cfg, str(path or "~/.config/slipstream/config.toml")),
+        typer.echo,
+    )
+
+
+def _window_mutation(mode, duration, config):
+    from .bench_window import write_override
+
+    cfg = _load_config(config)
+    seconds = _parse_interval(duration) if duration is not None else None
+    try:
+        write_override(mode, seconds)
+    except (OSError, ValueError, TimeoutError) as exc:
+        typer.echo(f"Window error: {exc}", err=True)
+        raise typer.Exit(1)
+    _show_window(cfg, config)
+
+
+@window_app.command("open")
+def window_open(
+    duration: str = typer.Option(..., "--for", help="Positive duration, e.g. 6h"),
+    config: Optional[Path] = typer.Option(None),
+):
+    """Permit new commits for a duration. Does not start watch."""
+    _window_mutation("open", duration, config)
+
+
+@window_app.command("close")
+def window_close(
+    duration: Optional[str] = typer.Option(None, "--for"),
+    config: Optional[Path] = typer.Option(None),
+):
+    """Deny new commits until reset, replaced, or the duration expires."""
+    _window_mutation("close", duration, config)
+
+
+@window_app.command("reset")
+def window_reset(config: Optional[Path] = typer.Option(None)):
+    """Remove the override and return to the configured schedule."""
+    _window_mutation(None, None, config)
+
+
+@window_app.command("status")
+def window_status_cmd(config: Optional[Path] = typer.Option(None)):
+    """Report selected policy and actual activity without opening a database."""
+    _show_window(_load_config(config), config)
 
 
 def _parse_interval(value: str) -> int:
@@ -298,6 +366,9 @@ def watch(
     from .consumer import MAX_BENCHES_PER_CYCLE
 
     schedule = subscriptions = None
+    deferred = False
+    was_closed = False
+    last_policy = None
     try:
         if not once and not dry_run:
             from .bus import BusError
@@ -316,10 +387,33 @@ def watch(
                 lambda msg: typer.echo(f"  {msg}", err=True),
             )
         while not should_stop():
+            decision = collector.admission().decision()
+            policy = (decision.allowed, decision.reason, decision.error)
+            if policy != last_policy:
+                typer.echo(f"Benchmark window: {decision.error or decision.reason}")
+                last_policy = policy
+            if not decision.allowed:
+                was_closed = True
+                if once or dry_run:
+                    deferred = not dry_run
+                    break
+                time.sleep(1)
+                continue
+            if was_closed:
+                if schedule is not None:
+                    schedule.rescan()
+                was_closed = False
             if schedule is not None:
-                schedule.wait(should_stop)
+                # Wake for policy even when no source has pending work.
+                schedule.wait(
+                    lambda: (
+                        should_stop() or not collector.admission().decision().allowed
+                    )
+                )
                 if should_stop():
                     break
+                if not collector.admission().decision().allowed:
+                    continue
             t0 = time.monotonic()
             rotation = collector.store.rotation_order("watch", engine_names)
             if schedule is not None:
@@ -344,6 +438,12 @@ def watch(
                         should_stop,
                         max_benches=1,
                     )
+                    if result.reason == StopReason.DEFERRED:
+                        deferred = True
+                        was_closed = True
+                        break
+                    if result.reason == StopReason.SHUTDOWN:
+                        break
                     if schedule is not None:
                         retry = None
                         if result.error:
@@ -405,6 +505,12 @@ def watch(
                     should_stop=should_stop,
                     max_commits=1,
                 )
+                if result.reason == StopReason.DEFERRED:
+                    deferred = True
+                    was_closed = True
+                    break
+                if result.reason == StopReason.SHUTDOWN:
+                    break
                 if result.benched and not dry_run:
                     turns[name] += result.benched
                     if turns[name] < MAX_BENCHES_PER_CYCLE:
@@ -428,6 +534,9 @@ def watch(
             subscriptions.close()
         collector.store.close()
 
+    if once and deferred:
+        typer.echo("Remaining benchmark work deferred by benchmark window")
+        raise typer.Exit(75)
     typer.echo("Watch stopped.")
 
 
@@ -864,10 +973,25 @@ def bus_status(
         if name not in cfg.engines:
             typer.echo(f"Error: engine '{name}' not configured.", err=True)
             raise typer.Exit(1)
-    # No db snapshot for a reporting command; it still opens read/write,
-    # because it reads columns an unmigrated db does not have.
-    collector = _open_collector(cfg, role="status", backup=False)
-    render(collect_status(cfg, collector, engines), typer.echo)
+    # Policy status must also work on a fresh host without creating a DB.
+    collector = (
+        _open_collector(cfg, role="status", backup=False)
+        if (cfg.metadata_dir / "slipstream.db").exists()
+        else None
+    )
+    try:
+        render(
+            collect_status(
+                cfg,
+                collector,
+                engines,
+                str(config or "~/.config/slipstream/config.toml"),
+            ),
+            typer.echo,
+        )
+    finally:
+        if collector is not None:
+            collector.store.close()
 
 
 @bus_app.command("gc")
