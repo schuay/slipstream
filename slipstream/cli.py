@@ -921,18 +921,20 @@ def bus_endpoint(
 def transfer(config: Optional[Path] = typer.Option(None), once: bool = False):
     """Transfer owned artifacts independently of building and benchmarking."""
     from .transfer import Coordinator
+    from .service_logging import EventLog
 
     cfg = _load_config(config)
     if cfg.bus is None or not cfg.bus.routes:
         raise typer.BadParameter("transfer requires [[bus.routes]]")
-    stopped = _shutdown_flag("transfer", log=lambda msg: typer.echo(msg, err=True))
+    log = EventLog("transfer")
+    stopped = _shutdown_flag("transfer", log=log)
     try:
-        success = Coordinator(cfg, log=lambda msg: typer.echo(msg, err=True)).run(
-            once=once, should_stop=stopped
-        )
+        success = Coordinator(cfg, log=log).run(once=once, should_stop=stopped)
     except (OSError, RuntimeError) as exc:
-        typer.echo(f"Transfer failed: {exc}", err=True)
+        log.error(f"Transfer failed: {exc}")
         raise typer.Exit(1)
+    finally:
+        log.close()
     if once and not success:
         raise typer.Exit(1)
 

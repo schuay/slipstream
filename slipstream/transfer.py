@@ -479,6 +479,15 @@ class Coordinator:
                 else []
             )
             self.bounds[engine] = max(map(CommitKey.parse, values), default=None)
+        cursor = CommitKey.parse(record["cursor"]) if record["cursor"] else None
+        remaining = sum(
+            cursor is None or CommitKey.parse(key) > cursor for key in snapshot["keys"]
+        )
+        bound = f", through={self.bounds[engine]}" if once else ""
+        self.log(
+            f"{engine}: route={route.name}, cursor={record['cursor'] or 'none'}, "
+            f"queued={remaining}{bound}"
+        )
         return record
 
     def _finish(self, engine, record, reply):
@@ -498,6 +507,8 @@ class Coordinator:
             cursor=str(key), pending=None, retry_after=0, failures=0, last_error=None
         )
         self.save(engine, record)
+        if pending["op"] == "skip":
+            self.log(f"{engine}: skipped unavailable history through {key}")
 
     def step(self, engine, record, *, once=False):
         route, source, dest = self.routes[engine]
@@ -509,6 +520,9 @@ class Coordinator:
                 pending["key"]
             ):
                 self._finish(engine, record, receipt)
+                self.log(
+                    f"{engine}: recovered acknowledgement through {record['cursor']}"
+                )
                 return True
             if pending["op"] == "skip":
                 self._finish(
@@ -562,6 +576,7 @@ class Coordinator:
         if target is None:
             self.save(engine, record)
             return False
+        started = time.monotonic()
         with source.capture(engine, target, self.local) as stage:
             ident = identity(stage.text)
             if pending and pending["identity"] != ident:
@@ -569,6 +584,10 @@ class Coordinator:
             record["pending"] = {"op": "deliver", "key": str(target), "identity": ident}
             self.save(engine, record)
             self._finish(engine, record, dest.accept(stage))
+        self.log(
+            f"{engine}: accepted {target}, remaining={record['backlog']}, "
+            f"elapsed={time.monotonic() - started:.2f}s"
+        )
         return True
 
     def copy_health(self, engine, record, generation):

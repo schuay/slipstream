@@ -291,7 +291,8 @@ def test_coordinator_once_freezes_upper_bound(pair, config, monkeypatch):
         dst.ready()["uuid"],
     )
     config.bus = BusConfig(src.root, routes=[route])
-    coordinator = Coordinator(config)
+    events = []
+    coordinator = Coordinator(config, log=events.append)
     record = {
         "source": route.source_uuid,
         "destination": route.destination_uuid,
@@ -313,6 +314,10 @@ def test_coordinator_once_freezes_upper_bound(pair, config, monkeypatch):
     monkeypatch.setattr(destination, "accept", accept_and_publish)
     assert coordinator.run(once=True)
     assert dst.read_entry("v8", 1) and dst.read_entry("v8", 2) is None
+
+    assert "queued=1, through=1" in events[0]
+    assert any("accepted 1, remaining=0, elapsed=" in event for event in events)
+    assert not any("accepted 2" in event for event in events)
 
 
 def test_coordinator_singleton(pair, config):
