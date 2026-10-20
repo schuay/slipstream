@@ -52,7 +52,8 @@ done
 `pmset` needs root privileges to change power settings. The sudoers template
 grants the service account passwordless access to **only the listed, exact AC
 power-mode commands**, keeping slipstream and its hooks unprivileged. Hooks use
-`sudo -n` and fail immediately when permission is missing. No sudoers rule is
+`sudo -n -k` to ignore cached authentication and fail when a command lacks
+passwordless permission. No sudoers rule is
 needed for the empty window templates.
 
 Copy the rule, replace `your_user` with the account running slipstream, and keep
@@ -74,3 +75,10 @@ Post-hooks also run after failed pre-hooks or jobs. Each pair shares a private
 `<out_dir>/metadata/hook-state/`. A killed process cannot restore automatically.
 For recovery, use slipstream's Python environment to run
 `python -m slipstream.power_hooks restore --state-dir /path/to/retained/state`.
+
+If builds initially succeed and a later post-hook reports `sudo: a password is
+required`, older hooks may have relied on cached sudo authentication that expired
+during the job. Install the generated `hooks/pmset.sudoers` rule as described
+above, including every restoration value, then restore the retained snapshot
+before restarting the builder. A successful build does not prove passwordless
+authorization is configured.

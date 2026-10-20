@@ -84,8 +84,9 @@ def read_power():
 
 def write_power(key, value):
     # Never prompt an unattended daemon. The host must grant these particular
-    # pmset commands via sudoers, or the hook fails before any job starts.
-    subprocess.run(["/usr/bin/sudo", "-n", PMSET, "-c", key, str(value)], check=True)
+    # pmset commands via sudoers. Ignore cached credentials so an interactive
+    # sudo session cannot mask missing rules until a long job's restoration.
+    subprocess.run(["/usr/bin/sudo", "-n", "-k", PMSET, "-c", key, str(value)], check=True)
 
 
 def apply(mode, state_dir):

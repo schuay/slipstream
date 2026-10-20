@@ -108,6 +108,20 @@ def test_failed_power_write_retains_snapshot_for_post_hook(tmp_path, monkeypatch
     assert state == {"lowpowermode": "0"}
 
 
+def test_power_write_ignores_cached_sudo_credentials(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        power_hooks.subprocess, "run", lambda cmd, **kw: calls.append((cmd, kw))
+    )
+    power_hooks.write_power("powermode", "2")
+    assert calls == [
+        (
+            ["/usr/bin/sudo", "-n", "-k", "/usr/bin/pmset", "-c", "powermode", "2"],
+            {"check": True},
+        )
+    ]
+
+
 def test_installer_limits_sudo_to_exact_commands(tmp_path, monkeypatch):
     monkeypatch.setattr(power_hooks, "is_macos", lambda: True)
     monkeypatch.setattr(power_hooks, "read_power", lambda: {"lowpowermode": "0"})
