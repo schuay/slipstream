@@ -219,6 +219,9 @@ suite = "js3"
 #                                    # omitted = unrestricted; restart watch
 #                                    # after changes. An admitted commit finishes.
 # Live override: window open --for 6h, window close [--for 2h], window reset
+# Optional watch hooks: executable hooks/pre-window and hooks/post-window beside
+# this config. Run once per observed opening/closing, never between jobs;
+# closing waits for the active job. See README for hook execution semantics.
 # Overrides are shared by every local-user config; bus pause is independent.
 # min_free_gb = 100                  # a payload plus its unpacked root at once
 # run_roots = 2                      # unpacked roots kept per engine

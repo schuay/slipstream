@@ -144,6 +144,22 @@ including when no new artifact arrived. `bench` and `watch --once` return exit
 75 if work is deferred, preserving any completed commits. `--dry-run` reports
 the policy without executing; `bench --clear` clears only admitted commits.
 
+`watch` supports Git-style executable hooks named `hooks/pre-window` and
+`hooks/post-window` beside the selected config file (by default,
+`~/.config/slipstream/hooks/`). `pre-window` runs synchronously once when watch
+observes an opening, before any jobs, including when watch starts in an open
+window. `post-window` runs once when watch observes closing, after the last
+admitted job finishes. Hooks also run for live override transitions, even if
+there is no pending work; they do not run between jobs in the same open window.
+Stopping watch while the window is open does not run `post-window`.
+
+Hooks need a shebang and executable permission (`chmod +x`), receive no arguments,
+and run with the config directory as their working directory and inherited
+environment and output. Missing hooks are skipped; non-executable files are
+ignored with a message. A hook that fails stops watch with an error; a failed
+`pre-window` prevents jobs from starting. `--dry-run` skips hooks. Hooks belong
+to each watch process; `bench` and the `window` commands do not execute them.
+
 `window status` and `bus status` identify the selected config and distinguish
 benchmarking permitted, finishing a current commit, and normal use permitted
 while admission is closed. Actual activity comes from the machine lock;

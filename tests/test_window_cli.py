@@ -128,7 +128,7 @@ def test_bounded_commands_defer_without_destructive_work(
 @pytest.mark.parametrize("notification_while_closed", [False, True])
 @pytest.mark.parametrize("defer_during_drain", [False, True])
 def test_watch_reopens_on_expiry_without_new_publication(
-    watch_env, monkeypatch, notification_while_closed, defer_during_drain
+    watch_env, monkeypatch, tmp_path, notification_while_closed, defer_during_drain
 ):
     _, collector = watch_env
     clock = [datetime(2026, 10, 19, 0, 0, tzinfo=UTC)]
@@ -139,6 +139,13 @@ def test_watch_reopens_on_expiry_without_new_publication(
     stopped = [False]
     monkeypatch.setattr(cli, "_shutdown_flag", lambda: lambda: stopped[0])
     schedules, dispatch = [], []
+    events = tmp_path / "events"
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    for name in ("pre-window", "post-window"):
+        hook = hooks / name
+        hook.write_text(f"#!/bin/sh\necho {name} >> events\n")
+        hook.chmod(0o755)
 
     def subscribe(sources, schedule, log):
         schedules.append(schedule)
@@ -148,6 +155,8 @@ def test_watch_reopens_on_expiry_without_new_publication(
     monkeypatch.setattr("slipstream.notifications.Subscriptions", subscribe)
 
     def drain(self, source, name, should_stop, **kwargs):
+        with events.open("a") as f:
+            f.write("job\n")
         dispatch.append(clock[0])
         if len(dispatch) == 1:
             bench_window.write_override("close", 1, now=clock[0])
@@ -171,13 +180,20 @@ def test_watch_reopens_on_expiry_without_new_publication(
         clock[0] += timedelta(seconds=seconds)
 
     monkeypatch.setattr(cli.time_mod, "sleep", sleep)
-    result = CliRunner().invoke(cli.app, ["watch"])
+    result = invoke(tmp_path / "config.toml", "watch")
     assert result.exit_code == 0, result.output
     assert dispatch == [
         datetime(2026, 10, 19, tzinfo=UTC),
         datetime(2026, 10, 19, 0, 0, 1, tzinfo=UTC),
     ]
     assert result.output.count("Benchmark window: forced close") == 1
+    assert events.read_text().splitlines() == [
+        "pre-window",
+        "job",
+        "post-window",
+        "pre-window",
+        "job",
+    ]
 
 
 def test_open_does_not_resume_bus_pause(window_config):
@@ -289,3 +305,58 @@ def test_timed_close_on_empty_schedule_does_not_claim_reset_will_open(window_con
     assert result.exit_code == 0, result.output
     assert "Normal use permitted (no scheduled opening)" in result.output
     assert "expires 20" in result.output
+
+
+@pytest.mark.parametrize("close_after_job", [False, True])
+def test_watch_hooks_once_per_transition_after_last_job(
+    watch_env, tmp_path, monkeypatch, close_after_job
+):
+    _, collector = watch_env
+    events = []
+    from slipstream.window_hooks import WindowHooks
+
+    original_update = WindowHooks.update
+
+    def update(self, allowed):
+        if allowed != self.open:
+            events.append("open" if allowed else "close")
+        original_update(self, allowed)
+
+    monkeypatch.setattr(WindowHooks, "update", update)
+    monkeypatch.setattr(cli, "_shutdown_flag", lambda: lambda: False)
+
+    def drain(self, *args, **kwargs):
+        events.append("job")
+        if events.count("job") == 2:
+            if close_after_job:
+                bench_window.write_override("close")
+            return CollectionResult()
+        return CollectionResult(1)
+
+    monkeypatch.setattr("slipstream.consumer.BusConsumer.drain", drain)
+    result = invoke(tmp_path / "config.toml", "watch", "--once")
+    assert result.exit_code == 0, result.output
+    assert events == ["open", "job", "job"] + (["close"] if close_after_job else [])
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_pre_window_failure_prevents_jobs(watch_env, tmp_path, monkeypatch, dry_run):
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    hook = hooks / "pre-window"
+    hook.write_text("#!/bin/sh\nexit 42\n")
+    hook.chmod(0o755)
+    monkeypatch.setattr(cli, "_shutdown_flag", lambda: lambda: False)
+    calls = []
+
+    def drain(self, *args, **kwargs):
+        calls.append("job")
+        return CollectionResult()
+
+    monkeypatch.setattr("slipstream.consumer.BusConsumer.drain", drain)
+    args = ["watch", "--once"] + (["--dry-run"] if dry_run else [])
+    result = invoke(tmp_path / "config.toml", *args)
+    assert result.exit_code == (0 if dry_run else 1), result.output
+    assert calls == (["job"] if dry_run else [])
+    if not dry_run:
+        assert "pre-window" in result.output and "42" in result.output

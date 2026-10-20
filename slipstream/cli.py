@@ -376,8 +376,10 @@ def watch(
     typer.echo(f"Watching {', '.join(engine_names)} (interval={interval}, step={step})")
 
     from .consumer import MAX_BENCHES_PER_CYCLE
+    from .window_hooks import HookError, WindowHooks
 
     schedule = subscriptions = None
+    hooks = WindowHooks(config, dry_run=dry_run, log=typer.echo)
     deferred = False
     was_closed = False
     last_policy = None
@@ -400,6 +402,7 @@ def watch(
             )
         while not should_stop():
             decision = collector.admission().decision()
+            hooks.update(decision.allowed)
             policy = (decision.allowed, decision.reason, decision.error)
             if policy != last_policy:
                 typer.echo(f"Benchmark window: {decision.error or decision.reason}")
@@ -415,6 +418,9 @@ def watch(
                 if schedule is not None:
                     schedule.rescan()
                 was_closed = False
+            # A pre-window hook can take time or change the live override.
+            if should_stop() or not collector.admission().decision().allowed:
+                continue
             if schedule is not None:
                 # Wake for policy even when no source has pending work.
                 schedule.wait(
@@ -451,6 +457,7 @@ def watch(
                         max_benches=1,
                     )
                     if result.reason == StopReason.DEFERRED:
+                        hooks.update(False)
                         deferred = True
                         was_closed = True
                         break
@@ -518,6 +525,7 @@ def watch(
                     max_commits=1,
                 )
                 if result.reason == StopReason.DEFERRED:
+                    hooks.update(False)
                     deferred = True
                     was_closed = True
                     break
@@ -541,10 +549,22 @@ def watch(
                 if should_stop():
                     break
                 time.sleep(1)
+    except HookError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
     finally:
         if subscriptions is not None:
             subscriptions.close()
-        collector.store.close()
+        try:
+            # A final commit may have overrun closing, including in --once
+            # mode or during shutdown. Exiting an open window isn't a close.
+            if not collector.admission().decision().allowed:
+                hooks.update(False)
+        except HookError as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(1)
+        finally:
+            collector.store.close()
 
     if once and deferred:
         typer.echo("Remaining benchmark work deferred by benchmark window")

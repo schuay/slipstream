@@ -8,6 +8,7 @@ import random
 import pytest
 
 from slipstream import lock as lock_mod
+from slipstream import config as config_mod
 from slipstream.config import (
     BenchmarkConfig,
     Config,
@@ -33,6 +34,8 @@ def isolated_machine_lock(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(lock_mod, "MACHINE_LOCK", locks / "machine.lock")
     monkeypatch.setattr(lock_mod, "PAUSE_FILE", locks / "pause")
     monkeypatch.setattr(lock_mod, "own_process_group", lambda: None)
+    # Watch hooks must never execute files from the developer's real config.
+    monkeypatch.setattr(config_mod, "_DEFAULT_CONFIG_PATH", locks / "config.toml")
 
 
 @pytest.fixture
