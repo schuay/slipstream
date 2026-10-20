@@ -280,6 +280,9 @@ class SafariReleases:
     def _refresh(self):
         from .builder import store_run_set
 
+        # The caller holds the machine lock, but another producer invocation
+        # may have adopted a release since this resolver last held it.
+        self.record = read_release(self.path)
         # An OS-list change does not mutate an already adopted release. Resolve
         # its old map too, so an upstream removal/change is still a conflict.
         candidate = resolve_packages(self.majors)

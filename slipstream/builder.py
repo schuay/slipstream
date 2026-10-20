@@ -437,7 +437,6 @@ class Builder:
                         f"{engine_name} derives from {engine.derives}, which "
                         f"this machine has no [engines.{engine.derives}] for"
                     )
-                self._seed_embedder_numbers(engine_name)
                 from .safari_packages import SafariReleases
 
                 def number_for(app, name=engine_name):
@@ -460,6 +459,9 @@ class Builder:
                         engine_name,
                         {f"stp-release:{record['release']}": record["embedder_id"]},
                     )
+                # Reserve the adopted identity before creating a synthetic
+                # historical floor when no publications remain.
+                self._seed_embedder_numbers(engine_name)
                 self._resolvers[engine_name] = DerivedResolver(
                     self.bus,
                     engine,

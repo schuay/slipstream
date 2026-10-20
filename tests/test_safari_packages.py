@@ -354,10 +354,37 @@ def test_migration_allocates_above_retained_and_dropped_history(acquisition, con
     r.fetch()
     assert r.installed()[1] == 43
     # A lost database reconstructs the adopted number, without publications.
+    a["bus"].write_builder_state(
+        "safari",
+        BuilderState(frontier=CommitKey(43, 10), highest_dropped=CommitKey(43, 10)),
+    )
     b.store.conn.execute("DELETE FROM embedders")
     b.store.conn.commit()
     restarted = Builder(config, a["bus"])
     assert restarted.resolver("safari").installed()[1] == 43
+    assert restarted.store.embedder_numbers("safari") == {"stp-release:252": 43}
+
+
+@pytest.mark.parametrize("release,error", [(253, "rollback"), (254, "conflict")])
+def test_stale_resolver_preserves_newer_adopted_record(acquisition, release, error):
+    a = acquisition
+    stale = a["manager"]()
+    stale.refresh()
+    other = a["manager"]()
+    a["metadata"] = metadata(254)
+    other.refresh()
+    adopted = copy.deepcopy(other.record)
+    downloads = list(a["downloads"])
+    numbers = a["store"].embedder_numbers("safari")
+
+    a["metadata"] = metadata(release)
+    a["metadata"]["packages"]["27"]["dmg_sha256"] = "f" * 64
+    stale.refresh()
+
+    assert error in stale.last_error
+    assert stale.record == stp.read_release(stale.path) == adopted
+    assert a["downloads"] == downloads
+    assert a["store"].embedder_numbers("safari") == numbers
 
 
 def test_cask_parser_pins_both_packages_and_rejects_mismatched_release():
