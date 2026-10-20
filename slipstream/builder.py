@@ -644,6 +644,11 @@ class Builder:
             self._publish_state(engine_name, state)
             return BuildResult()
 
+        with self.collector.job_hooks("build", engine_name, job.key):
+            return self._build_job(engine, job, state, stalled)
+
+    def _build_job(self, engine, job, state, stalled):
+        engine_name = engine.name
         key = job.key
         state.in_flight = self._in_flight(job, "build")
         self._publish_state(engine_name, state)

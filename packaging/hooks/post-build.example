@@ -1,0 +1,8 @@
+#!/bin/sh
+# Copyright 2026 The slipstream developers
+# SPDX-License-Identifier: MIT
+
+# Copy to <config-directory>/hooks/post-build and make executable.
+# Restore and verify the AC power settings saved by pre-build.
+# Also called after a failed pre-build or build; no snapshot is a no-op.
+exec "${SLIPSTREAM_PYTHON:-python3}" -m slipstream.power_hooks restore

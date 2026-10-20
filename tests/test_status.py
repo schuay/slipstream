@@ -560,7 +560,7 @@ class TestWindowStatus:
         lines = self.render_window(env)
         assert "Normal use permitted" in lines
         assert "for /selected/config.toml" in lines
-        assert "watches retain startup configuration" in lines
+        assert "benchers retain startup configuration" in lines
         env.cfg.bench.allowed_windows = None
         assert "Benchmarking permitted" in self.render_window(env)
 

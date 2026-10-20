@@ -618,7 +618,7 @@ class BusConsumer:
                             f"scores; this is the machine or the run set, not the "
                             f"tree. Check the run set, then "
                             f"'slipstream clear {engine_name} <first> <last>' and "
-                            f"'watch --reset-cursor {engine_name}=<first-1>'."
+                            f"'bench --reset-cursor {engine_name}=<first-1>'."
                         )
                         self.log(f"{engine_name}: stalled -- {state.last_error}")
                         break

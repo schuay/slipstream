@@ -1,0 +1,8 @@
+#!/bin/sh
+# Copyright 2026 The slipstream developers
+# SPDX-License-Identifier: MIT
+
+# Copy to <config-directory>/hooks/pre-window and make executable.
+# Runs once when bench observes an open window, including startup while open.
+# Add site-specific preparation here. Jobs have not started yet.
+exit 0

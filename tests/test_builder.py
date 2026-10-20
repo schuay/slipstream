@@ -1520,3 +1520,34 @@ class TestMigratedBus:
                 output,
             )
         assert (output / "out/d8").read_bytes() == binary.read_bytes()
+
+
+def test_build_hooks_cover_packaging_under_machine_lock(builder, monkeypatch):
+    from slipstream.hooks import Hooks
+
+    events = []
+    hooks = Hooks()
+
+    def run(name, env=None):
+        assert builder.lock.held
+        events.append(name)
+
+    monkeypatch.setattr(hooks, "run", run)
+    # Install marker files to enable the lifecycle; execution is recorded above.
+    directory = builder.cfg.out_dir / "hooks"
+    directory.mkdir()
+    for name in ("pre-build", "post-build"):
+        (directory / name).touch()
+    hooks.directory = directory
+    builder.collector.hooks = hooks
+    original = builder._package_and_publish
+
+    def package(*args, **kwargs):
+        assert builder.lock.held
+        events.append("package")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(builder, "_package_and_publish", package)
+    assert builder.run_cycle(["v8"], lambda: False) == 4
+    assert events == ["pre-build", "package", "post-build"] * 4
+    assert not builder.lock.held

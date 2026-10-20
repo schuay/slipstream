@@ -1070,3 +1070,12 @@ class TestWindowClear:
         assert result.benched == 1 and result.reason == StopReason.DEFERRED
         assert collector.store.is_done("v8", config.platform, 101)
         assert collector.store.get_status("v8", config.platform, 100) == "ok"
+
+
+def test_git_bench_cold_start_selects_newest_commit(config, monkeypatch):
+    collector = BenchCollector(config)
+    monkeypatch.setattr(collector, "head_commit_id", lambda *a, **kw: 123)
+    try:
+        assert collector.find_frontier("v8") == (122, 123)
+    finally:
+        collector.store.close()

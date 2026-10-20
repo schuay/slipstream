@@ -1,0 +1,9 @@
+#!/bin/sh
+# Copyright 2026 The slipstream developers
+# SPDX-License-Identifier: MIT
+
+# Copy to <config-directory>/hooks/post-window and make executable.
+# Runs once when bench observes closing, after the last admitted job finishes.
+# Exiting bench while the window is open does not invoke this hook.
+# Add site-specific cleanup here.
+exit 0

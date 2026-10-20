@@ -5,7 +5,7 @@ V8 or JavaScriptCore at each commit, runs JetStream2, JetStream3 or
 Speedometer 3, stores every raw score in SQLite, and delivers the series to
 the perf database, where the analysis lives.
 
-It is built for unattended operation: a `watch` daemon benchmarks new commits as
+It is built for unattended operation: a `bench` daemon benchmarks new commits as
 they land, and two machines can split the work, one building and both measuring
 the same artifacts.
 
@@ -46,7 +46,7 @@ per engine with its `src_dir`, a `[benchmarks.*]` table per suite with its
 is closed -- an unknown key is a startup error, not a comment -- so the template
 is the reference for what can be set.
 
-For upgrades, stop all running `build`, `watch`, `transfer`, and `deliver` processes before
+For upgrades, stop all running `build`, `bench`, `transfer`, and `deliver` processes before
 `uv tool install --force .`, then restart them. A running process keeps
 its loaded code after reinstalling; leaving an old daemon running across a
 schema migration can cause incompatible writes and retained SQLite locks.
@@ -83,18 +83,20 @@ bus migration.
 ## Measuring
 
 ```sh
-slipstream bench v8 109000 109100
-slipstream watch
+slipstream bench
+slipstream bench v8 --once
 ```
 
-`bench` walks a commit range, building and measuring each commit. `watch` is
-the same thing as a daemon: it picks up where the last run left off,
-measures each new commit, and persists the scores. Without engine arguments,
-`watch` selects engines named by `[[run]]` entries, leaving build-only engines
+`bench` is a daemon that picks up where the last run left off, measures each
+new commit, and persists the scores. A git-driven engine with no benchmark
+history starts with the newest commit; a bus-driven engine starts at its cursor.
+The old `watch` command and range-based `bench ENGINE START END` command are
+removed; update service definitions to use `bench`. Without engine arguments,
+`bench` selects engines named by `[[run]]` entries, leaving build-only engines
 out of collection. An explicitly requested engine must have a run entry.
 Run `slipstream deliver` separately to send scores onward.
 
-Bus-driven `watch` uses macOS/BSD filesystem notifications for new builds.
+Bus-driven `bench` uses macOS/BSD filesystem notifications for new builds.
 Local sources are watched directly; SSH sources use a persistent
 `slipstream bus subscribe` connection, then fetch artifacts as usual. Install
 this version on the source machine first. The SSH command adds `~/.local/bin`
@@ -119,13 +121,13 @@ allowed_windows = ["22:00-06:00"]
 Starts are inclusive and ends exclusive; overnight windows cross midnight.
 Omitting `allowed_windows` permits benchmarking at any time; `[]` permits none
 until an override opens admission. DST follows the local clock, including both
-occurrences of a repeated time. Restart affected watches after changing TOML.
+occurrences of a repeated time. Restart affected benchers after changing TOML.
 Every bencher must use the intended policy; schedules are per config.
 
 ```sh
 slipstream window close               # until reset or replaced
 slipstream window close --for 2h
-slipstream window open --for 6h        # duration required; does not start watch
+slipstream window open --for 6h        # duration required; does not start bench
 slipstream window reset               # return to the configured schedule
 slipstream window status --config /path/to/config.toml
 ```
@@ -139,35 +141,81 @@ admission and is reported until repaired with `window reset`.
 Closing prevents the next engine commit. An admitted commit finishes its build
 or unpacking, all rounds, cooldown and teardown under the machine lock, so it
 can overrun the window end. Queued benchmark requests withdraw when admission
-closes. `watch` keeps subscriptions alive while closed and rescans on reopening,
-including when no new artifact arrived. `bench` and `watch --once` return exit
+closes. `bench` keeps subscriptions alive while closed and rescans on reopening,
+including when no new artifact arrived. `bench --once` returns exit
 75 if work is deferred, preserving any completed commits. `--dry-run` reports
-the policy without executing; `bench --clear` clears only admitted commits.
+the policy without executing hooks or jobs.
 
-`watch` supports Git-style executable hooks named `hooks/pre-window` and
+`bench` supports Git-style executable hooks named `hooks/pre-window` and
 `hooks/post-window` beside the selected config file (by default,
-`~/.config/slipstream/hooks/`). `pre-window` runs synchronously once when watch
-observes an opening, before any jobs, including when watch starts in an open
-window. `post-window` runs once when watch observes closing, after the last
+`~/.config/slipstream/hooks/`). `pre-window` runs synchronously once when bench
+observes an opening, before any jobs, including when bench starts in an open
+window. `post-window` runs once when bench observes closing, after the last
 admitted job finishes. Hooks also run for live override transitions, even if
 there is no pending work; they do not run between jobs in the same open window.
-Stopping watch while the window is open does not run `post-window`.
+Stopping bench while the window is open does not run `post-window`.
 
 Hooks need a shebang and executable permission (`chmod +x`), receive no arguments,
 and run with the config directory as their working directory and inherited
 environment and output. Missing hooks are skipped; non-executable files are
-ignored with a message. A hook that fails stops watch with an error; a failed
+ignored with a message. A hook that fails stops bench with an error; a failed
 `pre-window` prevents jobs from starting. `--dry-run` skips hooks. Hooks belong
-to each watch process; `bench` and the `window` commands do not execute them.
+to each bench process; the `window` commands do not execute them.
+
+Build and measurement jobs also support `pre-build` / `post-build` and
+`pre-bench` / `post-bench` in the same hooks directory. They run once per job
+under the machine lock. Build hooks cover compilation, packaging and publication;
+git-driven benchmarking restores the build state before entering its bench hooks.
+Benchmark preflight runs after `pre-bench`, before scores are changed or measured.
+Post-hooks also run after a failed pre-hook or job, so partial setup can be undone.
+A failing hook stops the daemon without treating the commit as a build failure.
+
+Each pair receives `SLIPSTREAM_HOOK_STATE_DIR` (a private, unique directory),
+`SLIPSTREAM_ENGINE`, and `SLIPSTREAM_COMMIT`. The state directory is removed after
+a successful post-hook; a failed post-hook retains it under
+`<out_dir>/metadata/hook-state/` and prints its path for recovery.
+
+Portable templates for all six hooks live in [packaging/hooks](packaging/hooks),
+with an exact-command [sudoers template](packaging/sudoers/slipstream-power.example).
+See the [packaging guide](packaging/README.md) for installation.
+Copy the desired `.example` files beside your config under `hooks/`, removing
+the `.example` suffix and making each executable. Merge with any existing hooks.
+The window templates are empty customization points; the four job templates use
+the macOS power helper. The runner supplies `SLIPSTREAM_PYTHON`, the interpreter
+running slipstream, so the templates need no installation-specific Python path.
+Replace the sudoers account placeholder and retain only commands supported on
+the target host before validating and installing the rule.
+
+For quieter macOS builds and full-speed measurements, install the provided hooks
+using the Python environment that runs slipstream:
+
+```sh
+python -m slipstream.power_hooks install --config ~/.config/slipstream/config.toml
+```
+
+The installer creates the four job hooks and validates a `hooks/pmset.sudoers`
+fragment. Run its printed `sudo install` command once to authorize only the exact
+AC power-mode commands this host supports. Hooks use `sudo -n`; no general sudo
+access or privileged Python process is required. Build hooks select Low Power;
+bench hooks disable Low Power and request High Power where supported, falling
+back to Automatic when High Power is unavailable. Each post-hook restores the
+previous AC settings, with read-back verification. Battery settings are untouched.
+Use the installer separately on each bot, since their supported settings differ.
+
+Ordinary errors and graceful shutdown restore state. A killed process cannot run
+its post-hook; recover from its retained snapshot before restarting workers:
+
+```sh
+python -m slipstream.power_hooks restore --state-dir /path/to/retained/hook-state
+```
 
 `window status` and `bus status` identify the selected config and distinguish
 benchmarking permitted, finishing a current commit, and normal use permitted
 while admission is closed. Actual activity comes from the machine lock;
-unknown ownership is reported as unknown. Watches retain their startup
+unknown ownership is reported as unknown. Benchers retain their startup
 configuration until restarted, so the configured-policy summary assumes all
 benchers use that policy. `bus pause` remains an independent daemon blocker;
-opening a window does not resume a pause. Ad-hoc `bench` still bypasses that
-pause but respects windows. Builds, transfer, delivery and artifact retention
+opening a window does not resume a pause. Builds, transfer, delivery and artifact retention
 continue outside benchmark windows. Ensure bus capacity covers the backlog;
 retention can drop builds before a closed bencher reads them.
 
@@ -278,10 +326,10 @@ How many times each commit is measured is a property of the `[[run]]` entry,
 
 ## Two machines
 
-`build` and `watch` can be split across a pair of boxes over a shared directory
+`build` and `bench` can be split across a pair of boxes over a shared directory
 called the bus. One box runs `slipstream build`, which checks out each commit,
 builds it, packages the engine's `run_set`, and publishes it. Both boxes run
-`slipstream watch`, which unpacks published artifacts and measures them. This
+`slipstream bench`, which unpacks published artifacts and measures them. This
 keeps the two sets of numbers comparable, since they come from the same binary,
 and it keeps a slow build off the critical path of the faster box.
 

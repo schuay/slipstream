@@ -24,6 +24,7 @@ from . import host
 from .commit_filter import V8CommitFilter
 from .config import Config, EngineConfig, RunSpec
 from .lock import MachineLock
+from .hooks import HookError, Hooks
 from .models import CommitKey
 from .runners import RunRequest, RunResult, Runner, runner_for, suite_cfg_hash
 from .store import CommitIdCollision, CommitStore
@@ -81,6 +82,7 @@ class BenchCollector:
         self.verbose = verbose
         self.lock = MachineLock(role)
         self.wait_for_lock = wait_for_lock
+        self.hooks = Hooks(config.config_path, dry_run=dry_run, log=self._log)
         self.cfg.logs_dir.mkdir(parents=True, exist_ok=True)
         self.log_file = (
             self.cfg.logs_dir / f"bench_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -464,7 +466,16 @@ class BenchCollector:
             return None
         return engine.require_src_dir()
 
-    def build_at(
+    def build_at(self, engine, commit_hash, log=None, *, pins=None):
+        with self.job_hooks("build", engine.name, commit_hash):
+            return self._build_at(engine, commit_hash, log, pins=pins)
+
+    def job_hooks(self, kind, engine, key):
+        return self.hooks.job(
+            kind, self.cfg.metadata_dir / "hook-state", engine=engine, key=key
+        )
+
+    def _build_at(
         self,
         engine: EngineConfig,
         commit_hash: str,
@@ -613,6 +624,14 @@ class BenchCollector:
         )
 
     def bench_at_root(self, engine, commit, run_root, provenance=None):
+        with self.job_hooks("bench", engine.name, CommitKey.from_commit(commit)):
+            if not self.dry_run:
+                ready = host.preflight(self.cfg.host.preflight, self._log)
+                if not ready and self.cfg.host.preflight == "abort":
+                    raise HookError("host is not benchmark-ready after pre-bench")
+            return self._bench_with_result_lock(engine, commit, run_root, provenance)
+
+    def _bench_with_result_lock(self, engine, commit, run_root, provenance=None):
         if self.dry_run:
             return self._bench_at_root(engine, commit, run_root, provenance)
         key = CommitKey.from_commit(commit)
@@ -817,9 +836,12 @@ class BenchCollector:
         last_done = self.store.max_done_key(
             engine_name, self.cfg.platform, embedder_id=0
         )
+        head = self.head_commit_id(engine_name, fetch=fetch)
         return (
-            last_done.commit_id if last_done else None,
-            self.head_commit_id(engine_name, fetch=fetch),
+            last_done.commit_id
+            if last_done
+            else (head - 1 if head is not None else None),
+            head,
         )
 
     def head_commit_id(self, engine_name: str, fetch: bool = True) -> int | None:

@@ -1,0 +1,15 @@
+# Copyright 2026 The slipstream developers
+# SPDX-License-Identifier: MIT
+
+# Replace your_user with the account running build and bench.
+# Keep only the setting(s) reported by `pmset -g custom` on the target host.
+# lowpowermode: 0 = off, 1 = on.
+# powermode: 0 = Automatic, 1 = Low Power, 2 = High Power (when supported).
+# Validate with visudo -c -f, then install root-owned with mode 0440 in
+# /etc/sudoers.d/slipstream-power. The runtime uses sudo -n (never prompts).
+# Grant only these exact AC-profile commands; no wildcards or shell access.
+your_user ALL=(root) NOPASSWD: /usr/bin/pmset -c lowpowermode 0, \
+    /usr/bin/pmset -c lowpowermode 1, \
+    /usr/bin/pmset -c powermode 0, \
+    /usr/bin/pmset -c powermode 1, \
+    /usr/bin/pmset -c powermode 2

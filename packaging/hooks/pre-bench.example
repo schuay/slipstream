@@ -1,0 +1,9 @@
+#!/bin/sh
+# Copyright 2026 The slipstream developers
+# SPDX-License-Identifier: MIT
+
+# Copy to <config-directory>/hooks/pre-bench and make executable.
+# macOS: save the previous AC power mode and disable Low Power before preflight.
+# Request High Power when supported; otherwise use Automatic.
+# Requires the exact pmset sudo rules in ../sudoers/slipstream-power.example.
+exec "${SLIPSTREAM_PYTHON:-python3}" -m slipstream.power_hooks performance

@@ -12,6 +12,7 @@ from slipstream import config as config_mod
 from slipstream.config import (
     BenchmarkConfig,
     Config,
+    HostConfig,
     PushConfig,
     PushTarget,
     RunSpec,
@@ -42,6 +43,7 @@ def isolated_machine_lock(tmp_path_factory, monkeypatch):
 def config(tmp_path):
     """A real Config, so tests read the same attribute surface as the CLI does."""
     return Config(
+        host=HostConfig(preflight="off"),
         out_dir=tmp_path,
         results_dir="results",
         engines={},

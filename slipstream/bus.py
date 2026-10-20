@@ -496,7 +496,7 @@ class BenchState:
     last_error: str | None = None
     stalled_since: float | None = None
     # When a stalled bencher may try again. Persisted for the same reason the
-    # builder's is: `watch --once` from launchd is a new process each time.
+    # builder's is: `bench --once` from launchd is a new process each time.
     stall_retry_after: float | None = None
     # Highest entry this machine skipped because retention had already dropped
     # it. Its own record, because the builder's highest_dropped stops being

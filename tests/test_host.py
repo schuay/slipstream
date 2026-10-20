@@ -625,3 +625,10 @@ class TestRunningBrowsers:
         state = host.read_state(fake_reader(custom=PMSET_CUSTOM_NO_POWERMODE))
         (check,) = [c for c in host.checks(state) if c.name == "no browser running"]
         assert check.ok and check.got == "none"
+
+
+def test_modern_low_power_mode_blocks_benchmark_preflight():
+    state = host.HostState(on_ac=True, ac={"powermode": "1"})
+    assert "power mode is not Low Power" in {
+        c.name for c in host.failures(host.checks(state))
+    }

@@ -886,16 +886,15 @@ def test_empty_remote_reset_is_not_silently_treated_as_caught_up(tmp_path):
     assert read_cursor(source.path) == 12
 
 
-def test_watch_has_no_delivery_side_effects(config, store, monkeypatch):
+def test_bench_has_no_delivery_side_effects(config, store, monkeypatch):
     from types import SimpleNamespace
     from typer.testing import CliRunner
     from slipstream.cli import app
     from slipstream.config import EngineConfig
 
     _seed(store, [1])
-    config.engines["v8"] = EngineConfig("v8", None, "", "", "")
+    config.engines["v8"] = EngineConfig("v8", config.out_dir, "", "", "")
     monkeypatch.setattr("slipstream.cli._load_config", lambda path: config)
-    monkeypatch.setattr("slipstream.cli._host_preflight", lambda cfg: None)
     from slipstream.admission import Admission
     from slipstream.lock import MachineLock
 
@@ -907,11 +906,11 @@ def test_watch_has_no_delivery_side_effects(config, store, monkeypatch):
     monkeypatch.setattr("slipstream.cli._open_collector", lambda *a, **kw: collector)
     monkeypatch.setattr(
         "slipstream.delivery_targets.open_session",
-        lambda *a, **kw: pytest.fail("watch opened a delivery target"),
+        lambda *a, **kw: pytest.fail("bench opened a delivery target"),
     )
-    result = CliRunner().invoke(app, ["watch", "v8", "--once"])
+    result = CliRunner().invoke(app, ["bench", "v8", "--once"])
     assert result.exit_code == 0, result.output
-    # Watch closes its collector store; durable progress remains unacknowledged.
+    # Bench closes its collector store; durable progress remains unacknowledged.
     from slipstream.store import CommitStore
 
     reopened = CommitStore(store.db_path, backup=False)

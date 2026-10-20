@@ -78,7 +78,6 @@ class TestWatchRotation:
             collector.store.mark_done(name, config.platform, 100)
         monkeypatch.setattr(cli, "_load_config", lambda path: config)
         monkeypatch.setattr(cli, "_open_collector", lambda *a, **kw: collector)
-        monkeypatch.setattr(cli, "_host_preflight", lambda cfg: None)
         monkeypatch.setattr(cli, "_shutdown_flag", lambda: lambda: False)
         order = []
         counts = {"v8": 0, "jsc": 0}
@@ -126,7 +125,7 @@ class TestWatchRotation:
         args = (
             ["--interval", "100h" if bus_driven else "0s"] if continuous else ["--once"]
         )
-        result = CliRunner().invoke(cli.app, ["watch", "v8", "jsc", *args])
+        result = CliRunner().invoke(cli.app, ["bench", "v8", "jsc", *args])
         assert result.exit_code == 0, result.output
         assert order == ["v8", "jsc"] * 4
 
@@ -484,7 +483,7 @@ class TestBusCommands:
             f'root = "{tmp_path}/bus"\nengines = ["v8"]\n'
         )
         res = self._invoke(
-            ["watch", "jsc", "--reset-cursor", "v8=1000", "--config", str(p)]
+            ["bench", "jsc", "--reset-cursor", "v8=1000", "--config", str(p)]
         )
         assert res.exit_code == 0, res.output
         assert "cursor reset to 1000" in res.output
@@ -501,7 +500,7 @@ class TestBusCommands:
             f'root = "{tmp_path}/bus"\nengines = ["v8"]\n'
         )
         res = self._invoke(
-            ["watch", "v8", "--reset-cursor", "jsc=1000", "--config", str(p)]
+            ["bench", "v8", "--reset-cursor", "jsc=1000", "--config", str(p)]
         )
         assert res.exit_code == 1
         assert "no bus source" in res.output
@@ -579,7 +578,7 @@ class TestCheckoutlessEngine:
 
     def test_bench(self, tmp_path):
         res = self._invoke(
-            ["bench", "v8", "1", "2", "--config", str(self._cfg(tmp_path))]
+            ["bench", "v8", "--once", "--config", str(self._cfg(tmp_path))]
         )
         assert res.exit_code == 1
         assert "no checkout on this machine" in res.output
@@ -615,7 +614,6 @@ class TestWatchMeasuredEngines:
             collector.store.mark_done(name, config.platform, 100)
         monkeypatch.setattr(cli, "_load_config", lambda _: config)
         monkeypatch.setattr(cli, "_open_collector", lambda *a, **kw: collector)
-        monkeypatch.setattr(cli, "_host_preflight", lambda _: None)
         monkeypatch.setattr(cli, "_shutdown_flag", lambda: lambda: False)
         scanned = []
 
@@ -629,10 +627,10 @@ class TestWatchMeasuredEngines:
 
         monkeypatch.setattr(collector, "find_frontier", frontier)
         monkeypatch.setattr("slipstream.consumer.BusConsumer.drain", drain)
-        result = CliRunner().invoke(cli.app, ["watch", "--once"])
+        result = CliRunner().invoke(cli.app, ["bench", "--once"])
         assert result.exit_code == 0, result.output
         assert scanned == ["v8", "jsc"]
-        assert "Watching v8, jsc " in result.output
+        assert "Benchmarking v8, jsc " in result.output
         assert "would measure nothing" not in result.output
 
     @pytest.mark.parametrize("explicit", [False, True])
@@ -653,12 +651,21 @@ class TestWatchMeasuredEngines:
                 "opened a collector for an engine with no runs"
             ),
         )
-        args = ["watch", "v8"] if explicit else ["watch"]
+        args = ["bench", "v8"] if explicit else ["bench"]
         result = CliRunner().invoke(cli.app, args)
         assert result.exit_code == 1, result.output
         assert result.output.count("Error:") == 1
         assert (
             "would measure nothing" in result.output
             if explicit
-            else "no engines with [[run]] entries to watch" in result.output
+            else "no engines with [[run]] entries to bench" in result.output
         )
+
+
+def test_watch_command_is_removed():
+    from typer.testing import CliRunner
+    from slipstream.cli import app
+
+    result = CliRunner().invoke(app, ["watch"])
+    assert result.exit_code == 2
+    assert "No such command" in result.output

@@ -16,6 +16,7 @@ from .admission import StopReason
 from .config import load_config
 from .models import CommitKey
 from .collector import BenchCollector, FetchError
+from .hooks import HookError
 from . import host as host_mod
 
 app = typer.Typer(
@@ -93,81 +94,6 @@ def _shutdown_flag(label: str = "current commit", log=None):
     return lambda: state["stop"]
 
 
-def _host_preflight(cfg):
-    """Report macOS host power state; stop the session if configured to."""
-    ok = host_mod.preflight(cfg.host.preflight, lambda msg: typer.echo(msg))
-    if not ok and cfg.host.preflight == "abort":
-        typer.echo(
-            "Error: host is not benchmark-ready. Run 'slipstream host --apply', "
-            'or set [host] preflight = "warn" to run anyway.',
-            err=True,
-        )
-        raise typer.Exit(1)
-
-
-@app.command()
-def bench(
-    engine: Annotated[str, typer.Argument(help="Engine to benchmark: v8 or jsc")],
-    start: Annotated[int, typer.Argument(help="Start commit ID")],
-    end: Annotated[int, typer.Argument(help="End commit ID")],
-    step: int = typer.Option(1, help="Sample every N-th commit"),
-    config: Optional[Path] = typer.Option(
-        None, help="User config path (default: ~/.config/slipstream/config.toml)"
-    ),
-    dry_run: bool = typer.Option(
-        False, "--dry-run", help="Show what would run without executing"
-    ),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show build output"),
-    clear: bool = typer.Option(
-        False, "--clear", help="Clear results directory before starting"
-    ),
-):
-    """Collect benchmark results across a range of commits."""
-    cfg = _load_config(config)
-    if engine not in cfg.engines:
-        typer.echo(
-            f"Error: engine '{engine}' not configured. Available: {list(cfg.engines)}",
-            err=True,
-        )
-        raise typer.Exit(1)
-
-    _host_preflight(cfg)
-
-    from .lock import EXIT_BUSY, LockBusy
-
-    collector = _open_collector(cfg, dry_run=dry_run, verbose=verbose, role="bench")
-    try:
-        result = collector.collect(
-            engine,
-            start,
-            end,
-            step=step,
-            clear=clear,
-            should_stop=_shutdown_flag(),
-        )
-        if result.reason == StopReason.DEFERRED and not dry_run:
-            typer.echo(
-                f"{result.benched} benched; remaining work deferred by benchmark window"
-            )
-            raise typer.Exit(75)
-        if result.reason == StopReason.FAILURE:
-            raise typer.Exit(1)
-    except ValueError as e:
-        # An engine configured without src_dir, on a box that only benches
-        # artifacts. Every command that needs git says so by name.
-        typer.echo(f"Error: {e}", err=True)
-        raise typer.Exit(1)
-    except LockBusy as e:
-        # An operator command does not queue behind a daemon's bench.
-        typer.echo(f"Error: {e}", err=True)
-        typer.echo(
-            "Run 'slipstream bus pause' to have the daemons stand down.", err=True
-        )
-        raise typer.Exit(EXIT_BUSY)
-    finally:
-        collector.store.close()
-
-
 window_app = typer.Typer(
     help="Control benchmark admission; admitted commits finish normally."
 )
@@ -201,7 +127,7 @@ def window_open(
     duration: str = typer.Option(..., "--for", help="Positive duration, e.g. 6h"),
     config: Optional[Path] = typer.Option(None),
 ):
-    """Permit new commits for a duration. Does not start watch."""
+    """Permit new commits for a duration. Does not start bench."""
     _window_mutation("open", duration, config)
 
 
@@ -236,10 +162,12 @@ def _parse_interval(value: str) -> int:
 
 
 @app.command()
-def watch(
+def bench(
     engines: Annotated[
         Optional[list[str]],
-        typer.Argument(help="Engines to watch (default: engines with [[run]] entries)"),
+        typer.Argument(
+            help="Engines to benchmark (default: engines with [[run]] entries)"
+        ),
     ] = None,
     interval: str = typer.Option(
         "30m", help="Git fetch interval; bus builds use notifications"
@@ -249,7 +177,7 @@ def watch(
     no_push: bool = typer.Option(
         False,
         "--no-push",
-        help="Accepted for old service definitions; watch only collects",
+        help="Accepted for old service definitions; bench only collects",
     ),
     reset_cursor: Optional[str] = typer.Option(
         None,
@@ -282,7 +210,7 @@ def watch(
 
     if reset_cursor is None:
         if not engine_names:
-            typer.echo("Error: no engines with [[run]] entries to watch.", err=True)
+            typer.echo("Error: no engines with [[run]] entries to bench.", err=True)
             raise typer.Exit(1)
         for name in engine_names:
             try:
@@ -306,7 +234,7 @@ def watch(
         raise typer.Exit(1)
 
     collector = _open_collector(
-        cfg, dry_run=dry_run, verbose=verbose, role="watch", wait_for_lock=True
+        cfg, dry_run=dry_run, verbose=verbose, role="bench", wait_for_lock=True
     )
 
     consumer = None
@@ -353,30 +281,25 @@ def watch(
         )
         return
 
-    # Verify cold-start: each git-driven engine must have at least one done
-    # commit. A bus-driven engine starts from a cursor instead.
     for name in engine_names:
-        if source_for(name) is None and (
-            collector.store.max_done_key(name, cfg.platform, embedder_id=0) is None
-        ):
-            typer.echo(
-                f"Error: no done commits for '{name}'. "
-                f"Run 'slipstream bench {name} <start> <end>' first.",
-                err=True,
-            )
-            raise typer.Exit(1)
-
-    _host_preflight(cfg)
+        if source_for(name) is None:
+            try:
+                cfg.engines[name].require_src_dir()
+            except ValueError as exc:
+                typer.echo(f"Error: {exc}", err=True)
+                raise typer.Exit(1)
 
     if no_push:
-        typer.echo("watch only collects; --no-push has no effect")
+        typer.echo("bench only collects; --no-push has no effect")
 
     should_stop = _shutdown_flag()
 
-    typer.echo(f"Watching {', '.join(engine_names)} (interval={interval}, step={step})")
+    typer.echo(
+        f"Benchmarking {', '.join(engine_names)} (interval={interval}, step={step})"
+    )
 
     from .consumer import MAX_BENCHES_PER_CYCLE
-    from .window_hooks import HookError, WindowHooks
+    from .window_hooks import WindowHooks
 
     schedule = subscriptions = None
     hooks = WindowHooks(config, dry_run=dry_run, log=typer.echo)
@@ -569,7 +492,7 @@ def watch(
     if once and deferred:
         typer.echo("Remaining benchmark work deferred by benchmark window")
         raise typer.Exit(75)
-    typer.echo("Watch stopped.")
+    typer.echo("Bencher stopped.")
 
 
 @app.command()
@@ -587,7 +510,7 @@ def clear(
     """Forget a range of commits so they can be measured again.
 
     Drops their scores, processing state, push state, provenance and stdout
-    directories. Pair it with 'watch --reset-cursor' on a bus-driven engine:
+    directories. Pair it with 'bench --reset-cursor' on a bus-driven engine:
     the reset alone does nothing, because a consumer skips a commit that is
     already done without fetching it.
 
@@ -808,7 +731,7 @@ def build(
         # A key cursor cannot see anything at or below it, so a republished
         # entry sits unread unless every consumer is reset.
         typer.echo(
-            f"Each consumer needs: slipstream watch --reset-cursor "
+            f"Each consumer needs: slipstream bench --reset-cursor "
             f"{engine}={key.before()}"
         )
         return
@@ -817,21 +740,26 @@ def build(
         _build_probe(builder, engine_names)
         return
 
-    _host_preflight(cfg)
     should_stop = _shutdown_flag("current build")
     typer.echo(f"Building {', '.join(engine_names)} (interval={interval})")
     builder.migrate(should_stop)
 
-    while not should_stop():
-        t0 = time.monotonic()
-        builder.run_cycle(engine_names, should_stop)
-        if once:
-            break
-        sleep_secs = int(interval_secs - min(interval_secs, time.monotonic() - t0))
-        for _ in range(sleep_secs):
-            if should_stop():
+    try:
+        while not should_stop():
+            t0 = time.monotonic()
+            builder.run_cycle(engine_names, should_stop)
+            if once:
                 break
-            time.sleep(1)
+            sleep_secs = int(interval_secs - min(interval_secs, time.monotonic() - t0))
+            for _ in range(sleep_secs):
+                if should_stop():
+                    break
+                time.sleep(1)
+    except HookError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
+    finally:
+        builder.store.close()
     typer.echo("Builder stopped.")
 
 

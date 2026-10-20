@@ -158,7 +158,7 @@ suite = "js3"
 # # cursor_dir = "..."                 # local; default <out_dir>/relay
 
 # The build bus: box2 builds every commit and publishes an artifact, both boxes
-# bench from it. `slipstream build` publishes, `slipstream watch` consumes.
+# bench from it. `slipstream build` publishes, `slipstream bench` consumes.
 #
 # [bus]
 # root = "~/slipstream/bus"          # entries, payloads, fetch tmp, run roots
@@ -216,26 +216,28 @@ suite = "js3"
 # [bench]
 # timezone = "Europe/Berlin"         # required when allowed_windows is set
 # allowed_windows = ["22:00-06:00"]  # union of daily local windows; [] = closed
-#                                    # omitted = unrestricted; restart watch
+#                                    # omitted = unrestricted; restart bench
 #                                    # after changes. An admitted commit finishes.
 # Live override: window open --for 6h, window close [--for 2h], window reset
-# Optional watch hooks: executable hooks/pre-window and hooks/post-window beside
+# Optional bench window hooks: executable hooks/pre-window and hooks/post-window beside
 # this config. Run once per observed opening/closing, never between jobs;
-# closing waits for the active job. See README for hook execution semantics.
+# closing waits for the active job. Also supported: pre-build/post-build and
+# pre-bench/post-bench, once per job under the machine lock. See README for
+# power-mode hook installation, sudo rules, and saved-state restoration.
 # Overrides are shared by every local-user config; bus pause is independent.
 # min_free_gb = 100                  # a payload plus its unpacked root at once
 # run_roots = 2                      # unpacked roots kept per engine
 # max_consecutive_failures = 3       # commits with no scores before it stalls
 
-# macOS only: `bench` and `watch` check the host power state before starting a
-# session. Configure the machine once with `slipstream host --apply`; "abort"
+# macOS only: `bench` checks the host power state after pre-bench, before each
+# measurement job. Configure the machine once with `slipstream host --apply`; "abort"
 # is the right setting for a dedicated bot, which should never run in a state
 # that lets it suspend or throttle.
 #
 # [host]
 # preflight = "warn"    # "warn" (default), "abort", or "off"
 
-# Delivery runs separately from collector-only watch. Keep [[relay]] for remote
+# Delivery runs separately from collector-only bench. Keep [[relay]] for remote
 # spool sources; the relay CLI is removed. All omitted keys use these defaults.
 # [delivery]
 # local = true                      # false on remote-only / build-only machines

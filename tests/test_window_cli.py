@@ -31,7 +31,7 @@ def test_controls_and_status_without_daemon_bus_or_db(window_config, tmp_path):
     assert result.exit_code == 0, result.output
     assert "Normal use permitted" in result.output
     assert f"for {window_config}" in result.output
-    assert "Restart affected watches" in result.output
+    assert "Restart affected benchers" in result.output
     assert bench_window.read_override() is None
     assert list(bench_window.override_path().parent.iterdir()) == []
     result = invoke(window_config, "window", "open", "--for", "6h")
@@ -89,14 +89,12 @@ def watch_env(config, tmp_path, monkeypatch):
     collector = BenchCollector(config, wait_for_lock=True)
     monkeypatch.setattr(cli, "_load_config", lambda path: config)
     monkeypatch.setattr(cli, "_open_collector", lambda *a, **kw: collector)
-    monkeypatch.setattr(cli, "_host_preflight", lambda cfg: None)
     return config, collector
 
 
-@pytest.mark.parametrize("command", ["bench", "watch"])
 @pytest.mark.parametrize("dry_run", [False, True])
 def test_bounded_commands_defer_without_destructive_work(
-    watch_env, monkeypatch, command, dry_run
+    watch_env, monkeypatch, dry_run
 ):
     config, collector = watch_env
     config.bench.timezone = "UTC"
@@ -111,11 +109,7 @@ def test_bounded_commands_defer_without_destructive_work(
     monkeypatch.setattr(
         collector, "_provision", lambda *a: pytest.fail("provisioned while closed")
     )
-    args = (
-        ["bench", "v8", "100", "100", "--clear"]
-        if command == "bench"
-        else ["watch", "--once"]
-    )
+    args = ["bench", "--once"]
     if dry_run:
         args += ["--dry-run"]
     result = CliRunner().invoke(cli.app, args)
@@ -180,7 +174,7 @@ def test_watch_reopens_on_expiry_without_new_publication(
         clock[0] += timedelta(seconds=seconds)
 
     monkeypatch.setattr(cli.time_mod, "sleep", sleep)
-    result = invoke(tmp_path / "config.toml", "watch")
+    result = invoke(tmp_path / "config.toml", "bench")
     assert result.exit_code == 0, result.output
     assert dispatch == [
         datetime(2026, 10, 19, tzinfo=UTC),
@@ -209,45 +203,21 @@ def test_open_does_not_resume_bus_pause(window_config):
     assert paused_until() is not None
 
 
-@pytest.mark.parametrize("command", ["bench", "watch"])
-def test_partial_bounded_deferral_retains_completed_work(
-    watch_env, monkeypatch, command
-):
+def test_partial_bounded_deferral_retains_completed_work(watch_env, monkeypatch):
     config, collector = watch_env
     monkeypatch.setattr(cli, "_shutdown_flag", lambda: lambda: False)
     counts = []
-    if command == "bench":
-        for key, sha in [(100, "abc"), (101, "def")]:
-            collector.store.upsert_commit("v8", sha, key, "2026-01-01", key, "test")
-        monkeypatch.setattr(
-            collector,
-            "get_commit_list",
-            lambda *a, **kw: [{"hash": "abc"}, {"hash": "def"}],
-        )
-        monkeypatch.setattr(collector, "populate_commit_metadata", lambda *a: None)
-        monkeypatch.setattr(collector, "_provision", lambda *a: config.out_dir)
 
-        def measured(engine, key, root):
-            from slipstream.collector import BenchOutcome
+    def drain(self, source, name, should_stop, **kwargs):
+        if counts:
+            return CollectionResult(reason=StopReason.DEFERRED)
+        counts.append(100)
+        collector.store.mark_done("v8", config.platform, 100)
+        bench_window.write_override("close")
+        return CollectionResult(1)
 
-            counts.append(key.commit_id)
-            bench_window.write_override("close")
-            return BenchOutcome(1, 1, 10)
-
-        monkeypatch.setattr(collector, "_run_benchmarks", measured)
-        args = ["bench", "v8", "100", "101"]
-    else:
-
-        def drain(self, source, name, should_stop, **kwargs):
-            if counts:
-                return CollectionResult(reason=StopReason.DEFERRED)
-            counts.append(100)
-            collector.store.mark_done("v8", config.platform, 100)
-            bench_window.write_override("close")
-            return CollectionResult(1)
-
-        monkeypatch.setattr("slipstream.consumer.BusConsumer.drain", drain)
-        args = ["watch", "--once"]
+    monkeypatch.setattr("slipstream.consumer.BusConsumer.drain", drain)
+    args = ["bench", "--once"]
     result = CliRunner().invoke(cli.app, args)
     assert result.exit_code == 75, result.output
     assert counts == [100]
@@ -334,7 +304,7 @@ def test_watch_hooks_once_per_transition_after_last_job(
         return CollectionResult(1)
 
     monkeypatch.setattr("slipstream.consumer.BusConsumer.drain", drain)
-    result = invoke(tmp_path / "config.toml", "watch", "--once")
+    result = invoke(tmp_path / "config.toml", "bench", "--once")
     assert result.exit_code == 0, result.output
     assert events == ["open", "job", "job"] + (["close"] if close_after_job else [])
 
@@ -354,7 +324,7 @@ def test_pre_window_failure_prevents_jobs(watch_env, tmp_path, monkeypatch, dry_
         return CollectionResult()
 
     monkeypatch.setattr("slipstream.consumer.BusConsumer.drain", drain)
-    args = ["watch", "--once"] + (["--dry-run"] if dry_run else [])
+    args = ["bench", "--once"] + (["--dry-run"] if dry_run else [])
     result = invoke(tmp_path / "config.toml", *args)
     assert result.exit_code == (0 if dry_run else 1), result.output
     assert calls == (["job"] if dry_run else [])

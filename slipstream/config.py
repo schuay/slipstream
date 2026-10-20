@@ -131,7 +131,7 @@ class DeliveryConfig:
 
 @dataclass
 class HostConfig:
-    """How `bench` and `watch` react to the macOS host power state.
+    """How `bench` reacts to the macOS host power state after pre-bench.
 
     ``preflight``: "warn" reports and continues, "abort" refuses to start when a
     blocking check fails, "off" skips the check. Inert off macOS.
@@ -530,6 +530,8 @@ class Config:
     # state in the store; it is a host property, not a user setting.
     delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
     platform: str = field(default_factory=_platform.machine)
+    # Origin for local executable hooks; not a TOML setting.
+    config_path: Path | None = None
 
     def require_runs(self, engine: str) -> list[RunSpec]:
         """This engine's matrix, refusing an engine that has none.
@@ -764,6 +766,7 @@ def load_config(user_config_path: Path | None = None) -> Config:
     validate_delivery_identities(push_cfg, relays)
 
     return Config(
+        config_path=path.absolute(),
         out_dir=out_dir,
         results_dir=results_dir,
         bot_name=bot_name,

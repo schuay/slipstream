@@ -26,11 +26,11 @@ if ((${#staged_files[@]})); then
     --check --files "${staged_files[@]}"
 fi
 
-# Prose stays out of this repository: README.md is the one markdown file it
-# carries. Anything else -- design notes, runbooks, incident write-ups --
+# Prose stays out of this repository except the main and packaging READMEs.
+# Anything else -- design notes, runbooks, incident write-ups --
 # belongs in a private place, and a doc that lands here by habit is in the
 # public history for good. Renames count, so moving a doc in is caught too.
-markdown_allowed=(README.md)
+markdown_allowed=(README.md packaging/README.md)
 mapfile -d '' -t staged_new < <(
   git diff --cached --name-only --diff-filter=ACR -z
 )

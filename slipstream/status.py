@@ -206,7 +206,7 @@ def render_window(report, echo):
     for waiter in report.waiters:
         echo(f"  queued: {waiter}")
     echo(
-        "  Configured-policy view: benchers must use this policy. Restart affected watches after TOML changes; watches retain startup configuration."
+        "  Configured-policy view: benchers must use this policy. Restart affected benchers after TOML changes; benchers retain startup configuration."
     )
 
 

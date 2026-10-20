@@ -5,9 +5,10 @@
 
 A collector that runs for months must never suspend, never blank into a lock
 screen, and never sit in a degraded power mode. On macOS those are `pmset`
-settings, which persist across reboots, so the host is configured once with
-``slipstream host --apply`` and only read back afterwards. Nothing here needs
-root except ``--apply`` and ``--restore``.
+settings, which persist across reboots. Configure baseline settings with
+``slipstream host --apply``; optional job hooks temporarily switch power modes
+and restore them. Preflight reads the resulting state after the pre-bench hook.
+Nothing here needs root except ``--apply`` and ``--restore``.
 
 Every write is followed by a re-read: `pmset` accepts `powermode` on hardware
 that has no High Power Mode and silently does nothing, so the only honest
@@ -256,6 +257,17 @@ def checks(state: HostState) -> list[Check]:
             fix="sudo pmset -a disablesleep 1",
         ),
     ]
+
+    if "lowpowermode" not in state.ac and state.ac.get("powermode") == "1":
+        out.append(
+            Check(
+                name="power mode is not Low Power",
+                want="Automatic or High Power",
+                got="Low Power",
+                ok=False,
+                fix="sudo pmset -c powermode 0",
+            )
+        )
 
     # No supported way to read back whether the screen locks: askForPassword has
     # not been honoured since 10.13.4. A screensaver that never starts on a
