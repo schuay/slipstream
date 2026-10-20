@@ -489,7 +489,7 @@ def report(state: HostState, results: list[Check], log: Callable[[str], None]) -
 
 
 def preflight(mode: str, log: Callable[[str], None]) -> bool:
-    """Report host state before a long session. False on a blocking failure.
+    """Check each measurement job, reporting only on a blocking failure.
 
     Takes the mode rather than a Config: config imports this module.
     """
@@ -497,8 +497,10 @@ def preflight(mode: str, log: Callable[[str], None]) -> bool:
         return True
     state = read_state()
     results = checks(state)
-    report(state, results, log)
-    return not failures(results)
+    ready = not failures(results)
+    if not ready:
+        report(state, results, log)
+    return ready
 
 
 # --- Machine identity, recorded with every artifact and every bench ---

@@ -408,6 +408,20 @@ class TestReport:
 
 
 class TestPreflight:
+    @pytest.mark.parametrize("mode", ["warn", "abort"])
+    def test_ready_host_is_silent_even_with_advisories(self, monkeypatch, mode):
+        monkeypatch.setattr(host, "is_macos", lambda: True)
+        state = host.HostState(
+            on_ac=True,
+            ac={"sleep": "0", "displaysleep": "0", "lowpowermode": "0"},
+            screensaver_idle=0,
+        )
+        assert any(not c.ok for c in host.checks(state))
+        monkeypatch.setattr(host, "read_state", lambda: state)
+        logged = []
+        assert host.preflight(mode, logged.append) is True
+        assert logged == []
+
     def test_off_mode_reads_nothing(self):
         logged = []
         assert host.preflight("off", logged.append) is True
@@ -419,13 +433,14 @@ class TestPreflight:
         assert host.preflight("warn", logged.append) is True
         assert logged == []
 
-    def test_reports_and_fails_on_macos(self, monkeypatch):
+    @pytest.mark.parametrize("mode", ["warn", "abort"])
+    def test_reports_and_fails_on_macos(self, monkeypatch, mode):
         monkeypatch.setattr(host, "is_macos", lambda: True)
         monkeypatch.setattr(
             host, "_read", fake_reader(custom=PMSET_CUSTOM_NO_POWERMODE)
         )
         logged = []
-        assert host.preflight("warn", logged.append) is False
+        assert host.preflight(mode, logged.append) is False
         assert any("system sleep (AC)" in line for line in logged)
         assert any("sudo pmset -c sleep 0" in line for line in logged)
 

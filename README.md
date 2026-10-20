@@ -167,6 +167,8 @@ Build and measurement jobs also support `pre-build` / `post-build` and
 under the machine lock. Build hooks cover compilation, packaging and publication;
 git-driven benchmarking restores the build state before entering its bench hooks.
 Benchmark preflight runs after `pre-bench`, before scores are changed or measured.
+Successful preflight checks are silent; a blocking failure prints the host report
+and fixes (`warn` continues, `abort` stops). Hook execution is still logged.
 Post-hooks also run after a failed pre-hook or job, so partial setup can be undone.
 A failing hook stops the daemon without treating the commit as a build failure.
 
