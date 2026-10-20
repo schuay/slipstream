@@ -38,28 +38,34 @@ def _sha(value):
 
 
 def validate_release(record):
+    def require(condition):
+        if not condition:
+            raise BusError("malformed adopted Safari release")
+
     try:
-        assert record["schema"] == 1
-        assert type(record["release"]) is int and record["release"] > 0
-        assert type(record["embedder_id"]) is int and record["embedder_id"] > 0
-        assert re.fullmatch(r"[0-9a-f]{40}", record["homebrew_revision"])
+        require(record["schema"] == 1)
+        require(type(record["release"]) is int and record["release"] > 0)
+        require(type(record["embedder_id"]) is int and record["embedder_id"] > 0)
+        require(re.fullmatch(r"[0-9a-f]{40}", record["homebrew_revision"]))
         majors = record["os_majors"]
-        assert isinstance(majors, list) and majors
-        assert all(type(n) is int and n > 0 for n in majors)
-        assert len(set(majors)) == len(majors)
-        assert set(record["packages"]) == {str(n) for n in majors}
+        require(isinstance(majors, list) and majors)
+        require(all(type(n) is int and n > 0 for n in majors))
+        require(len(set(majors)) == len(majors))
+        require(set(record["packages"]) == {str(n) for n in majors})
         for major, package in record["packages"].items():
-            assert package["os_major"] == int(major)
-            assert package["app_build"] and isinstance(package["app_build"], str)
-            assert package["source_url"].startswith(
-                "https://secure-appldnld.apple.com/"
+            require(
+                type(package["os_major"]) is int and package["os_major"] == int(major)
             )
-            assert _sha(package["dmg_sha256"])
+            require(isinstance(package["app_build"], str) and package["app_build"])
+            require(
+                package["source_url"].startswith("https://secure-appldnld.apple.com/")
+            )
+            require(_sha(package["dmg_sha256"]))
             blob = Blob.from_json(package["blob"], "Safari release")
-            assert blob.path == APP and blob.delta is None
-            assert _sha(blob.id) and _sha(blob.sha256)
-            assert type(blob.bytes) is int and blob.bytes > 0
-    except (AssertionError, KeyError, TypeError, ValueError, AttributeError) as exc:
+            require(blob.path == APP and blob.delta is None)
+            require(_sha(blob.id) and _sha(blob.sha256))
+            require(type(blob.bytes) is int and blob.bytes > 0)
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
         raise BusError("malformed adopted Safari release") from exc
 
 
@@ -254,6 +260,7 @@ class SafariReleases:
             subprocess.SubprocessError,
             KeyError,
             IndexError,
+            TypeError,
         ) as exc:
             self.last_error = str(exc)
             self.log(f"{self.engine}: Safari acquisition failed: {exc}")

@@ -43,6 +43,11 @@ compressed-byte SHA-256. The tree IDs still recognize reusable build output.
 ``bus_protocol.py`` owns locking, captures, publication and recovery for these
 roots. Unmigrated roots retain the version 3 machine-lock-only behavior.
 
+Version 5 Safari publications retain version 4 object addressing and add a
+complete adopted release with an OS-major-to-package map. ``blobs`` holds shared
+WebKit output; ``all_blobs`` includes the alternative app packages for transfer
+and retention. Provisioning unpacks only the package selected for the host OS.
+
 Version 3 adds the delta shape of a blob: the same tree, stored as a base
 archive plus one bsdiff patch per changed 8 MiB block of the tar stream
 (``delta.py``). Patches are files beside the archives, ``blobs/<sha>.bsdiff``,

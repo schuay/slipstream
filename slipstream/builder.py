@@ -504,6 +504,7 @@ class Builder:
             self.store.max_terminal_build_key(engine_name),
         ]
         floor = max((k.embedder_id for k in historical if k is not None), default=0)
+        floor = max(floor, self.store.max_historical_embedder_number(engine_name))
         top = max(
             [*known.values(), *self.store.embedder_numbers(engine_name).values(), 0]
         )
@@ -776,6 +777,16 @@ class Builder:
             if safari_release["embedder_id"] != key.embedder_id:
                 raise BuildError("Safari release changed before publication")
             blobs = list(job.inherits.blobs)
+            # Version 5 addresses compressed bytes even on a legacy local bus.
+            # Preserve old manifests and add aliases for their shared objects.
+            if job.inherits.version < 4:
+                for blob in blobs:
+                    for old, new in zip(
+                        blob.objects(job.inherits.version), blob.objects(5)
+                    ):
+                        dest = storage.object_path(new.name)
+                        if not dest.exists():
+                            os.link(storage.entry_object_path(job.inherits, old), dest)
             inherited = job.inherits.build_cfg_hash
         else:
             # The inner entry's blobs by reference, then this engine's own.

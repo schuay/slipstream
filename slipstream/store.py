@@ -1267,6 +1267,17 @@ class CommitStore:
             )
         return number
 
+    def max_historical_embedder_number(self, engine: str) -> int:
+        """Include retained results and build attempts if allocation rows were lost."""
+        maxima = [*self.embedder_numbers(engine).values(), 0]
+        for table in _KEYED_TABLES:
+            row = self.conn.execute(
+                f"SELECT COALESCE(MAX(embedder_id), 0) FROM {table} WHERE engine=?",
+                (engine,),
+            ).fetchone()
+            maxima.append(int(row[0]))
+        return max(maxima)
+
     def embedder_numbers(self, engine: str) -> dict[str, int]:
         rows = self.conn.execute(
             "SELECT hash, number FROM embedders WHERE engine=?", (engine,)

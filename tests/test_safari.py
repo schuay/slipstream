@@ -679,3 +679,44 @@ class TestOwnership:
         assert not verdict.ok
         assert "vmmap parse failure for 100" in verdict.problem
         assert bad_row in verdict.problem
+
+
+class TestExactImages:
+    def test_bundled_jsc_inside_run_root_is_rejected(self, req):
+        host = _Host(req.run_root, 100)
+        host.content(200)
+        host.content(
+            201,
+            jsc_dir=str(
+                req.run_root / "Safari Technology Preview.app/Contents/Frameworks"
+            ),
+        )
+        verdict = _Runner(host).verify(req, _Proc(100))
+        assert not verdict.ok
+        assert "201:" in verdict.problem
+
+    def test_wrong_safari_inside_run_root_is_rejected(self, req):
+        host = _Host(req.run_root, 100)
+        host.images[100] = [
+            str(
+                req.run_root / "Other.app/Contents/Frameworks" / safari_mod.SAFARI_IMAGE
+            )
+        ]
+        host.content(200)
+        assert not _Runner(host).verify(req, _Proc(100)).ok
+
+    def test_framework_current_symlink_is_accepted(self, req):
+        host = _Host(req.run_root, 100)
+        host.content(200)
+        image = req.run_root / "WebKitBuild/Release" / safari_mod.JSC_IMAGE
+        image.parent.mkdir(parents=True)
+        image.write_bytes(b"image")
+        (image.parent.parent / "Current").symlink_to("A")
+        host.images[200] = [str(image).replace("/Versions/A/", "/Versions/Current/")]
+        assert _Runner(host).verify(req, _Proc(100)).ok
+
+    def test_second_foreign_jsc_mapping_is_rejected(self, req):
+        host = _Host(req.run_root, 100)
+        host.content(200)
+        host.images[200].append("/System/Library/Frameworks/" + safari_mod.JSC_IMAGE)
+        assert not _Runner(host).verify(req, _Proc(100)).ok

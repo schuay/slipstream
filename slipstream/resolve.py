@@ -433,12 +433,10 @@ class DerivedResolver:
     """An engine whose entries wrap another's: key = (B, inner key).
 
     Safari Technology Preview around jsc's WebKit build. There is no source
-    and nothing to compile: each inner entry ``w`` that has what this engine
-    needs becomes ``(B, w)`` -- the inner entry's blobs plus this engine's own
-    run set, which is the installed app. ``B`` names the app. Its
-    ``Info.plist`` has a build string and no position, so the builder
-    assigns one per distinct string through ``number_for``, which the store
-    keeps monotone; the string itself is the embedder hash.
+    and nothing to compile: each qualifying inner entry becomes ``(B, w)``.
+    In production, ``releases`` acquires complete OS package sets and supplies
+    a durable public-release identity and number. The installed-app seam is
+    retained for other derived engines and resolver tests.
 
     An inner entry qualifies when its blobs cover the inner engine's current
     run set: a jsc entry archived before the WebKit runtime joined the run
@@ -446,11 +444,11 @@ class DerivedResolver:
     startup. Migrated version 1 entries have no paths and never qualify.
 
     The series moves with two causes. A new inner entry above the frontier
-    is the ordinary step. A new app (auto-update landed) is first published
+    is the ordinary step. A newly adopted release is first published
     as ``(B', w)`` on the frontier's own ``w``, so the app change is a step
     of its own rather than folded into the next WebKit commit; the inner
-    entries above ``w`` then follow under ``B'``. An app older than the
-    frontier's (a reinstall) is an error until a newer one is installed:
+    entries above ``w`` then follow under ``B'``. An identity below the
+    frontier is an error:
     the series does not go backwards.
     """
 

@@ -283,7 +283,7 @@ class TestRunnerProvenance:
     RUNNER_HASHES = {
         "shell": "sha256:fdb9b01694d1f8052ba10fab1323d49e2d18efdecc040d325067d5c93513cd8b",
         "chromium": "sha256:60a05e56577cd5e3d0f0f8cb3522970a7ae2f3e2c83a6c856d3252e88eff1892",
-        "safari": "sha256:9b9bbf7148a7eeb514b48a6b8884d8e18c8260566d20a1dae1e96d5c14731f71",
+        "safari": "sha256:49feac703fd6e7482d9738e309907a198e4971ae871d45b78f0411c7887d88d6",
     }
     SUITE_HASHES = {
         "js2": "sha256:c8c206b3c459a43f8f7305b13be726b06b65cab2b7c7176a9d647acffcd14c14",
@@ -354,7 +354,9 @@ class TestRunnerProvenance:
         env = ChromiumRunner(**self.kw).host_env(engine, tmp_path)
         assert env == {"host_app": "Chromium 7300.0.1 (146.0.7300.1)"}
 
-    def test_safari_names_the_packaged_stp_and_the_hosts_launcher(self, tmp_path):
+    def test_safari_names_the_packaged_stp_and_the_hosts_launcher(
+        self, tmp_path, monkeypatch
+    ):
         from slipstream.runners import SafariRunner
 
         launcher_app = _bundle(
@@ -373,8 +375,24 @@ class TestRunnerProvenance:
             "27.0",
             "Safari Technology Preview",
         )
+        import json
+
+        monkeypatch.setattr(
+            "slipstream.runners.safari.platform.mac_ver", lambda: ("27.0", (), "")
+        )
+        (root / "safari-package.json").write_text(
+            json.dumps(
+                {
+                    "app_build": "22626.1.8.19.2",
+                    "blob": {"archive": {"sha256": "a" * 64}},
+                }
+            )
+        )
         env = SafariRunner(**self.kw).host_env(engine, root)
         assert env == {
+            "os_version": "27.0",
+            "package_sha256": "a" * 64,
+            "app_build": "22626.1.8.19.2",
             "host_app": "Safari Technology Preview 22626.1.8.19.2 (27.0)",
             "launcher": "Safari 20622.1.2 (26.1)",
         }

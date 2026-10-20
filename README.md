@@ -195,6 +195,35 @@ triggers alongside its existing benchmarking/background flags. HTTP policy and
 Chrome flags are included in the runner configuration hash; adopting them
 changes the measurement baseline for existing browser results.
 
+Safari publications contain one public STP release with packages for each
+configured macOS major (`[build] safari_os_majors = [26, 27]`). The producer
+resolves an immutable Homebrew cask revision, downloads the Apple DMGs, verifies
+their SHA-256 hashes, and extracts their app payloads without installing them.
+Neither an installed STP nor a Safari `src_dir` is required. The producer adopts
+only complete releases, allocating one embedder number after storing all objects.
+`bus/state/safari/safari.json` durably pins the release and protects its objects
+from retention even when no publications remain. Keep this state with bus backups.
+
+An upstream outage, incomplete release, lower public release, or changed metadata
+for the adopted release leaves the pinned release active. Acquisition errors are
+logged and exposed as `safari_acquisition_error` in the builder state. Equal
+releases cannot receive a new identity; active OS-list changes take effect on the
+next higher release. The DMG checksum, app tree hash, and compressed archive hash
+identify distinct representations and are recorded separately.
+
+Upgrade producer, transfer endpoints, and consumers together: these Safari
+publications use entry version 5, while other engines retain their existing
+format. Old consumers reject version 5; new Safari consumers reject legacy
+single-app publications with a compatibility error. Preserve historical identities
+and cursors. A host OS upgrade selects the new package at the existing cursor;
+there is no automatic reset or backfill. A missing OS package or a failed object
+checksum leaves the publication pending. After the last macOS 26 host upgrades,
+set `safari_os_majors = [27]` for future releases.
+
+Before resuming production, validate extraction on the producer and run both JS3
+and SP3 on each target OS against the same publication. Unit tests and package
+extraction alone do not establish compatibility with a custom WebKit build.
+
 Safari runs require a dedicated benchmark account. The runner stops that
 account's Safari launchers and WebKit helpers attributed to their launchd PID
 domains before and after each measurement. It retains attributed process start
@@ -208,9 +237,14 @@ attempt's stderr is kept as `stderr-recovery`. Workload failures are not retried
 Safari provenance checks inspect owned WebContent workers and the launcher with
 `vmmap -w`, which includes system dyld shared-cache libraries that `lsof` can
 omit and preserves full paths under home directories that `sample` redacts.
-Missing images and inspection errors fail verification. The early inspection
-can overlap measurement. This policy changes the configuration
-hash, so measurements are distinguishable from the old inspection policy.
+The launcher must map the selected app's exact Safari.framework image, and every
+owned WebContent worker must map the publication's exact
+`WebKitBuild/Release/JavaScriptCore.framework` image. At least one worker must
+exist. Comparisons resolve symlinks; bundled STP JSC is rejected even inside the
+run root. Missing images and inspection errors fail verification. The selected
+archive hash and app build, host OS, and launcher are recorded in run metadata
+and included in runner configuration identity. The early inspection can overlap
+measurement.
 Safari startup can still trigger Software Update activity; scoped cleanup does
 not establish a background-free measurement environment.
 

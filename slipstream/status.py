@@ -363,7 +363,10 @@ def _fill_bus_status(cfg, bus, source, name, st, mine):
     st.failed_builds = list(builder.failed)
     st.failed_builds_total = builder.failed_total or len(builder.failed)
     st.stalled_since = builder.stalled_since
-    st.builder_error = builder.last_error
+    errors = [builder.last_error] if builder.last_error else []
+    if builder.safari_acquisition_error:
+        errors.append(f"Safari acquisition: {builder.safari_acquisition_error}")
+    st.builder_error = "; ".join(errors) or None
     st.builder_age = time.time() - builder.updated_at if builder.updated_at else None
     st.paused_by_floor = builder.publishing_paused_by_floor
     st.builder_in_flight = builder.in_flight

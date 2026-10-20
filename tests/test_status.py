@@ -572,3 +572,11 @@ class TestWindowStatus:
         assert "Benchmarking permitted" in lines
         assert "last reported blocker" in lines and "stalled" in lines
         assert "Normal use permitted" not in lines
+
+
+def test_safari_acquisition_error_remains_visible_while_publishing(env):
+    env.bus.write_builder_state(
+        "v8", BuilderState(safari_acquisition_error="frozen release conflict")
+    )
+    _, status = _status(env)
+    assert status.builder_error == "Safari acquisition: frozen release conflict"

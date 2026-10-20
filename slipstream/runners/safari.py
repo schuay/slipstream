@@ -17,8 +17,8 @@ the overrides and runs the system engine with no visible difference, and
 ``open -a`` starts stock Safari; both were measured once and discarded. So
 a run is accepted only on evidence from the processes themselves: the
 launcher has loaded ``Safari.framework`` from the run root, and every owned
-WebContent process with a ``JavaScriptCore`` mapped has it from the run
-root, at least one of them existing. Ownership comes from the launcher's
+WebContent process maps the publication's exact ``WebKitBuild/Release`` JSC
+image, at least one of them existing. Symlinks are resolved before comparison. Ownership comes from the launcher's
 launchd PID domain, not Unix parentage or the helper's executable path.
 """
 
@@ -211,13 +211,16 @@ class SafariRunner(BrowserRunner):
 
         try:
             owned = self._discover(proc.pid)
-            safari = _image(self.loaded_images(proc.pid), SAFARI_IMAGE)
+            safari_images = _images(self.loaded_images(proc.pid), SAFARI_IMAGE)
+            safari = ", ".join(safari_images)
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
             return Verdict(
                 False, notes, f"cannot inspect Safari ownership/images: {exc}"
             )
         notes.append(f"launcher {proc.pid}: Safari.framework from {safari or '(none)'}")
-        if not safari or Path(safari).resolve() != expected_safari:
+        if not safari_images or any(
+            Path(p).resolve() != expected_safari for p in safari_images
+        ):
             return Verdict(
                 False,
                 notes,
@@ -234,17 +237,18 @@ class SafariRunner(BrowserRunner):
             if WEBCONTENT not in name or pid not in owned:
                 continue
             try:
-                jsc = _image(self.loaded_images(pid), JSC_IMAGE)
+                images = _images(self.loaded_images(pid), JSC_IMAGE)
                 if self.identity(pid) != self._owned[pid][1]:
                     raise RuntimeError(f"WebContent {pid} changed during inspection")
             except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
                 return Verdict(False, notes, f"cannot inspect WebContent {pid}: {exc}")
-            if not jsc:
+            if not images:
                 return Verdict(
                     False, notes, f"WebContent {pid}: no JavaScriptCore image"
                 )
-            content.append((pid, jsc))
-            notes.append(f"WebContent {pid}: JavaScriptCore from {jsc}")
+            for jsc in images:
+                content.append((pid, jsc))
+                notes.append(f"WebContent {pid}: JavaScriptCore from {jsc}")
         if not content:
             return Verdict(False, notes, "no WebContent process has loaded an engine")
         foreign = [
@@ -449,11 +453,20 @@ class _BSDInfo(ctypes.Structure):
     ]
 
 
-def _image(images: list[str], suffix: str) -> str | None:
+def _images(images: list[str], suffix: str) -> list[str]:
+    # A reported image may use Versions/Current or a symlink to the image.
+    # Check all matching mappings, so a second foreign image cannot hide
+    # behind an earlier correct mapping.
+    framework, _, binary = suffix.partition("/")
+    name = Path(binary).name
+    found = []
     for path in images:
-        if path.endswith(suffix):
-            return path
-    return None
+        resolved = Path(path).resolve()
+        if path.endswith(suffix) or (
+            resolved.name == name and framework in resolved.parts
+        ):
+            found.append(path)
+    return found
 
 
 def _kill(pid: int, sig: signal.Signals) -> None:

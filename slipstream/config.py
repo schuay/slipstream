@@ -180,10 +180,10 @@ class EngineConfig:
 
     An engine that ``derives`` from another (safari from jsc) has no source
     and no compile: each of its entries is an entry of the inner engine plus
-    this engine's own ``run_set``, taken from ``src_dir`` -- for safari the
-    directory the installed app sits in. Its series is ``(B, w)`` with ``w``
-    the inner engine's key and ``B`` a number the builder assigns per
-    distinct installed app. ``binary_path`` may then be absolute: the
+    this engine's own ``run_set``. Safari acquires OS-specific STP packages
+    independently of ``src_dir``. Its series is ``(B, w)`` with ``w`` the
+    inner engine's key and ``B`` a number assigned per public STP release.
+    ``binary_path`` may then be absolute: the
     process that hosts the run is provided by the machine, not the artifact.
     """
 
