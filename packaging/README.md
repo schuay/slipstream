@@ -18,6 +18,22 @@ needs to be embedded in the templates.
 
 ## Install hooks
 
+For the default macOS power hooks, run from the repository root, without sudo:
+
+```sh
+./scripts/install-default-hooks.sh
+# Or select a different config:
+./scripts/install-default-hooks.sh --config /path/to/config.toml
+```
+
+This uses `uv` to prepare the checkout's Python environment, installs the four
+power hooks, and generates and validates a sudoers fragment for the current
+account and supported power settings. Run the printed `sudo install` command
+to enable power changes. Existing custom hooks are not overwritten; window hooks
+are left alone. Keep the checkout and its Python environment in place, since
+the generated hooks use that interpreter.
+
+For manual installation or customized window hooks, use the templates below.
 From the repository root, copy templates without the `.example` suffix and make
 them executable. This preserves existing hooks; merge those manually if needed.
 For a custom config, change `hooks_dir` to its sibling `hooks/` directory.

@@ -187,11 +187,14 @@ Replace the sudoers account placeholder and retain only commands supported on
 the target host before validating and installing the rule.
 
 For quieter macOS builds and full-speed measurements, install the provided hooks
-using the Python environment that runs slipstream:
+from the checkout (requires `uv`):
 
 ```sh
-python -m slipstream.power_hooks install --config ~/.config/slipstream/config.toml
+./scripts/install-default-hooks.sh
 ```
+
+Pass `--config /path/to/config.toml` for a different config. Alternatively, use
+`python -m slipstream.power_hooks install` in slipstream's Python environment.
 
 The installer creates the four job hooks and validates a `hooks/pmset.sudoers`
 fragment. Run its printed `sudo install` command once to authorize only the exact
