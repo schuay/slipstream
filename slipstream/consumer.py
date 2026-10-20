@@ -18,6 +18,7 @@ project is least able to see.
 
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 import subprocess
@@ -251,6 +252,11 @@ class BusConsumer:
         a different run set entry, so the union is the run root and nothing
         in it is written twice.
         """
+        selected = None
+        if engine.runtime == "safari":
+            from .safari_packages import host_os_major, select_package
+
+            selected = select_package(entry, host_os_major())
         if isinstance(source, LocalSource) and source.bus.protocol:
             with source.bus.protocol.capture(entry.engine, entry.key) as capture:
                 if capture.entry != entry:
@@ -273,7 +279,12 @@ class BusConsumer:
         if tmp_root.exists():
             shutil.rmtree(tmp_root)
         tmp_root.mkdir(parents=True)
-        for blob in entry.blobs:
+        blobs = list(entry.blobs)
+        if selected is not None:
+            from .bus import Blob
+
+            blobs.append(Blob.from_json(selected["blob"], "selected Safari package"))
+        for blob in blobs:
             if blob.delta is None:
                 _unpack(paths[blob.objects(entry.version)[0].name], tmp_root)
             else:
@@ -283,6 +294,10 @@ class BusConsumer:
                     lambda sha: paths[patch_name(sha)].read_bytes(),
                     tmp_root,
                 )
+        if selected is not None:
+            (tmp_root / "safari-package.json").write_text(
+                json.dumps(selected, sort_keys=True)
+            )
         tmp_root.rename(root)
         t2 = time.monotonic()
         self._trim_run_roots(engine.name, keep=entry.key)

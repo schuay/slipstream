@@ -729,6 +729,13 @@ class BenchCollector:
         identity = host.identity()
         runner = self._runner(engine)
         host_env = runner.host_env(engine, run_root) if run_root is not None else {}
+        runner_hash = runner.cfg_hash()
+        if engine.runtime == "safari":
+            from .runners.base import cfg_digest
+
+            runner_hash = cfg_digest(
+                "safari-environment", runner_hash, json.dumps(host_env, sort_keys=True)
+            )
         return {
             "source": "local",
             "runs": self.max_runs(engine),
@@ -738,7 +745,7 @@ class BenchCollector:
             "os_version": identity["os_version"],
             "toolchain": identity["toolchain"],
             "build_cfg_hash": build_cfg_hash(engine),
-            "runner_cfg_hash": runner.cfg_hash(),
+            "runner_cfg_hash": runner_hash,
             "suite_cfg_hash": json.dumps(self.suite_cfg_hashes(engine), sort_keys=True),
             "host_env": json.dumps(host_env, sort_keys=True),
             "slipstream_version": __version__,

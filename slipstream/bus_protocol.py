@@ -81,7 +81,7 @@ def component(value):
 
 def identity(text):
     entry = Entry.from_json(text)
-    if entry.version != 4:
+    if entry.version not in (4, 5):
         raise BusError("transfer requires offline migration to version 4")
     component(entry.engine)
     try:
@@ -589,7 +589,7 @@ class BusProtocol:
                 with capture:
                     capture.verify()
                     old = capture.entry
-                    if old.version == 4:
+                    if old.version >= 4:
                         identity(capture.text)
                         if old.owner_uuid != owners[engine]:
                             raise BusError("migration owner conflict")

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import json
 import os
 import platform
 import re
@@ -87,7 +88,7 @@ class SafariRunner(BrowserRunner):
             "<launcher> -HomePage <url>",
             *LAUNCH_ARGS,
             "drain current-user Safari and its launchd PID-domain helpers",
-            "verify owned engines with vmmap image paths including shared cache",
+            "verify exact selected Safari and WebKit JSC resolved image paths with vmmap",
             "retry launch/provenance failure once after cleanup",
         )
 
@@ -117,7 +118,14 @@ class SafariRunner(BrowserRunner):
         # launcher is the macOS Safari whose SafariForWebKitDevelopment ran it,
         # which is host state and the one thing here the archive does not pin.
         apps = [Path(run_root) / e for e in engine.run_set if e.endswith(".app")]
+        selected = Path(run_root) / "safari-package.json"
+        package = json.loads(selected.read_text()) if selected.exists() else {}
         return {
+            "os_version": platform.mac_ver()[0],
+            "package_sha256": package.get("blob", {})
+            .get("archive", {})
+            .get("sha256", ""),
+            "app_build": package.get("app_build", ""),
             "host_app": describe(apps[0]) if apps else "",
             "launcher": describe(bundle_of(engine.resolve_binary(run_root))),
         }
@@ -193,11 +201,13 @@ class SafariRunner(BrowserRunner):
     # --- evidence ---
 
     def verify(self, req: RunRequest, proc: subprocess.Popen) -> Verdict:
-        root = str(req.run_root)
+        root = Path(req.run_root)
         notes: list[str] = []
-
-        def under_root(path: str) -> bool:
-            return Path(path).resolve().is_relative_to(Path(root).resolve())
+        apps = [root / p for p in req.engine.run_set if p.endswith(".app")]
+        if len(apps) != 1:
+            return Verdict(False, notes, "expected exactly one selected Safari app")
+        expected_safari = (apps[0] / "Contents/Frameworks" / SAFARI_IMAGE).resolve()
+        expected_jsc = (root / "WebKitBuild/Release" / JSC_IMAGE).resolve()
 
         try:
             owned = self._discover(proc.pid)
@@ -207,7 +217,7 @@ class SafariRunner(BrowserRunner):
                 False, notes, f"cannot inspect Safari ownership/images: {exc}"
             )
         notes.append(f"launcher {proc.pid}: Safari.framework from {safari or '(none)'}")
-        if not safari or not under_root(safari):
+        if not safari or Path(safari).resolve() != expected_safari:
             return Verdict(
                 False,
                 notes,
@@ -237,13 +247,17 @@ class SafariRunner(BrowserRunner):
             notes.append(f"WebContent {pid}: JavaScriptCore from {jsc}")
         if not content:
             return Verdict(False, notes, "no WebContent process has loaded an engine")
-        foreign = [f"{pid}: {jsc}" for pid, jsc in content if not under_root(jsc)]
+        foreign = [
+            f"{pid}: {jsc}"
+            for pid, jsc in content
+            if Path(jsc).resolve() != expected_jsc
+        ]
         if foreign:
             return Verdict(
                 False,
                 notes,
-                "a WebContent process runs an engine outside the run "
-                "root: " + "; ".join(foreign),
+                "a WebContent process runs an engine other than the publication's "
+                "WebKitBuild/Release/JavaScriptCore.framework: " + "; ".join(foreign),
             )
         self._content_pids = [pid for pid, _ in content]
         return Verdict(True, notes)

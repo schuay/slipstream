@@ -438,13 +438,34 @@ class Builder:
                         f"this machine has no [engines.{engine.derives}] for"
                     )
                 self._seed_embedder_numbers(engine_name)
+                from .safari_packages import SafariReleases
+
+                def number_for(app, name=engine_name):
+                    return self.store.embedder_number(name, app.version, app.title)
+
+                releases = (
+                    SafariReleases(
+                        self.bus,
+                        engine_name,
+                        self.cfg.build.safari_os_majors,
+                        number_for,
+                        self.log,
+                    )
+                    if engine.runtime == "safari"
+                    else None
+                )
+                if releases and releases.record:
+                    record = releases.record
+                    self.store.seed_embedder_numbers(
+                        engine_name,
+                        {f"stp-release:{record['release']}": record["embedder_id"]},
+                    )
                 self._resolvers[engine_name] = DerivedResolver(
                     self.bus,
                     engine,
                     inner,
-                    number_for=lambda app, name=engine_name: self.store.embedder_number(
-                        name, app.version, app.title
-                    ),
+                    number_for=number_for,
+                    releases=releases,
                 )
             elif engine.embeds:
                 inner = self.cfg.engines.get(engine.embeds)
@@ -474,6 +495,20 @@ class Builder:
         for entry in self.bus.entries(engine_name):
             if entry.embedder_hash:
                 known[entry.embedder_hash] = entry.embedder_id
+        # Retention may have removed every manifest; durable frontiers still
+        # establish a floor above legacy numbers after a store rebuild.
+        state = self.bus.read_builder_state(engine_name)
+        historical = [
+            state.frontier,
+            state.highest_dropped,
+            self.store.max_terminal_build_key(engine_name),
+        ]
+        floor = max((k.embedder_id for k in historical if k is not None), default=0)
+        top = max(
+            [*known.values(), *self.store.embedder_numbers(engine_name).values(), 0]
+        )
+        if floor > top:
+            known[f"legacy-floor:{floor}"] = floor
         if known:
             self.store.seed_embedder_numbers(engine_name, known)
 
@@ -732,8 +767,16 @@ class Builder:
         key = job.key
         commit = job.commit
         inherited = None
+        safari_release = {}
         if job.compiles:
             blobs = self._store(engine, storage)
+        elif engine.runtime == "safari":
+            releases = self.resolver(engine.name).releases
+            safari_release = releases.record
+            if safari_release["embedder_id"] != key.embedder_id:
+                raise BuildError("Safari release changed before publication")
+            blobs = list(job.inherits.blobs)
+            inherited = job.inherits.build_cfg_hash
         else:
             # The inner entry's blobs by reference, then this engine's own.
             # The app can be replaced under us by its updater: its identity
@@ -767,7 +810,8 @@ class Builder:
             builder=dict(self.identity),
             built_at=int(time.time()),
             build_secs=build_secs,
-            version=storage.format_version,
+            version=5 if safari_release else storage.format_version,
+            safari_release=safari_release,
         )
         storage.publish(entry)
         return entry
@@ -788,6 +832,11 @@ class Builder:
                         raise BuildError(
                             "derived parent changed or was retained away; retry"
                         )
+                for obj in protocol.bus.adopted_objects():
+                    dest = private.object_path(obj.name)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    if not dest.exists():
+                        os.link(protocol.bus.object_path(obj.name), dest)
                 for name in protocol.bus.engines():
                     for entry in protocol.bus.entries(name):
                         for obj in entry.objects():
@@ -908,6 +957,10 @@ class Builder:
         # and a bus state directory that was wiped under a populated topic
         # would otherwise republish "frontier null, no failed builds" forever,
         # because no publish or failure ever comes along to refresh it.
+        resolver = self._resolvers.get(engine_name)
+        releases = getattr(resolver, "releases", None)
+        if releases is not None:
+            state.safari_acquisition_error = releases.last_error
         state.frontier = self.frontier(engine_name)
         state.lowest_retained = self.bus.lowest_retained(engine_name)
         failures = [dict(r) for r in self.store.build_failures(engine_name)]

@@ -462,10 +462,12 @@ class DerivedResolver:
         *,
         number_for: Callable[[HostApp], int],
         installed: Callable[[], HostApp] | None = None,
+        releases=None,
     ):
         self.bus = bus
         self.engine = engine
         self.inner = inner
+        self.releases = releases
         self.number_for = number_for
         self._installed = installed or self._read_installed
 
@@ -487,13 +489,17 @@ class DerivedResolver:
             raise ValueError(f"{self.engine.name}: {e}") from None
 
     def installed(self) -> tuple[HostApp, int]:
+        if self.releases is not None:
+            return self.releases.installed()
         app = self._installed()
         return app, self.number_for(app)
 
     # --- Resolver ---
 
     def fetch(self) -> None:
-        """The inner topic is on this bus and the app is on this disk."""
+        """Refresh the complete release once per producer cycle."""
+        if self.releases is not None:
+            self.releases.refresh()
 
     def eligible(self, entry: Entry) -> bool:
         have = {b.path for b in entry.blobs}

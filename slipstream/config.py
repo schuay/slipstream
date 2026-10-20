@@ -341,6 +341,7 @@ class BuildConfig:
     # Jobs built per hold of the machine before a waiting bencher gets a turn.
     # 0 holds it until the known work is built: a roll's commits share a warm
     # build cache, and a bench-only peer box is waiting on the bus for them.
+    safari_os_majors: list[int] = field(default_factory=lambda: [26, 27])
     batch: int = 0
     # Exclusive lower bounds for automatic builds, including with older local
     # history. Published entries and terminal failures can advance them further.
@@ -1069,6 +1070,7 @@ def _parse_build(data: dict, engines: dict[str, EngineConfig]) -> BuildConfig:
             "delta_max_ratio",
             "delta_min_mb",
             "delta_workers",
+            "safari_os_majors",
         ),
         "[build]",
     )
@@ -1098,7 +1100,18 @@ def _parse_build(data: dict, engines: dict[str, EngineConfig]) -> BuildConfig:
     # Zero is meaningful here (hold until drained), so not _positive.
     if isinstance(batch, bool) or not isinstance(batch, int) or batch < 0:
         raise ValueError("[build] batch must be a whole number; 0 means unbounded")
+    majors = data.get("safari_os_majors", [26, 27])
+    if (
+        not isinstance(majors, list)
+        or not majors
+        or any(type(n) is not int or n not in (26, 27) for n in majors)
+        or len(set(majors)) != len(majors)
+    ):
+        raise ValueError(
+            "[build] safari_os_majors must be a nonempty unique list of 26 and/or 27"
+        )
     return BuildConfig(
+        safari_os_majors=sorted(majors),
         engines=names,
         retain_gb=_positive(data, "retain_gb", 400.0, "[build]"),
         min_free_gb=_positive(data, "min_free_gb", 100.0, "[build]"),

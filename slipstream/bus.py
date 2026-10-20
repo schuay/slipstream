@@ -72,7 +72,7 @@ from .models import CommitKey
 VERSION = 1
 # Entries. Versions 1 and 2 are read, version 3 is written.
 ENTRY_VERSION = 3
-READABLE_ENTRY_VERSIONS = (1, 2, 3, 4)
+READABLE_ENTRY_VERSIONS = (1, 2, 3, 4, 5)
 
 BLOB_SUFFIX = ".tar.zst"
 PATCH_SUFFIX = ".bsdiff"
@@ -344,6 +344,13 @@ class Entry:
     version: int = ENTRY_VERSION
     owner_uuid: str = ""
     publication_uuid: str = ""
+    safari_release: dict = field(default_factory=dict)
+
+    @property
+    def all_blobs(self) -> list[Blob]:
+        from .safari_packages import release_blobs
+
+        return [*self.blobs, *release_blobs(self.safari_release)]
 
     @property
     def key(self) -> CommitKey:
@@ -357,11 +364,13 @@ class Entry:
     def blob_bytes(self) -> int:
         """Bytes of the distinct stored objects this entry needs. A delta
         entry counts its base here: it is what a cold consumer fetches."""
-        return sum(o.bytes for o in distinct_objects(self.blobs, self.version).values())
+        return sum(
+            o.bytes for o in distinct_objects(self.all_blobs, self.version).values()
+        )
 
     def objects(self) -> list[StoredObject]:
         """Every stored object this entry needs, each once, in blob order."""
-        return list(distinct_objects(self.blobs, self.version).values())
+        return list(distinct_objects(self.all_blobs, self.version).values())
 
     def to_json(self) -> str:
         data = asdict(self)
@@ -395,6 +404,16 @@ class Entry:
                 data["blobs"] = [Blob("", sha, sha, data["blob_bytes"])]
         elif "blobs" in data:
             data["blobs"] = _parse_blobs(data["blobs"], where)
+        if data.get("safari_release"):
+            from .safari_packages import validate_release
+
+            if version != 5:
+                raise BusError("Safari package publications require entry version 5")
+            validate_release(data["safari_release"])
+            if data.get("embedder_id") != data["safari_release"]["embedder_id"]:
+                raise BusError("Safari release embedder does not match publication")
+        elif version == 5:
+            raise BusError("version 5 publication is missing its Safari release")
         known = {f for f in cls.__dataclass_fields__}
         # Every field the constructor requires, not just the interesting ones:
         # a missing one would otherwise raise TypeError, which a consumer does
@@ -438,6 +457,7 @@ class BuilderState:
     # the life of the engine.
     failed: list[dict] = field(default_factory=list)
     failed_total: int = 0
+    safari_acquisition_error: str | None = None
     publishing_paused_by_floor: bool = False
     last_error: str | None = None
     stalled_since: float | None = None
@@ -712,9 +732,12 @@ class Bus:
         sizes: dict[str, int] = {}
         for entries in topics.values():
             for entry in entries:
-                objects = distinct_objects(entry.blobs, entry.version)
+                objects = distinct_objects(entry.all_blobs, entry.version)
                 refs.update(objects.keys())
                 sizes.update({name: obj.bytes for name, obj in objects.items()})
+        for obj in self.adopted_objects():
+            refs[obj.name] += 1
+            sizes[obj.name] = obj.bytes
         used = sum(sizes.values())
         floors = {
             engine: entries[-1].key for engine, entries in topics.items() if entries
@@ -741,7 +764,7 @@ class Bus:
             entry = topics[engine][index]
             self._delete_pruned(engine, entry.key)
             dropped.setdefault(engine, []).append(entry.key)
-            for name in distinct_objects(entry.blobs, entry.version):
+            for name in distinct_objects(entry.all_blobs, entry.version):
                 refs[name] -= 1
                 if refs[name] == 0:
                     used -= sizes[name]
@@ -764,6 +787,15 @@ class Bus:
                 seen.setdefault(obj.name, obj.bytes)
         return sum(seen.values())
 
+    def adopted_objects(self) -> list[StoredObject]:
+        from .safari_packages import read_release, release_blobs
+
+        objects = {}
+        for path in (self.root / "state" / "safari").glob("*.json"):
+            record = read_release(path)
+            objects.update(distinct_objects(release_blobs(record), 5))
+        return list(objects.values())
+
     def referenced_objects(self) -> set[str]:
         """Every stored object's name something in this root still needs.
 
@@ -772,7 +804,7 @@ class Bus:
         a fetched object has. A delta entry names its base, so the base
         outlives its own entry for as long as any delta against it is kept.
         """
-        refs: set[str] = set()
+        refs: set[str] = {o.name for o in self.adopted_objects()}
         for engine in self.engines():
             for entry in self.entries(engine):
                 refs.update(o.name for o in entry.objects())
