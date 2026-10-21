@@ -10,6 +10,7 @@ import time
 import uuid
 from pathlib import Path
 
+from .service_logging import warning, error, success, prefixed
 from .config import DeliveryConfig, validate_delivery_identities
 from .delivery_sources import (
     LocalDbSource,
@@ -103,7 +104,9 @@ class Coordinator:
         )
         self.retry[source.identity] = failures, time.monotonic() + delay
         self.log(
-            f"source={source.identity} failed: {exc}; retry_in={delay:.1f}s retry_at_unix={time.time() + delay:.3f}"
+            warning(
+                f"source={source.identity} failed: {exc}; retry_in={delay:.1f}s retry_at_unix={time.time() + delay:.3f}"
+            )
         )
 
     def cycle(self, *, probe_bot=None):
@@ -246,7 +249,7 @@ class Coordinator:
                         locked.append(target)
                     except Exception as exc:
                         self.errors.append(exc)
-                        self.log(f"target={identity} lock failed: {exc}")
+                        self.log(error(f"target={identity} lock failed: {exc}"))
                         break
                 target_locks.callback(self._close, sessions)
                 if len(locked) == len(self.targets):
@@ -262,12 +265,12 @@ class Coordinator:
                                 should_stop=self.should_stop,
                                 shutdown_deadline=self.shutdown_deadline,
                                 log=lambda msg, i=identity: self.log(
-                                    f"target={i} {msg}"
+                                    prefixed(f"target={i} ", msg)
                                 ),
                             )
                         except Exception as exc:
                             self.errors.append(exc)
-                            self.log(f"target={identity} open failed: {exc}")
+                            self.log(error(f"target={identity} open failed: {exc}"))
                 if probe_bot is not None and len(sessions) == len(self.targets):
                     from .delivery_batch import Batch
                     from .durability import identity_digest
@@ -277,10 +280,10 @@ class Coordinator:
                     for identity, session in sessions.items():
                         try:
                             session.stage(batch, attempt)
-                            self.log(f"{identity}: probe accepted")
+                            self.log(success(f"{identity}: probe accepted"))
                         except Exception as exc:
                             self.errors.append(exc)
-                            self.log(f"{identity}: probe failed: {exc}")
+                            self.log(error(f"{identity}: probe failed: {exc}"))
                 for source, batch, record in selected:
                     if (
                         source.identity in failed_sources
@@ -333,7 +336,9 @@ class Coordinator:
                             else f"commit={batch.unit}"
                         )
                         self.log(
-                            f"ack source={source.identity} unit={batch.unit} {progress} rows={len(batch.rows)} elapsed={time.monotonic() - before:.3f}s"
+                            success(
+                                f"ack source={source.identity} unit={batch.unit} {progress} rows={len(batch.rows)} elapsed={time.monotonic() - before:.3f}s"
+                            )
                         )
                         source.retire()  # ack-before-delete is reconciled after restart
                         if source.identity not in preparation_failed:
@@ -356,12 +361,16 @@ class Coordinator:
                     try:
                         result = session.refresh()
                         self.log(
-                            f"target={identity} refresh={result or 'complete'} elapsed={time.monotonic() - before:.3f}s"
+                            success(
+                                f"target={identity} refresh={result or 'complete'} elapsed={time.monotonic() - before:.3f}s"
+                            )
                         )
                     except Exception as exc:
                         self.errors.append(exc)
                         self.log(
-                            f"target={identity} refresh failed: {exc}; retry on idle cycle"
+                            warning(
+                                f"target={identity} refresh failed: {exc}; retry on idle cycle"
+                            )
                         )
                 # Cleanup occurs while target locks are held, and never refreshes.
                 self._close(sessions)
@@ -382,7 +391,7 @@ class Coordinator:
                 session.close()
             except Exception as exc:
                 self.errors.append(exc)
-                self.log(f"target={identity} cleanup failed: {exc}")
+                self.log(error(f"target={identity} cleanup failed: {exc}"))
             finally:
                 self.log(
                     f"target={identity} cleanup elapsed={time.monotonic() - before:.3f}s"

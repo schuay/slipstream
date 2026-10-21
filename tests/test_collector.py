@@ -94,6 +94,9 @@ class TestRunEnv:
         collector.dry_run = False
         collector.verbose = False
         collector.log_file = tmp_path / "collector.log"
+        from slipstream.service_logging import EventLog
+
+        collector.output = EventLog("bench", mirror_path=collector.log_file)
         return collector
 
     def test_git_terminal_prompt_disabled(self, tmp_path):
@@ -133,6 +136,9 @@ class TestFindFrontier:
         collector.dry_run = False
         collector.verbose = False
         collector.log_file = tmp_path / "collector.log"
+        from slipstream.service_logging import EventLog
+
+        collector.output = EventLog("bench", mirror_path=collector.log_file)
         collector.cfg = SimpleNamespace(
             engines={
                 "jsc": EngineConfig(

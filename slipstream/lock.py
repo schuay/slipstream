@@ -578,12 +578,16 @@ class MachineLock:
             pass
 
     def _paused(self, log: Callable[[str], None] | None) -> bool:
+        from .service_logging import warning
+
         until = paused_until()
         if until is None:
             return False
         if log:
             log(
-                f"paused by operator until {time.strftime('%H:%M', time.localtime(until))}"
+                warning(
+                    f"paused by operator until {time.strftime('%H:%M', time.localtime(until))}"
+                )
             )
         return True
 

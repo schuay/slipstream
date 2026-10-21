@@ -17,6 +17,7 @@ from .config import load_config
 from .models import CommitKey
 from .collector import BenchCollector, FetchError
 from .hooks import HookError
+from .service_logging import EventLog, warning
 from . import host as host_mod
 
 app = typer.Typer(
@@ -85,8 +86,8 @@ def _shutdown_flag(label: str = "current commit", log=None):
         if state["stop"]:
             raise SystemExit(1)
         state["stop"] = True
-        (log or typer.echo)(
-            f"Shutdown requested; finishing {label} (^C again to force)"
+        (log or EventLog("bench"))(
+            warning(f"Shutdown requested; finishing {label} (^C again to force)")
         )
 
     signal.signal(signal.SIGINT, handle)
@@ -247,7 +248,7 @@ def bench(
             consumer = BusConsumer(
                 cfg,
                 collector,
-                log=lambda m: typer.echo(f"  {m}"),
+                log=EventLog("bench"),
                 dry_run=dry_run,
             )
         except ConsumerError as e:
@@ -289,20 +290,19 @@ def bench(
                 typer.echo(f"Error: {exc}", err=True)
                 raise typer.Exit(1)
 
+    log = EventLog("bench")
     if no_push:
-        typer.echo("bench only collects; --no-push has no effect")
+        log("bench only collects; --no-push has no effect")
 
-    should_stop = _shutdown_flag()
+    should_stop = _shutdown_flag(log=log)
 
-    typer.echo(
-        f"Benchmarking {', '.join(engine_names)} (interval={interval}, step={step})"
-    )
+    log(f"Benchmarking {', '.join(engine_names)} (interval={interval}, step={step})")
 
     from .consumer import MAX_BENCHES_PER_CYCLE
     from .window_hooks import WindowHooks
 
     schedule = subscriptions = None
-    hooks = WindowHooks(config, dry_run=dry_run, log=typer.echo)
+    hooks = WindowHooks(config, dry_run=dry_run, log=log)
     deferred = False
     was_closed = False
     last_policy = None
@@ -321,14 +321,16 @@ def bench(
             subscriptions = Subscriptions(
                 [(source, names) for source, names in sources if names],
                 schedule,
-                lambda msg: typer.echo(f"  {msg}", err=True),
+                log,
             )
         while not should_stop():
             decision = collector.admission().decision()
             hooks.update(decision.allowed)
             policy = (decision.allowed, decision.reason, decision.error)
             if policy != last_policy:
-                typer.echo(f"Benchmark window: {decision.error or decision.reason}")
+                (log if decision.allowed else log.warning)(
+                    f"Benchmark window: {decision.error or decision.reason}"
+                )
                 last_policy = policy
             if not decision.allowed:
                 was_closed = True
@@ -404,9 +406,7 @@ def bench(
                         # It has already said what it would do.
                         continue
                     if result.benched:
-                        typer.echo(
-                            f"  {name}: {result.benched} benched from {source.name}"
-                        )
+                        log(f"  {name}: {result.benched} benched from {source.name}")
                         turns[name] += 1
                         if not result.error and turns[name] < MAX_BENCHES_PER_CYCLE:
                             rotation.append(name)
@@ -414,7 +414,7 @@ def bench(
                         # Reported already; do not follow it with "up to date".
                         pass
                     else:
-                        typer.echo(f"  {name}: up to date with {source.name}")
+                        log(f"  {name}: up to date with {source.name}")
                     continue
                 try:
                     if name not in git_frontiers:
@@ -425,19 +425,19 @@ def bench(
                     # new frontier each turn would reset --step sampling.
                     last_done, head_id = git_frontiers[name]
                 except FetchError:
-                    typer.echo(f"  {name}: skipping until fetch succeeds")
+                    log.warning(f"{name}: skipping until fetch succeeds")
                     continue
                 except ValueError as e:
-                    typer.echo(f"  {name}: {e}")
+                    log.error(f"{name}: {e}")
                     continue
                 if last_done is None or head_id is None:
-                    typer.echo(f"  {name}: could not determine frontier, skipping")
+                    log.warning(f"{name}: could not determine frontier, skipping")
                     continue
                 if head_id <= last_done:
-                    typer.echo(f"  {name}: up to date at {last_done}")
+                    log(f"  {name}: up to date at {last_done}")
                     continue
 
-                typer.echo(f"  {name}: new commits {last_done + 1}..{head_id}")
+                log(f"  {name}: new commits {last_done + 1}..{head_id}")
                 result = collector.collect(
                     name,
                     last_done,
@@ -473,7 +473,7 @@ def bench(
                     break
                 time.sleep(1)
     except HookError as exc:
-        typer.echo(f"Error: {exc}", err=True)
+        log.error(f"{exc}")
         raise typer.Exit(1)
     finally:
         if subscriptions is not None:
@@ -484,15 +484,15 @@ def bench(
             if not collector.admission().decision().allowed:
                 hooks.update(False)
         except HookError as exc:
-            typer.echo(f"Error: {exc}", err=True)
+            log.error(f"{exc}")
             raise typer.Exit(1)
         finally:
             collector.store.close()
 
     if once and deferred:
-        typer.echo("Remaining benchmark work deferred by benchmark window")
+        log.warning("Remaining benchmark work deferred by benchmark window")
         raise typer.Exit(75)
-    typer.echo("Bencher stopped.")
+    log("Bencher stopped.")
 
 
 @app.command()
@@ -607,7 +607,6 @@ def deliver(
         typer.echo("Error: --force applies to --rebuild", err=True)
         raise typer.Exit(1)
     cfg = _load_config(config)
-    from .service_logging import EventLog
 
     echo = EventLog("deliver", log_file)
     should_stop = _shutdown_flag("delivery unit", log=echo)
@@ -708,12 +707,13 @@ def build(
     from .store import StoreError
 
     interval_secs = _parse_interval(interval)
+    log = EventLog("build")
     try:
         builder = Builder(
             cfg,
             Bus(cfg.bus.root),
             verbose=verbose,
-            log=lambda msg: typer.echo(f"  {msg}"),
+            log=log,
             interval_secs=interval_secs,
         )
     except StoreError as e:
@@ -740,8 +740,8 @@ def build(
         _build_probe(builder, engine_names)
         return
 
-    should_stop = _shutdown_flag("current build")
-    typer.echo(f"Building {', '.join(engine_names)} (interval={interval})")
+    should_stop = _shutdown_flag("current build", log=log)
+    log(f"Building {', '.join(engine_names)} (interval={interval})")
     builder.migrate(should_stop)
 
     try:
@@ -756,11 +756,11 @@ def build(
                     break
                 time.sleep(1)
     except HookError as exc:
-        typer.echo(f"Error: {exc}", err=True)
+        log.error(f"{exc}")
         raise typer.Exit(1)
     finally:
         builder.store.close()
-    typer.echo("Builder stopped.")
+    log("Builder stopped.")
 
 
 def _build_probe(builder, engine_names: list[str]) -> None:
@@ -869,7 +869,6 @@ def bus_endpoint(
 def transfer(config: Optional[Path] = typer.Option(None), once: bool = False):
     """Transfer owned artifacts independently of building and benchmarking."""
     from .transfer import Coordinator
-    from .service_logging import EventLog
 
     cfg = _load_config(config)
     if cfg.bus is None or not cfg.bus.routes:
@@ -902,9 +901,7 @@ def bus_subscribe(
 
     if any(not name or name in (".", "..") or "/" in name for name in engine):
         raise typer.BadParameter("engine must be a directory name")
-    should_stop = _shutdown_flag(
-        "subscription", log=lambda msg: typer.echo(msg, err=True)
-    )
+    should_stop = _shutdown_flag("subscription", log=EventLog("transfer"))
     try:
         serve(root, engine, should_stop, sys.stdout, sys.stdin.fileno(), role=role)
     except EOFError:
@@ -1063,8 +1060,6 @@ def push(
     if not cfg.push:
         typer.echo("Error: no [push] section in config.", err=True)
         raise typer.Exit(1)
-
-    from .service_logging import EventLog
 
     if probe:
         events = EventLog("push", log_file)

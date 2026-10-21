@@ -16,8 +16,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from rich.console import Console
-from rich.markup import escape
+from .service_logging import EventLog, message, warning, error, prefixed
 
 from .admission import Admission, AdmissionStopped, CollectionResult, StopReason
 from . import host
@@ -28,8 +27,6 @@ from .hooks import HookError, Hooks
 from .models import CommitKey
 from .runners import RunRequest, RunResult, Runner, runner_for, suite_cfg_hash
 from .store import CommitIdCollision, CommitStore
-
-console = Console()
 
 
 class FetchError(RuntimeError):
@@ -87,6 +84,9 @@ class BenchCollector:
         self.log_file = (
             self.cfg.logs_dir / f"bench_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         )
+        self.output = EventLog(
+            role, mirror_path=None if self.dry_run else self.log_file
+        )
         self.store = CommitStore(
             self.cfg.metadata_dir / "slipstream.db",
             bot=self.cfg.bot_name,
@@ -96,14 +96,8 @@ class BenchCollector:
         self.cool_down: Callable[[Callable[[str], None]], float] = host.cool_down
         self._commit_relevance: dict[tuple, bool] = {}
 
-    def _log(self, message: str, **kwargs):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        console.print(f"[{timestamp}] {message}", **kwargs)
-        if not self.dry_run:
-            from rich.text import Text
-
-            with open(self.log_file, "a") as f:
-                f.write(f"[{timestamp}] {Text.from_markup(message).plain}\n")
+    def _log(self, text):
+        self.output(text)
 
     def _run(
         self,
@@ -116,10 +110,10 @@ class BenchCollector:
         if caffeinate and not self.dry_run and platform.system() == "Darwin":
             cmd = f"caffeinate -im {cmd}"
         if self.dry_run and not capture:
-            self._log(f"[yellow]Would run:[/yellow] {escape(cmd)}")
+            self._log(message(("Would run: ", "yellow"), cmd))
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         if self.verbose:
-            self._log(f"[dim]$ {escape(cmd)}[/dim]")
+            self._log(message((f"$ {cmd}", "dim")))
         # An unattended collector has nobody to answer a git credential prompt,
         # and a blocked git blocks the whole watch loop. Fail fast instead.
         child_env = dict(os.environ if env is None else env)
@@ -369,8 +363,7 @@ class BenchCollector:
                 commit = self._parse_commit_metadata(engine, raw)
                 if commit is None:
                     self._log(
-                        f"[yellow]Warning: no commit ID found in "
-                        f"{raw.strip()[:8]}, skipping.[/yellow]"
+                        warning(f"no commit ID found in {raw.strip()[:8]}, skipping.")
                     )
                     continue
                 self.store.update_commit_metadata(
@@ -391,7 +384,7 @@ class BenchCollector:
         """Replace GCC_TREAT_WARNINGS_AS_ERRORS=YES with NO in xcconfig files."""
         src = engine.require_src_dir()
         if self.dry_run:
-            self._log(f"[yellow]Would patch:[/yellow] {engine.pre_build_patches}")
+            self._log(message(("Would patch: ", "yellow"), engine.pre_build_patches))
             return
         for rel_path in engine.pre_build_patches:
             path = src / rel_path
@@ -437,9 +430,9 @@ class BenchCollector:
         ):
             return 0
 
-        console.print(f"  [dim]gn gen {build_dir}[/dim]")
+        self._log(message((f"  gn gen {build_dir}", "dim")))
         if self.dry_run:
-            self._log(f"[yellow]Would write:[/yellow] {args_path}")
+            self._log(message(("Would write: ", "yellow"), str(args_path)))
             return self._run(
                 f"gn gen {build_dir}{self._quiet(log)}", cwd=src
             ).returncode
@@ -512,7 +505,7 @@ class BenchCollector:
         try:
             self._apply_pre_build_patches(engine)
         except OSError as exc:
-            self._log(f"  [red]patch step failed: {escape(str(exc))}[/red]")
+            self._log(error(f"  patch step failed: {exc}"))
             return BuildStepError("patch", 1)
 
         for dep, rev in (pins or {}).items():
@@ -543,7 +536,7 @@ class BenchCollector:
         return runner_for(
             engine.runtime,
             log=self._log,
-            progress=lambda: console.print(".", end="", highlight=False),
+            progress=self.output.dot,
         )
 
     def _run_benchmarks(
@@ -570,7 +563,7 @@ class BenchCollector:
         configs_total = 0
         score_total = 0
         for run in range(1, rounds + 1):
-            self._log(f"  Run [bold]{run}/{rounds}[/bold]:")
+            self._log(message("  Run ", (f"{run}/{rounds}", "bold"), ":"))
             for rc in run_configs:
                 if run > rc.runs:
                     continue
@@ -578,39 +571,40 @@ class BenchCollector:
                 # stand on their own and the elapsed time is the measurement's.
                 if not self.dry_run:
                     self.cool_down(self._log)
-                console.print(f"    {rc.suite} ({rc.variant}): ", end="")
-                t0 = time.time()
-                configs_total += 1
-                if self.dry_run:
-                    console.print("." * 5, end="")
-                    result = RunResult(True, [])
-                else:
-                    result = runner.run(
-                        RunRequest(
-                            engine=engine,
-                            run_root=run_root,
-                            bench=self.cfg.benchmarks[rc.suite],
-                            spec=rc,
-                            run=run,
-                            res_dir=res_dir,
+                with self.output.progress(f"    {rc.suite} ({rc.variant}):"):
+                    t0 = time.time()
+                    configs_total += 1
+                    if self.dry_run:
+                        for _ in range(5):
+                            self.output.dot()
+                        result = RunResult(True, [])
+                    else:
+                        result = runner.run(
+                            RunRequest(
+                                engine=engine,
+                                run_root=run_root,
+                                bench=self.cfg.benchmarks[rc.suite],
+                                spec=rc,
+                                run=run,
+                                res_dir=res_dir,
+                            )
                         )
-                    )
-                elapsed = int(time.time() - t0)
-                scores = result.scores if result.ok else []
-                if scores:
-                    self.store.insert_scores(
-                        engine.name,
-                        self.cfg.platform,
-                        key,
-                        int(time.time()),
-                        [s._asdict() for s in scores],
-                    )
-                score_total += len(scores)
-                if result.ok:
-                    configs_ok += 1
-                    console.print(f" [green]OK ({elapsed}s)[/green]")
-                else:
-                    console.print(f" [yellow]ERRORS ({elapsed}s)[/yellow]")
+                    elapsed = int(time.time() - t0)
+                    scores = result.scores if result.ok else []
+                    if scores:
+                        self.store.insert_scores(
+                            engine.name,
+                            self.cfg.platform,
+                            key,
+                            int(time.time()),
+                            [s._asdict() for s in scores],
+                        )
+                    score_total += len(scores)
+                    if result.ok:
+                        configs_ok += 1
+                        self.output.finish(f"OK ({elapsed}s)")
+                    else:
+                        self.output.finish(f"ERRORS ({elapsed}s)", failed=True)
 
         return BenchOutcome(configs_ok, configs_total, score_total)
 
@@ -620,7 +614,7 @@ class BenchCollector:
             self.lock,
             wait=self.wait_for_lock,
             dry_run=self.dry_run,
-            log=lambda m: self._log(f"  {m}"),
+            log=lambda m: self._log(prefixed("  ", m)),
         )
 
     def bench_at_root(self, engine, commit, run_root, provenance=None):
@@ -669,9 +663,7 @@ class BenchCollector:
         try:
             outcome = self._run_benchmarks(engine, key, run_root)
         except KeyboardInterrupt:
-            self._log(
-                f"  [yellow]Interrupted on {key} — will retry on next run[/yellow]"
-            )
+            self._log(warning(f"  Interrupted on {key}; will retry on next run"))
             raise
         except Exception as exc:
             # Still marked done, as before, but now recorded as failed: this
@@ -680,7 +672,7 @@ class BenchCollector:
             # the commit is labelled failed while whatever runs completed would
             # otherwise still be exported and pushed as if the commit were
             # measured. "failed" means no scores everywhere else.
-            self._log(f"  [red]Fatal error during benchmarks: {escape(str(exc))}[/red]")
+            self._log(error(f"  Fatal error during benchmarks: {exc}"))
             if not self.dry_run:
                 self.store.clear_scores(engine.name, self.cfg.platform, [key])
 
@@ -704,7 +696,7 @@ class BenchCollector:
             # join them to that commit's metadata and ship this commit's
             # numbers under the other one's git hash. The missing-commit-row
             # guard cannot see that, because a row for the id does exist.
-            self._log(f"  [red]{escape(str(e))}[/red]")
+            self._log(error(f"  {e}"))
             self.store.clear_scores(engine.name, self.cfg.platform, [key])
             self.store.mark_done(engine.name, self.cfg.platform, key, status="failed")
             # Zero scores, because they were just deleted. The caller's circuit
@@ -863,9 +855,9 @@ class BenchCollector:
             # Without this the stale origin/main below reads as "up to date"
             # and the engine silently stops advancing.
             if res.returncode != 0:
-                self._log(f"[red]{engine_name}: git fetch failed[/red]")
+                self._log(error(f"{engine_name}: git fetch failed"))
                 if res.stderr:
-                    self._log(f"[dim]{escape(res.stderr.strip())}[/dim]")
+                    self._log(message((res.stderr.strip(), "dim")))
                 raise FetchError(engine_name)
 
         path_filter = engine.path_filter or ""
@@ -939,12 +931,14 @@ class BenchCollector:
                 eta = str(timedelta(seconds=int(remaining)))
 
             self._log(
-                f"\n[bold green]=== [{idx + 1}/{total}] ID: {commit_id} "
-                f"({commit_hash[:8]}) | ETA: {eta or 'N/A'}[/bold green]"
+                message(
+                    (f"=== [{idx + 1}/{total}] ID: {commit_id}", "bold"),
+                    (f" ({commit_hash[:8]}) | ETA: {eta or 'N/A'}", "dim"),
+                )
             )
 
             if not clear and self.store.is_done(engine_name, self.cfg.platform, key):
-                self._log("  [yellow]Skipping: already done[/yellow]")
+                self._log(warning("  Skipping: already done"))
                 continue
 
             # The build and every run of this commit happen under one hold, so
@@ -963,13 +957,15 @@ class BenchCollector:
                             if path.exists():
                                 shutil.rmtree(path)
                     t0 = time.time()
-                    console.print("  Building... ", end="")
-                    run_root = self._provision(engine, commit_hash)
-                    if run_root is None:
-                        console.print(f"[red]FAILED ({int(time.time() - t0)}s)[/red]")
-                        failed = True
-                        continue
-                    console.print(f"[green]OK ({int(time.time() - t0)}s)[/green]")
+                    with self.output.progress("  Building..."):
+                        run_root = self._provision(engine, commit_hash)
+                        if run_root is None:
+                            self.output.finish(
+                                f"FAILED ({int(time.time() - t0)}s)", failed=True
+                            )
+                            failed = True
+                            continue
+                        self.output.finish(f"OK ({int(time.time() - t0)}s)")
                     self.bench_at_root(engine, dict(row), run_root)
                     completed += 1
             except AdmissionStopped as exc:

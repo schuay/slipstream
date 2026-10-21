@@ -99,7 +99,7 @@ def test_bounded_commands_defer_without_destructive_work(
     config, collector = watch_env
     config.bench.timezone = "UTC"
     config.bench.allowed_windows = []
-    monkeypatch.setattr(cli, "_shutdown_flag", lambda: lambda: False)
+    monkeypatch.setattr(cli, "_shutdown_flag", lambda **kw: lambda: False)
     collector.store.upsert_commit("v8", "abc", 100, "2026-01-01", 1, "test")
     collector.store.mark_done("v8", config.platform, 100)
     monkeypatch.setattr(
@@ -131,7 +131,7 @@ def test_watch_reopens_on_expiry_without_new_publication(
         bench_window, "current", lambda config: current(config, now=clock[0])
     )
     stopped = [False]
-    monkeypatch.setattr(cli, "_shutdown_flag", lambda: lambda: stopped[0])
+    monkeypatch.setattr(cli, "_shutdown_flag", lambda **kw: lambda: stopped[0])
     schedules, dispatch = [], []
     events = tmp_path / "events"
     hooks = tmp_path / "hooks"
@@ -205,7 +205,7 @@ def test_open_does_not_resume_bus_pause(window_config):
 
 def test_partial_bounded_deferral_retains_completed_work(watch_env, monkeypatch):
     config, collector = watch_env
-    monkeypatch.setattr(cli, "_shutdown_flag", lambda: lambda: False)
+    monkeypatch.setattr(cli, "_shutdown_flag", lambda **kw: lambda: False)
     counts = []
 
     def drain(self, source, name, should_stop, **kwargs):
@@ -293,7 +293,7 @@ def test_watch_hooks_once_per_transition_after_last_job(
         original_update(self, allowed)
 
     monkeypatch.setattr(WindowHooks, "update", update)
-    monkeypatch.setattr(cli, "_shutdown_flag", lambda: lambda: False)
+    monkeypatch.setattr(cli, "_shutdown_flag", lambda **kw: lambda: False)
 
     def drain(self, *args, **kwargs):
         events.append("job")
@@ -316,7 +316,7 @@ def test_pre_window_failure_prevents_jobs(watch_env, tmp_path, monkeypatch, dry_
     hook = hooks / "pre-window"
     hook.write_text("#!/bin/sh\nexit 42\n")
     hook.chmod(0o755)
-    monkeypatch.setattr(cli, "_shutdown_flag", lambda: lambda: False)
+    monkeypatch.setattr(cli, "_shutdown_flag", lambda **kw: lambda: False)
     calls = []
 
     def drain(self, *args, **kwargs):

@@ -9,6 +9,8 @@ One-second waits below check shutdown; they never scan the bus on a timer.
 
 from __future__ import annotations
 
+from .service_logging import warning
+
 import json
 import os
 import select
@@ -295,7 +297,9 @@ class Subscriptions:
             except (OSError, ValueError, RuntimeError) as exc:
                 if not self.stop.is_set():
                     self.log(
-                        f"{source.name}: notifications disconnected: {exc}; reconnecting"
+                        warning(
+                            f"{source.name}: notifications disconnected: {exc}; reconnecting"
+                        )
                     )
             if connected:
                 delay = 1.0

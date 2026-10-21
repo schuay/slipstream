@@ -10,6 +10,8 @@ use the same capture and acceptance transactions.
 
 from __future__ import annotations
 
+from .service_logging import warning, error, success
+
 import json
 import os
 import select
@@ -508,7 +510,7 @@ class Coordinator:
         )
         self.save(engine, record)
         if pending["op"] == "skip":
-            self.log(f"{engine}: skipped unavailable history through {key}")
+            self.log(warning(f"{engine}: skipped unavailable history through {key}"))
 
     def step(self, engine, record, *, once=False):
         route, source, dest = self.routes[engine]
@@ -521,7 +523,9 @@ class Coordinator:
             ):
                 self._finish(engine, record, receipt)
                 self.log(
-                    f"{engine}: recovered acknowledgement through {record['cursor']}"
+                    success(
+                        f"{engine}: recovered acknowledgement through {record['cursor']}"
+                    )
                 )
                 return True
             if pending["op"] == "skip":
@@ -585,8 +589,10 @@ class Coordinator:
             self.save(engine, record)
             self._finish(engine, record, dest.accept(stage))
         self.log(
-            f"{engine}: accepted {target}, remaining={record['backlog']}, "
-            f"elapsed={time.monotonic() - started:.2f}s"
+            success(
+                f"{engine}: accepted {target}, remaining={record['backlog']}, "
+                f"elapsed={time.monotonic() - started:.2f}s"
+            )
         )
         return True
 
@@ -606,7 +612,7 @@ class Coordinator:
             record["health_retry_after"] = time.time() + min(
                 60, 2 ** min(record["health_failures"] - 1, 6)
             )
-            self.log(f"{engine}: health snapshot: {exc}")
+            self.log(warning(f"{engine}: health snapshot: {exc}"))
             self.save(engine, record)
         else:
             if record.get("health_error"):
@@ -653,7 +659,7 @@ class Coordinator:
                         if records[engine].get("conflict"):
                             self.failed.add(engine)
                     except BusError as exc:
-                        self.log(f"{engine}: {exc}")
+                        self.log(error(f"{engine}: {exc}"))
                         self.failed.add(engine)
                 # --once freezes every upper bound before delivering any work.
                 if once:
@@ -668,7 +674,7 @@ class Coordinator:
                             if isinstance(exc, BusError):
                                 record["conflict"] = True
                             self.save(engine, record)
-                            self.log(f"{engine}: {exc}")
+                            self.log(error(f"{engine}: {exc}"))
                             self.failed.add(engine)
                 schedule.changed(records)
                 while not should_stop():
@@ -712,7 +718,7 @@ class Coordinator:
                                 record["conflict"] = True
                                 self.failed.add(engine)
                             self.save(engine, record)
-                            self.log(f"{engine}: {exc}")
+                            self.log(error(f"{engine}: {exc}"))
                             schedule.finished(
                                 engine,
                                 generation,

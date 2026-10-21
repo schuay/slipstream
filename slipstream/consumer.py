@@ -27,6 +27,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from .service_logging import warning, error as log_error, success, message
 from .admission import AdmissionStopped, CollectionResult, StopReason
 from . import __version__, host
 from .bus import (
@@ -229,7 +230,7 @@ class BusConsumer:
             # and keys_above is strict. Restarting costs nothing -- _skip_done
             # walks past the done ones without fetching, which is what a
             # missing cursor file already does.
-            self.log(f"{engine}: {e}; resuming from the start of the topic")
+            self.log(warning(f"{engine}: {e}; resuming from the start of the topic"))
             return None
 
     def set_cursor(self, source: BusSource, engine: str, key) -> None:
@@ -311,14 +312,16 @@ class BusConsumer:
             # Another publication may have an unsupported format. We cannot
             # discover all its references, so retain its objects and continue
             # measuring the readable entry rather than misclassifying it.
-            self.log(f"{engine.name}: deferring blob sweep: {exc}")
+            self.log(warning(f"{engine.name}: deferring blob sweep: {exc}"))
         t3 = time.monotonic()
         # A browser bundle is a gigabyte of small files; this is where the
         # minute between two commits goes, and it should say so.
         self.log(
-            f"{engine.name}: provisioned {entry.key} from {len(paths)} object(s), "
-            f"{size_mb:.0f} MB: fetch {t1 - t0:.0f}s, unpack {t2 - t1:.0f}s, "
-            f"trim {t3 - t2:.0f}s"
+            success(
+                f"{engine.name}: provisioned {entry.key} from {len(paths)} object(s), "
+                f"{size_mb:.0f} MB: fetch {t1 - t0:.0f}s, unpack {t2 - t1:.0f}s, "
+                f"trim {t3 - t2:.0f}s"
+            )
         )
         return root
 
@@ -408,10 +411,10 @@ class BusConsumer:
         try:
             return self._drain(source, engine_name, should_stop, max_benches)
         except AdmissionStopped as exc:
-            self.log(f"{engine_name}: {exc.reason.value}: {exc}")
+            self.log(warning(f"{engine_name}: {exc.reason.value}: {exc}"))
             return DrainResult(self._benched, reason=exc.reason)
         except TRANSPORT_ERRORS as e:
-            self.log(f"{engine_name}: {e}")
+            self.log(log_error(f"{engine_name}: {e}"))
             return DrainResult(self._benched, str(e), StopReason.FAILURE)
 
     def _drain(
@@ -435,7 +438,7 @@ class BusConsumer:
         except BusError as e:
             # A state file this version cannot read (a rollback across a
             # version bump) must not kill the daemon at its first line.
-            self.log(f"{engine_name}: {e}")
+            self.log(log_error(f"{engine_name}: {e}"))
             return DrainResult(0, str(e), StopReason.FAILURE)
         try:
             self.cfg.require_runs(engine_name)
@@ -444,7 +447,7 @@ class BusConsumer:
             # advance past entries nothing measured, and one misconfigured
             # engine must not take the other down with it.
             state.last_error = str(e)
-            self.log(f"{engine_name}: {state.last_error}")
+            self.log(log_error(f"{engine_name}: {state.last_error}"))
             self._publish_state(
                 engine_name, state, self.cursor(source, engine_name), handle
             )
@@ -465,9 +468,11 @@ class BusConsumer:
             # Say it every cycle: the backoff runs for hours, and silence here
             # is indistinguishable from a healthy idle engine.
             self.log(
-                f"{engine_name}: stalled until "
-                f"{time.strftime('%H:%M', time.localtime(state.stall_retry_after))}"
-                f" -- {state.last_error}"
+                warning(
+                    f"{engine_name}: stalled until "
+                    f"{time.strftime('%H:%M', time.localtime(state.stall_retry_after))}"
+                    f" -- {state.last_error}"
+                )
             )
             self._publish_state(engine_name, state, cursor, handle)
             return DrainResult(0, state.last_error, StopReason.FAILURE)
@@ -505,7 +510,7 @@ class BusConsumer:
                     # Listing failed, so there is nothing to skip past. Leave the
                     # cursor and try again next cycle.
                     state.last_error = f"listing {source.name}: {e}"
-                    self.log(f"{engine_name}: {state.last_error}")
+                    self.log(log_error(f"{engine_name}: {state.last_error}"))
                     break
                 if not batch:
                     # Nothing above the cursor and nothing went wrong this cycle.
@@ -535,7 +540,7 @@ class BusConsumer:
                     # source that could not answer must not, or an outage would
                     # silently skip unbenched commits.
                     state.last_error = f"reading entry {key}: {e}"
-                    self.log(f"{engine_name}: {state.last_error}")
+                    self.log(log_error(f"{engine_name}: {state.last_error}"))
                     break
                 if entry is None:
                     # Retention dropped it, which is not an error but is a hole in
@@ -544,8 +549,10 @@ class BusConsumer:
                     # cursor passes it, so nothing else would report this after the
                     # next successful bench.
                     self.log(
-                        f"{engine_name}: entry {key} was dropped by retention "
-                        f"before this machine benched it"
+                        warning(
+                            f"{engine_name}: entry {key} was dropped by retention "
+                            f"before this machine benched it"
+                        )
                     )
                     state.skipped_dropped = _max_key(state.skipped_dropped, key)
                     cursor = key
@@ -554,7 +561,9 @@ class BusConsumer:
                 if self.free_gb() < self.cfg.bench.min_free_gb:
                     state.benching_paused_by_floor = True
                     state.last_error = f"only {self.free_gb():.0f}GB free"
-                    self.log(f"{engine_name}: paused, {self.free_gb():.0f}GB free")
+                    self.log(
+                        warning(f"{engine_name}: paused, {self.free_gb():.0f}GB free")
+                    )
                     break
                 try:
                     with admission.commit(f"{engine_name} {key}", should_stop):
@@ -566,8 +575,10 @@ class BusConsumer:
                         fresh = handle.read_entry(engine_name, key)
                         if fresh is None:
                             self.log(
-                                f"{engine_name}: entry {key} was dropped by "
-                                f"retention while waiting for the machine"
+                                warning(
+                                    f"{engine_name}: entry {key} was dropped by "
+                                    f"retention while waiting for the machine"
+                                )
                             )
                             state.skipped_dropped = _max_key(state.skipped_dropped, key)
                             cursor = key
@@ -596,8 +607,11 @@ class BusConsumer:
                             else sum(1 for k in batch if k > cursor)
                         )
                         self.log(
-                            f"{engine_name}: benching {key} ({entry.hash[:8]}), "
-                            f"{queued} above the cursor"
+                            message(
+                                (f"{engine_name}: benching {key}", "bold"),
+                                (f" ({entry.hash[:8]})", "dim"),
+                                f", {queued} above the cursor",
+                            )
                         )
                         outcome = self.bench_entry(handle, engine, entry)
                 except PermanentEntryError as e:
@@ -607,7 +621,7 @@ class BusConsumer:
                 except TRANSPORT_ERRORS as e:
                     state.last_error = str(e)
                     state.in_flight = None
-                    self.log(f"{engine_name}: {e}")
+                    self.log(log_error(f"{engine_name}: {e}"))
                     break
                 state.in_flight = None
                 benched += 1
@@ -635,7 +649,9 @@ class BusConsumer:
                             f"'slipstream clear {engine_name} <first> <last>' and "
                             f"'bench --reset-cursor {engine_name}=<first-1>'."
                         )
-                        self.log(f"{engine_name}: stalled -- {state.last_error}")
+                        self.log(
+                            warning(f"{engine_name}: stalled -- {state.last_error}")
+                        )
                         break
                 else:
                     consecutive_failures = 0
@@ -643,7 +659,7 @@ class BusConsumer:
                     state.stalled_since = None
                     state.stall_retry_after = None
         except AdmissionStopped as exc:
-            self.log(f"{engine_name}: {exc.reason.value}: {exc}")
+            self.log(warning(f"{engine_name}: {exc.reason.value}: {exc}"))
             stop_reason = exc.reason
         try:
             self._publish_state(engine_name, state, cursor, handle)
@@ -651,7 +667,7 @@ class BusConsumer:
             # Same exposure as the call inside the loop, which is guarded for
             # the same reason: it writes to the filesystem this path is about
             # running out of, and the caught-up path does no floor check at all.
-            self.log(f"{engine_name}: writing bench state: {e}")
+            self.log(log_error(f"{engine_name}: writing bench state: {e}"))
             return DrainResult(benched, str(e), StopReason.FAILURE)
         return DrainResult(
             benched,
@@ -664,7 +680,11 @@ class BusConsumer:
         )
 
     def _skip_permanent(self, source, engine_name, key, state, error):
-        self.log(f"{engine_name}: skipping {key}: permanent publication error: {error}")
+        self.log(
+            log_error(
+                f"{engine_name}: skipping {key}: permanent publication error: {error}"
+            )
+        )
         state.in_flight = None
         state.skipped_permanent = key
         state.permanent_skip_reason = str(error)
@@ -684,15 +704,17 @@ class BusConsumer:
         try:
             keys = handle.keys_above(engine_name, cursor)
         except TRANSPORT_ERRORS as e:
-            self.log(f"{engine_name}: listing {source.name}: {e}")
+            self.log(log_error(f"{engine_name}: listing {source.name}: {e}"))
             return DrainResult(0, str(e), StopReason.FAILURE)
         todo = [
             k for k in keys if not self.store.is_done(engine_name, self.cfg.platform, k)
         ]
         self.log(
-            f"{engine_name}: would bench {len(todo)} of {len(keys)} entries above "
-            f"{cursor} from {source.name}"
-            + (f" (first {todo[0]}, last {todo[-1]})" if todo else "")
+            warning(
+                f"{engine_name}: would bench {len(todo)} of {len(keys)} entries above "
+                f"{cursor} from {source.name}"
+                + (f" (first {todo[0]}, last {todo[-1]})" if todo else "")
+            )
         )
         return DrainResult()
 
@@ -733,8 +755,10 @@ class BusConsumer:
             return
         state.skipped_dropped = dropped
         self.log(
-            f"{engine_name}: entries up to {dropped} were dropped by retention "
-            f"before this machine benched them"
+            warning(
+                f"{engine_name}: entries up to {dropped} were dropped by retention "
+                f"before this machine benched them"
+            )
         )
 
     def _skip_done(

@@ -35,6 +35,8 @@ be tested against a recording fake.
 
 from __future__ import annotations
 
+from .service_logging import warning
+
 import csv
 import io
 import math
@@ -289,7 +291,7 @@ class SpannerDb:
                 step()
             except Exception as exc:
                 errors.append(exc)
-                self._log(f"cleanup failed: {type(exc).__name__}: {exc}")
+                self._log(warning(f"cleanup failed: {type(exc).__name__}: {exc}"))
         lock = getattr(self, "_local_lock", None)
         if lock is not None:
             lock.close()
@@ -309,7 +311,9 @@ class SpannerDb:
                 step()
             except Exception as exc:
                 errors.append(exc)
-                self._log(f"channel cleanup failed: {type(exc).__name__}: {exc}")
+                self._log(
+                    warning(f"channel cleanup failed: {type(exc).__name__}: {exc}")
+                )
         if errors:
             raise errors[0]
 

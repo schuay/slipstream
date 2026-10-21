@@ -17,6 +17,8 @@ report is the one built from state read after the fact.
 
 from __future__ import annotations
 
+from .service_logging import warning
+
 import functools
 import json
 import platform
@@ -355,8 +357,9 @@ def cool_down(
         waited = clock() - start
         if waited >= timeout:
             log(
-                f"  [yellow]still throttled at {limit}% after {int(waited)}s; "
-                f"measuring anyway[/yellow]"
+                warning(
+                    f"  still throttled at {limit}% after {int(waited)}s; measuring anyway"
+                )
             )
             return waited
         sleep(min(poll, max(0.0, timeout - waited)))

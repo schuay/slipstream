@@ -78,7 +78,7 @@ class TestWatchRotation:
             collector.store.mark_done(name, config.platform, 100)
         monkeypatch.setattr(cli, "_load_config", lambda path: config)
         monkeypatch.setattr(cli, "_open_collector", lambda *a, **kw: collector)
-        monkeypatch.setattr(cli, "_shutdown_flag", lambda: lambda: False)
+        monkeypatch.setattr(cli, "_shutdown_flag", lambda **kw: lambda: False)
         order = []
         counts = {"v8": 0, "jsc": 0}
         if continuous:
@@ -89,7 +89,7 @@ class TestWatchRotation:
             monkeypatch.setattr(
                 cli,
                 "_shutdown_flag",
-                lambda: (
+                lambda **kw: (
                     lambda: (
                         all(n >= 4 for n in counts.values())
                         or time.monotonic() > deadline
@@ -614,7 +614,7 @@ class TestWatchMeasuredEngines:
             collector.store.mark_done(name, config.platform, 100)
         monkeypatch.setattr(cli, "_load_config", lambda _: config)
         monkeypatch.setattr(cli, "_open_collector", lambda *a, **kw: collector)
-        monkeypatch.setattr(cli, "_shutdown_flag", lambda: lambda: False)
+        monkeypatch.setattr(cli, "_shutdown_flag", lambda **kw: lambda: False)
         scanned = []
 
         def frontier(name):

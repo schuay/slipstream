@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from rich.markup import escape
+from ..service_logging import error
 
 from ..config import EngineConfig
 from .base import Log, Progress, RunRequest, RunResult, cfg_digest, geomean_overall
@@ -249,7 +249,7 @@ class BrowserRunner:
         return verdict.ok
 
     def _fail(self, label: str, what: str) -> None:
-        self._log(f"\n    [red]Error [{label}]: {escape(what)}[/red]")
+        self._log(error(f"    Error [{label}]: {what}"))
 
 
 def _signal_group(proc: subprocess.Popen, sig: signal.Signals) -> None:

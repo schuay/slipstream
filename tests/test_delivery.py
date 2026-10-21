@@ -851,15 +851,15 @@ def test_shared_logging_has_one_plain_sink_with_bounded_retention(tmp_path, caps
     path = tmp_path / "logs" / "deliver.log"
     events = EventLog("deliver", path)
     events("task start source=bot unit=1")
-    events("target refresh failed; retry")
+    events.warning("target refresh failed; retry")
     events.error("task failed")
     assert events.handler.maxBytes == 5 * 1024 * 1024
     assert events.handler.backupCount == 3
     events.close()
     text = path.read_text()
-    assert "INFO slipstream.deliver" in text
-    assert "WARNING slipstream.deliver" in text
-    assert "ERROR slipstream.deliver" in text
+    assert "deliver task start" in text
+    assert "deliver WARNING: target refresh failed" in text
+    assert "deliver ERROR: task failed" in text
     assert "\x1b" not in text and not capsys.readouterr().err
 
 

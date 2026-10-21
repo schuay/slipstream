@@ -26,6 +26,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from .service_logging import warning, error, success, message, prefixed
 from . import delta, host
 from .bus import (
     Blob,
@@ -363,7 +364,7 @@ def _try_delta(
         if plan is not None and (base_proc.returncode or target_proc.returncode):
             raise DeltaError("zstd failed while streaming the archives")
     except Exception as e:  # noqa: BLE001 -- the delta path may not fail a publish
-        log(f"{label}: delta against {base.id[:12]} failed, stored whole: {e}")
+        log(warning(f"{label}: delta against {base.id[:12]} failed, stored whole: {e}"))
         return None
     finally:
         # Popen's KeyboardInterrupt context exit can return before the child
@@ -618,7 +619,7 @@ class Builder:
             state.last_error = f"only {self.free_gb():.0f}GB free"
             state.in_flight = None
             self._publish_state(engine_name, state)
-            self.log(f"{engine_name}: paused, {self.free_gb():.0f}GB free")
+            self.log(warning(f"{engine_name}: paused, {self.free_gb():.0f}GB free"))
             return BuildResult()
         state.publishing_paused_by_floor = False
 
@@ -655,7 +656,6 @@ class Builder:
         self.lock.set_job(f"{engine_name} {key}")
         # Said out loud: without -v nothing else reaches the console until the
         # build has published or failed, and a long one looks like a hang.
-        self.log(f"{engine_name}: building {key}")
 
         row = self.store.get_build_state(engine_name, key)
         was_retry = row is not None and row["status"] == "retry_requested"
@@ -663,7 +663,12 @@ class Builder:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         started = time.time()
         if job.compiles:
-            self.log(f"{engine_name}: building {key} ({job.hash[:8]})")
+            self.log(
+                message(
+                    (f"{engine_name}: building {key}", "bold"),
+                    (f" ({job.hash[:8]})", "dim"),
+                )
+            )
             failure = self.collector.build_at(
                 engine, job.checkout_hash, log_path, pins=job.pins
             )
@@ -706,7 +711,7 @@ class Builder:
         except sqlite3.Error as e:
             self.store.conn.rollback()
             cleanup_error = f"published {key}; database cleanup deferred: {e}"
-            self.log(f"{engine_name}: {cleanup_error}")
+            self.log(warning(f"{engine_name}: {cleanup_error}"))
         state.stall_retry_after = None
         self._retain(engine_name, state, keep=entry.key)
         state.stalled_since = None
@@ -715,9 +720,11 @@ class Builder:
         self._publish_state(engine_name, state)
         patches = sum(b.delta.plan.patch_bytes for b in entry.blobs if b.delta)
         self.log(
-            f"{engine_name}: published {key} ({entry.blob_bytes / MB:.0f}MB"
-            + (f", {patches / MB:.1f}MB of it patches" if patches else "")
-            + f", {entry.build_secs}s)"
+            success(
+                f"{engine_name}: published {key} ({entry.blob_bytes / MB:.0f}MB"
+                + (f", {patches / MB:.1f}MB of it patches" if patches else "")
+                + f", {entry.build_secs}s)"
+            )
         )
         return BuildResult(key=key, published=True)
 
@@ -883,7 +890,7 @@ class Builder:
             engine.require_run_set(),
             engine=engine.name,
             delta_cfg=self.cfg.build.delta,
-            log=lambda msg: self.log(f"{engine.name}: {msg}"),
+            log=lambda msg: self.log(prefixed(f"{engine.name}: ", msg)),
         )
 
     def migrate(self, should_stop=lambda: False) -> None:
@@ -900,7 +907,7 @@ class Builder:
         finally:
             self.lock.release()
         if migrated:
-            self.log(f"migrated {len(migrated)} entries to the blob store")
+            self.log(success(f"migrated {len(migrated)} entries to the blob store"))
 
     def _record_failure(
         self,
@@ -951,13 +958,15 @@ class Builder:
             if state.stalled_since is None:
                 state.stalled_since = time.time()
                 self.log(
-                    f"{engine_name}: stalled after "
-                    f"{self.cfg.build.max_consecutive_burns} burns in a row; "
-                    f"this is the machine, not the tree"
+                    warning(
+                        f"{engine_name}: stalled after "
+                        f"{self.cfg.build.max_consecutive_burns} burns in a row; "
+                        f"this is the machine, not the tree"
+                    )
                 )
             self._arm_stall_backoff(state)
         self._publish_state(engine_name, state)
-        self.log(f"{engine_name}: {key} {status} at {kind}, log {log_path}")
+        self.log(error(f"{engine_name}: {key} {status} at {kind}, log {log_path}"))
         return BuildResult(key=key, failed_kind=kind, status=status)
 
     # --- stall backoff ---
@@ -1031,7 +1040,7 @@ class Builder:
                             fetched.add(name)
                         result = self.build_one(name)
                     except FetchError:
-                        self.log(f"{name}: skipping until fetch succeeds")
+                        self.log(warning(f"{name}: skipping until fetch succeeds"))
                         continue
                     except (
                         BuildError,
@@ -1047,7 +1056,7 @@ class Builder:
                         # not an OSError, is every build_state write. None of
                         # them may take the working engines down too.
                         self.store.conn.rollback()
-                        self.log(f"{name}: {e}")
+                        self.log(error(f"{name}: {e}"))
                         # The operation ended, even if its bookkeeping could
                         # not be committed. Clear stale in-flight state and
                         # expose the error.

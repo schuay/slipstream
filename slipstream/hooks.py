@@ -12,6 +12,7 @@ import sys
 import tempfile
 
 from . import config as config_mod
+from .service_logging import warning
 
 
 class HookError(RuntimeError):
@@ -36,7 +37,7 @@ class Hooks:
         if self.dry_run or not path.is_file():
             return
         if not os.access(path, os.X_OK):
-            self.log(f"Ignoring non-executable hook: {path}")
+            self.log(warning(f"Ignoring non-executable hook: {path}"))
             return
         self.log(f"Running hook: {path}")
         try:

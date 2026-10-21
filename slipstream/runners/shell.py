@@ -13,7 +13,7 @@ import signal
 import subprocess
 from pathlib import Path
 
-from rich.markup import escape
+from ..service_logging import error, message
 
 from ..config import EngineConfig
 from ..models import Score
@@ -161,8 +161,8 @@ class ShellRunner:
         try:
             result = subprocess.run(argv, cwd=cwd, env=env, stdout=out_f, stderr=err_f)
         except Exception as exc:
-            self._log(f"\n    [red]Exception [{label}]: {escape(str(exc))}[/red]")
-            self._log(f"    [dim]$ cd {cwd} && {escape(cmd)}[/dim]")
+            self._log(error(f"    Exception [{label}]: {exc}"))
+            self._log(message((f"    $ cd {cwd} && {cmd}", "dim")))
             err_f.write(f"\n$ cd {cwd} && {cmd}\n")
             return False
         if result.returncode in (-signal.SIGINT, -signal.SIGTERM, 130, 143):
@@ -173,9 +173,11 @@ class ShellRunner:
             err_f.flush()
             stderr_tail = stderr_file.read_text()[-300:].strip()
             self._log(
-                f"\n    [red]Error (exit {result.returncode}) [{label}]: "
-                f"{escape(stderr_tail or '(no stderr)')}[/red]"
+                error(
+                    f"    Error (exit {result.returncode}) [{label}]: "
+                    f"{stderr_tail or '(no stderr)'}"
+                )
             )
-            self._log(f"    [dim]$ cd {cwd} && {escape(cmd)}[/dim]")
+            self._log(message((f"    $ cd {cwd} && {cmd}", "dim")))
             return False
         return True
