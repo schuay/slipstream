@@ -100,6 +100,14 @@ class BusError(RuntimeError):
     """The bus root holds something this version cannot read."""
 
 
+class PermanentEntryError(BusError):
+    """An immutable publication cannot be consumed; retrying cannot repair it.
+
+    Includes unsupported publication versions. Never use for transport, host,
+    checksum or configuration errors that may recover after repair.
+    """
+
+
 def _atomic_write(path: Path, data: str) -> None:
     """Write via a uniquely named tmp file and rename.
 
@@ -395,7 +403,8 @@ class Entry:
             raise BusError(f"bus entry {where} is not an object")
         version = data.get("version")
         if version not in READABLE_ENTRY_VERSIONS:
-            raise BusError(
+            error = PermanentEntryError if type(version) is int else BusError
+            raise error(
                 f"bus entry {where} is version {version}, this slipstream reads "
                 f"versions {list(READABLE_ENTRY_VERSIONS)}; upgrade the consumer"
             )
@@ -487,7 +496,7 @@ class BenchState:
     than only that they currently agree.
     """
 
-    KEY_FIELDS = ("cursor", "skipped_dropped", "skipped_upstream")
+    KEY_FIELDS = ("cursor", "skipped_dropped", "skipped_upstream", "skipped_permanent")
 
     bot: str | None = None
     cursor: CommitKey | None = None
@@ -503,6 +512,8 @@ class BenchState:
     # evidence the moment the cursor passes it.
     skipped_dropped: CommitKey | None = None
     skipped_upstream: CommitKey | None = None
+    skipped_permanent: CommitKey | None = None
+    permanent_skip_reason: str | None = None
     # Carry the breaker across round-robin turns and daemon restarts.
     consecutive_failures: int = 0
     benching_paused_by_floor: bool = False

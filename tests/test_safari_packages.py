@@ -11,7 +11,7 @@ import pytest
 
 from slipstream import safari_packages as stp
 from slipstream.builder import Builder, store_run_set
-from slipstream.bus import Bus, BusError, Entry
+from slipstream.bus import Bus, BusError, Entry, PermanentEntryError
 from slipstream.bus_protocol import BusProtocol
 from slipstream.collector import BenchCollector
 from slipstream.config import BusConfig, BusSource, EngineConfig
@@ -245,7 +245,7 @@ def test_manifest_roundtrip_and_reject_legacy(acquisition):
     with pytest.raises(BusError, match="version 5"):
         Entry.from_json(legacy.to_json())
     legacy.safari_release = {}
-    with pytest.raises(BusError, match="legacy"):
+    with pytest.raises(PermanentEntryError, match="legacy"):
         stp.select_package(legacy, 27)
     with pytest.raises(BusError, match="no package"):
         stp.select_package(entry, 28)
@@ -457,9 +457,7 @@ def test_builder_publishes_shared_webkit_and_both_packages(
 
 
 @pytest.mark.parametrize("failure", ["missing", "checksum", "legacy"])
-def test_drain_keeps_failed_compatibility_commit_pending(
-    acquisition, config, monkeypatch, failure
-):
+def test_drain_classifies_publication_errors(acquisition, config, monkeypatch, failure):
     from slipstream.config import RunSpec
 
     a = acquisition
@@ -496,8 +494,18 @@ def test_drain_keeps_failed_compatibility_commit_pending(
     consumer.set_cursor(source, "safari", CommitKey(1, 9))
     result = consumer.drain(source, "safari", lambda: False)
     assert result.benched == 0
-    assert consumer.cursor_file(source, "safari").read_text().strip() == "1-9"
     state = a["bus"].read_bench_state("safari")
+    if failure == "legacy":
+        assert consumer.cursor(source, "safari") == entry.key
+        assert state.cursor == entry.key
+        assert state.skipped_permanent == entry.key
+        assert "legacy" in state.permanent_skip_reason
+        assert state.last_error is None
+        assert result.error is None
+        assert state.consecutive_failures == 0
+        return
+    assert consumer.cursor_file(source, "safari").read_text().strip() == "1-9"
+    assert state.skipped_permanent is None
     assert state.last_error
     assert state.cursor == CommitKey(1, 9)
 

@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from slipstream.builder import store_run_set
-from slipstream.bus import Bus, Entry
+from slipstream.bus import Bus, BusError, Entry, PermanentEntryError
 from slipstream.collector import BenchCollector, BenchOutcome
 from slipstream.config import BusConfig, BusSource, EngineConfig, RunSpec
 from slipstream.consumer import BusConsumer, ConsumerError, ShaMismatch
@@ -208,6 +208,102 @@ class TestWhatTheCommitsRowRecords:
 
 
 class TestDraining:
+    @pytest.mark.parametrize("version", [0, 6, 99])
+    def test_unsupported_publication_version_skips_to_next_commit(
+        self, setup, scored, version
+    ):
+        setup.publish(100)
+        setup.publish(101)
+        path = setup.bus.entry_path("v8", 100)
+        data = json.loads(path.read_text())
+        data["version"] = version
+        path.write_text(json.dumps(data))
+        result = _drain_result(setup)
+        assert result.benched == 1
+        assert result.error is None
+        assert [cid for cid, _ in scored] == [101]
+        assert setup.consumer.cursor(setup.source, "v8") == K1(101)
+        state = setup.bus.read_bench_state("v8")
+        assert state.skipped_permanent == K1(100)
+        assert f"version {version}" in state.permanent_skip_reason
+
+    @pytest.mark.parametrize("version", [None, "99", []])
+    def test_malformed_version_remains_pending(self, setup, scored, version):
+        setup.publish(100)
+        path = setup.bus.entry_path("v8", 100)
+        data = json.loads(path.read_text())
+        data["version"] = version
+        path.write_text(json.dumps(data))
+        result = _drain_result(setup)
+        assert result.error
+        assert scored == []
+        assert setup.consumer.cursor(setup.source, "v8") is None
+        assert setup.bus.read_bench_state("v8").skipped_permanent is None
+
+    @pytest.mark.parametrize("stage", ["read", "bench"])
+    def test_permanent_error_skips_and_benches_next_entry(
+        self, setup, scored, monkeypatch, stage
+    ):
+        setup.publish(100)
+        setup.publish(101)
+        setup.publish(102)
+        if stage == "read":
+            from slipstream.consumer import LocalSource
+
+            original = LocalSource.read_entry
+
+            def read(source, engine, key):
+                if key.commit_id < 102:
+                    raise PermanentEntryError("immutable publication defect")
+                return original(source, engine, key)
+
+            monkeypatch.setattr(LocalSource, "read_entry", read)
+        else:
+            original = setup.consumer.bench_entry
+
+            def bench(source, engine, entry):
+                if entry.commit_id < 102:
+                    raise PermanentEntryError("immutable publication defect")
+                return original(source, engine, entry)
+
+            monkeypatch.setattr(setup.consumer, "bench_entry", bench)
+        result = setup.consumer.drain(setup.source, "v8", lambda: False, max_benches=1)
+        assert result.benched == 1
+        assert result.error is None
+        assert [cid for cid, _ in scored] == [102]
+        assert setup.consumer.cursor(setup.source, "v8") == K1(102)
+        state = setup.bus.read_bench_state("v8")
+        assert state.skipped_permanent == K1(101)
+        assert state.permanent_skip_reason == "immutable publication defect"
+        assert state.consecutive_failures == 0
+        assert state.in_flight is None
+        assert not setup.collector.lock.held
+        rows = setup.collector.store.conn.execute(
+            "SELECT commit_id FROM commits ORDER BY commit_id"
+        ).fetchall()
+        assert [r[0] for r in rows] == [102]
+        assert (
+            len([m for m in setup.consumer.logs if "permanent publication" in m]) == 2
+        )
+        assert _drain(setup) == 0
+
+    @pytest.mark.parametrize("error", [BusError("repairable"), OSError("offline")])
+    def test_retryable_errors_leave_entry_pending(self, setup, monkeypatch, error):
+        setup.publish(100)
+        setup.publish(101)
+
+        def bench(*args):
+            raise error
+
+        monkeypatch.setattr(setup.consumer, "bench_entry", bench)
+        result = _drain_result(setup)
+        assert result.benched == 0
+        assert result.error == str(error)
+        assert setup.consumer.cursor(setup.source, "v8") is None
+        state = setup.bus.read_bench_state("v8")
+        assert state.skipped_permanent is None
+        assert state.last_error == str(error)
+
     def test_benches_every_entry_in_one_cycle(self, setup, scored):
         """A cursor reset must not take one cycle per entry to walk back up."""
         for cid in (100, 101, 102):

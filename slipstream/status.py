@@ -57,6 +57,8 @@ class EngineStatus:
     bench_stalled_since: float | None = None
     bench_skipped_dropped: CommitKey | None = None
     bench_skipped_upstream: CommitKey | None = None
+    bench_skipped_permanent: CommitKey | None = None
+    permanent_skip_reason: str | None = None
     status_counts: dict = field(default_factory=dict)
     orphan_scores: int = 0
     provenance: dict = field(default_factory=dict)
@@ -379,6 +381,8 @@ def _fill_bus_status(cfg, bus, source, name, st, mine):
     st.bench_stalled_since = mine_state.stalled_since
     st.bench_skipped_dropped = mine_state.skipped_dropped
     st.bench_skipped_upstream = mine_state.skipped_upstream
+    st.bench_skipped_permanent = mine_state.skipped_permanent
+    st.permanent_skip_reason = mine_state.permanent_skip_reason
     st.bench_age = (
         time.time() - mine_state.updated_at if mine_state.updated_at else None
     )
@@ -437,6 +441,11 @@ def render(report: BusStatus, echo) -> None:
         if st.bench_skipped_upstream:
             echo(
                 f"  source retention prevented transfer through {st.bench_skipped_upstream}"
+            )
+        if st.bench_skipped_permanent is not None:
+            echo(
+                f"  last permanent publication skip: {st.bench_skipped_permanent}: "
+                f"{st.permanent_skip_reason}"
             )
         if st.transfer:
             progress = st.transfer

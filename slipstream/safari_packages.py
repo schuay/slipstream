@@ -23,7 +23,7 @@ import urllib.request
 from contextlib import nullcontext
 from pathlib import Path
 
-from .bus import Blob, Bus, BusError, sha256_file
+from .bus import Blob, Bus, BusError, PermanentEntryError, sha256_file
 from .durability import atomic_write, durable_mkdir, flush_file, fsync_dir
 from .hostapp import HostApp, read_app
 
@@ -98,7 +98,7 @@ def host_os_major():
 
 def select_package(entry, major):
     if entry.version != 5 or not entry.safari_release:
-        raise BusError(
+        raise PermanentEntryError(
             "incompatible legacy Safari publication; requires OS packages (version 5)"
         )
     validate_release(entry.safari_release)

@@ -87,6 +87,24 @@ def _status(env, name="v8"):
 
 
 class TestBusDrivenEngine:
+    def test_permanent_skip_remains_visible_after_cursor_advances(self, env):
+        env.bus.write_bench_state(
+            "v8",
+            BenchState(
+                skipped_permanent=K1(100),
+                permanent_skip_reason="immutable publication defect",
+            ),
+        )
+        write_cursor(cursor_path(env.cfg.out_dir, "local", "v8"), 101)
+        report, st = _status(env)
+        assert st.bench_skipped_permanent == K1(100)
+        lines = []
+        render(report, lines.append)
+        assert any(
+            "last permanent publication skip: 100: immutable publication defect" in line
+            for line in lines
+        )
+
     def test_frontier_cursor_and_lag(self, env):
         for cid in (100, 101, 102):
             env.publish(cid)

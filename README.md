@@ -282,9 +282,15 @@ identify distinct representations and are recorded separately.
 
 Upgrade producer, transfer endpoints, and consumers together: these Safari
 publications use entry version 5, while other engines retain their existing
-format. Old consumers reject version 5; new Safari consumers reject legacy
-single-app publications with a compatibility error. Preserve historical identities
-and cursors. A host OS upgrade selects the new package at the existing cursor;
+format. Old consumers reject version 5; new Safari consumers skip legacy
+single-app publications as permanent publication errors and advance the cursor.
+The consumer logs each skip, records its last key and reason in bench state,
+and reports it in `bus status`, without recording benchmark results. Only
+explicitly classified permanent publication errors, including unsupported
+publication format versions for every engine, are skipped; transport,
+checksum, host and configuration errors remain pending for repair.
+Historical publication identities are preserved.
+A host OS upgrade selects the new package at the existing cursor;
 there is no automatic reset or backfill. A missing OS package or a failed object
 checksum leaves the publication pending. After the last macOS 26 host upgrades,
 set `safari_os_majors = [27]` for future releases.

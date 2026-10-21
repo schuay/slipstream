@@ -35,6 +35,7 @@ from .bus import (
     BusError,
     Delta,
     Entry,
+    PermanentEntryError,
     StoredObject,
     cursor_path,
     parse_key_stem,
@@ -304,7 +305,13 @@ class BusConsumer:
         # The blobs this entry needed are in the bench state by now, so the
         # sweep keeps them for the next entry to share and reclaims the
         # previous entry's.
-        self.bus.sweep_blobs()
+        try:
+            self.bus.sweep_blobs()
+        except PermanentEntryError as exc:
+            # Another publication may have an unsupported format. We cannot
+            # discover all its references, so retain its objects and continue
+            # measuring the readable entry rather than misclassifying it.
+            self.log(f"{engine.name}: deferring blob sweep: {exc}")
         t3 = time.monotonic()
         # A browser bundle is a gigabyte of small files; this is where the
         # minute between two commits goes, and it should say so.
@@ -519,6 +526,10 @@ class BusConsumer:
                     continue
                 try:
                     entry = handle.read_entry(engine_name, key)
+                except PermanentEntryError as e:
+                    self._skip_permanent(source, engine_name, key, state, e)
+                    cursor = key
+                    continue
                 except TRANSPORT_ERRORS as e:
                     # Only a source that says "not there" advances the cursor; a
                     # source that could not answer must not, or an outage would
@@ -589,6 +600,10 @@ class BusConsumer:
                             f"{queued} above the cursor"
                         )
                         outcome = self.bench_entry(handle, engine, entry)
+                except PermanentEntryError as e:
+                    self._skip_permanent(source, engine_name, key, state, e)
+                    cursor = key
+                    continue
                 except TRANSPORT_ERRORS as e:
                     state.last_error = str(e)
                     state.in_flight = None
@@ -647,6 +662,16 @@ class BusConsumer:
             if should_stop()
             else stop_reason,
         )
+
+    def _skip_permanent(self, source, engine_name, key, state, error):
+        self.log(f"{engine_name}: skipping {key}: permanent publication error: {error}")
+        state.in_flight = None
+        state.skipped_permanent = key
+        state.permanent_skip_reason = str(error)
+        # Persist the reason before moving the cursor, so a crash cannot hide
+        # why this machine passed an unmeasured publication.
+        self.bus.write_bench_state(engine_name, state)
+        self.set_cursor(source, engine_name, key)
 
     def _report_plan(self, source, handle, engine_name: str) -> DrainResult:
         """Say what a real cycle would bench, and write nothing.
