@@ -27,7 +27,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from .service_logging import warning, error as log_error, success, message
+from .service_logging import warning, error as log_error, message
 from .admission import AdmissionStopped, CollectionResult, StopReason
 from . import __version__, host
 from .bus import (
@@ -317,10 +317,15 @@ class BusConsumer:
         # A browser bundle is a gigabyte of small files; this is where the
         # minute between two commits goes, and it should say so.
         self.log(
-            success(
-                f"{engine.name}: provisioned {entry.key} from {len(paths)} object(s), "
-                f"{size_mb:.0f} MB: fetch {t1 - t0:.0f}s, unpack {t2 - t1:.0f}s, "
-                f"trim {t3 - t2:.0f}s"
+            message(
+                f"{engine.name}: ",
+                (f"provisioned {entry.key}", "green"),
+                f" from {len(paths)} object(s), ",
+                (
+                    f"{size_mb:.0f} MB: fetch {t1 - t0:.0f}s, unpack {t2 - t1:.0f}s, "
+                    f"trim {t3 - t2:.0f}s",
+                    "dim",
+                ),
             )
         )
         return root
@@ -608,7 +613,9 @@ class BusConsumer:
                         )
                         self.log(
                             message(
-                                (f"{engine_name}: benching {key}", "bold"),
+                                (engine_name, "bold"),
+                                ": benching ",
+                                (str(key), "bold"),
                                 (f" ({entry.hash[:8]})", "dim"),
                                 f", {queued} above the cursor",
                             )
@@ -710,7 +717,7 @@ class BusConsumer:
             k for k in keys if not self.store.is_done(engine_name, self.cfg.platform, k)
         ]
         self.log(
-            warning(
+            message(
                 f"{engine_name}: would bench {len(todo)} of {len(keys)} entries above "
                 f"{cursor} from {source.name}"
                 + (f" (first {todo[0]}, last {todo[-1]})" if todo else "")
@@ -744,7 +751,9 @@ class BusConsumer:
                     ):
                         state.skipped_upstream = upstream
                         self.log(
-                            f"{engine_name}: source retention prevented transfer through {upstream}"
+                            warning(
+                                f"{engine_name}: source retention prevented transfer through {upstream}"
+                            )
                         )
             dropped = handle.builder_state(engine_name).highest_dropped
         except TRANSPORT_ERRORS:

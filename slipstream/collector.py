@@ -113,13 +113,13 @@ class BenchCollector:
         if self.dry_run and not capture:
             self._log(message(("Would run: ", "yellow"), cmd))
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-        if self.verbose:
+        deadline = getattr(self, "_read_deadline", None)
+        if self.verbose and deadline is None:
             self._log(message((f"$ {cmd}", "dim")))
         # An unattended collector has nobody to answer a git credential prompt,
         # and a blocked git blocks the whole watch loop. Fail fast instead.
         child_env = dict(os.environ if env is None else env)
         child_env.setdefault("GIT_TERMINAL_PROMPT", "0")
-        deadline = getattr(self, "_read_deadline", None)
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:

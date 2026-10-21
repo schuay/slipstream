@@ -162,7 +162,7 @@ class TestFindFrontier:
         return collector, calls
 
     def test_fetch_failure_raises(self, tmp_path):
-        # stderr carries bracket text to confirm it survives rich markup escaping.
+        # stderr carries bracket text to confirm it stays literal.
         failed = subprocess.CompletedProcess(
             "git fetch origin main",
             1,

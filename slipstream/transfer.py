@@ -10,7 +10,7 @@ use the same capture and acceptance transactions.
 
 from __future__ import annotations
 
-from .service_logging import warning, error, success
+from .service_logging import warning, error, success, message
 
 import json
 import os
@@ -589,9 +589,11 @@ class Coordinator:
             self.save(engine, record)
             self._finish(engine, record, dest.accept(stage))
         self.log(
-            success(
-                f"{engine}: accepted {target}, remaining={record['backlog']}, "
-                f"elapsed={time.monotonic() - started:.2f}s"
+            message(
+                f"{engine}: ",
+                (f"accepted {target}", "green"),
+                f", remaining={record['backlog']}, ",
+                (f"elapsed={time.monotonic() - started:.2f}s", "dim"),
             )
         )
         return True

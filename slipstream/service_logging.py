@@ -142,6 +142,8 @@ class EventLog:
 
     def __call__(self, text):
         level = getattr(text, "level", logging.INFO)
+        if not self.logger.isEnabledFor(level):
+            return
         record = self.logger.makeRecord(self.logger.name, level, "", 0, text, (), None)
         with _terminal.lock:
             self.logger.handle(record)
@@ -201,7 +203,11 @@ class EventLog:
             label, self._progress = self._progress, None
             if label is None:
                 return
-            text = message(label + " ", (outcome, "red" if failed else "green"))
+            text = message(
+                label + " ",
+                (outcome, "red" if failed else "green"),
+                level=logging.ERROR if failed else logging.INFO,
+            )
             if self.interactive and _terminal.partial is self:
                 _terminal.partial = None
                 suffix = Text(" " + outcome)
@@ -209,7 +215,7 @@ class EventLog:
                     suffix.stylize("red" if failed else "green")
                 _terminal.console.print(suffix, soft_wrap=True)
                 record = self.logger.makeRecord(
-                    self.logger.name, logging.INFO, "", 0, text, (), None
+                    self.logger.name, text.level, "", 0, text, (), None
                 )
                 self._mirror(record)
             else:

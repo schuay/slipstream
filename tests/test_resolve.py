@@ -645,3 +645,16 @@ def test_identity_selected_hash_bounds_backlog(embedder, monkeypatch):
     )
     with resolver.collector.read_budget(2):
         assert list(resolver.pending_keys(frontier, selected=selected)) == expected
+
+
+def test_optional_backlog_reads_do_not_flood_verbose_output(embedder, monkeypatch):
+    frontier = CommitKey(5001, 0)
+    selected = embedder.next_after(frontier)
+    logs = []
+    embedder.collector.verbose = True
+    monkeypatch.setattr(embedder.collector, "_log", logs.append)
+    with embedder.collector.read_budget(2):
+        assert len(list(embedder.pending_keys(frontier, selected=selected))) == 10
+    assert not logs
+    embedder.next_after(frontier)
+    assert logs

@@ -23,6 +23,7 @@ import urllib.request
 from contextlib import nullcontext
 from pathlib import Path
 
+from .service_logging import warning
 from .bus import Blob, Bus, BusError, PermanentEntryError, sha256_file
 from .durability import atomic_write, durable_mkdir, flush_file, fsync_dir
 from .hostapp import HostApp, read_app
@@ -263,7 +264,7 @@ class SafariReleases:
             TypeError,
         ) as exc:
             self.last_error = str(exc)
-            self.log(f"{self.engine}: Safari acquisition failed: {exc}")
+            self.log(warning(f"{self.engine}: Safari acquisition failed: {exc}"))
             self.record = read_release(self.path)
             if not self.record:
                 raise BusError(f"no adopted Safari release: {exc}") from exc

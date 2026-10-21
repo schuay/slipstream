@@ -127,6 +127,8 @@ class TestWatchRotation:
         )
         result = CliRunner().invoke(cli.app, ["bench", "v8", "jsc", *args])
         assert result.exit_code == 0, result.output
+        assert not result.stdout
+        assert "bench Benchmarking v8, jsc" in result.stderr
         assert order == ["v8", "jsc"] * 4
 
 

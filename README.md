@@ -373,6 +373,22 @@ for both its local DB and remote spools. The `relay` command is removed.
 `slipstream deliver --help` lists the maintenance switches (explicit replay,
 rebuild, legacy reconciliation); the `launchd/` example keeps it running.
 
+## Process logs
+
+Human process logs go to stderr as `HH:MM:SS role message`, with explicit
+`WARNING:` and `ERROR:` labels when needed. Colors and benchmark progress dots
+are terminal-only; redirected output contains complete, flushed lines suitable
+for launchd's `StandardErrorPath`. `NO_COLOR` disables styling. Stdout remains
+available for command results and machine protocols. `--log-file` on delivery
+and push selects the existing rotating file sink instead of stderr; collector
+logs retain their existing console and file destinations.
+
+Build starts include a snapshot count of eligible jobs, including the current
+one. Explicit retries are labeled separately. Counting uses a two-second read
+budget and never fetches or blocks an otherwise valid build on a counting error;
+those cases report `backlog unavailable`. Git snapshots are reused until the
+next fetch; derived engines refresh their retained inputs at each start.
+
 ## Development
 
 ```sh

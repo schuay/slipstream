@@ -77,7 +77,7 @@ def test_diagnostic_from_another_logger_closes_partial_line(terminal, tmp_path):
     lines = output.splitlines()
     assert lines[0] == "    js3: ."
     assert "transfer ERROR: connection lost" in lines[1]
-    assert "bench     js3: ERRORS (1s)" in lines[2]
+    assert "bench ERROR:     js3: ERRORS (1s)" in lines[2]
     assert output.count("ERRORS") == 1
 
 
@@ -96,6 +96,7 @@ def test_exception_finishes_progress(terminal, tmp_path, exception, outcome, tty
             raise exception()
     assert stream.getvalue().count(outcome) == 1
     assert path.read_text().count(outcome) == 1
+    assert "bench ERROR:" in path.read_text()
     assert terminal.partial is None
 
 

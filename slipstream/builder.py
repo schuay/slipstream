@@ -768,10 +768,15 @@ class Builder:
         self._publish_state(engine_name, state)
         patches = sum(b.delta.plan.patch_bytes for b in entry.blobs if b.delta)
         self.log(
-            success(
-                f"{engine_name}: published {key} ({entry.blob_bytes / MB:.0f}MB"
-                + (f", {patches / MB:.1f}MB of it patches" if patches else "")
-                + f", {entry.build_secs}s)"
+            message(
+                f"{engine_name}: ",
+                (f"published {key}", "green"),
+                (
+                    f" ({entry.blob_bytes / MB:.0f}MB"
+                    + (f", {patches / MB:.1f}MB of it patches" if patches else "")
+                    + f", {entry.build_secs}s)",
+                    "dim",
+                ),
             )
         )
         return BuildResult(key=key, published=True)
