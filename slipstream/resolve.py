@@ -74,6 +74,9 @@ class Resolver(Protocol):
     def next_after(self, frontier: CommitKey) -> BuildJob | None:
         """The lowest key above ``frontier`` with something to build, or None."""
 
+    def pending_keys(self, frontier: CommitKey, *, selected: BuildJob | None = None):
+        """Read eligible keys without fetching or changing the selected job."""
+
     def for_key(self, key: CommitKey) -> BuildJob | None:
         """The job for exactly ``key``, or None if the key names nothing."""
 
@@ -96,6 +99,17 @@ class IdentityResolver:
         self._own(frontier)
         commit = self.collector.next_commit_after(self.engine, frontier.commit_id)
         return self._job(commit)
+
+    def pending_keys(self, frontier: CommitKey, *, selected: BuildJob | None = None):
+        self._own(frontier)
+        start_hash = None
+        if selected is not None:
+            yield selected.key
+            frontier, start_hash = selected.key, selected.hash
+        for commit in self.collector.commits_after(
+            self.engine, frontier.commit_id, start_hash=start_hash
+        ):
+            yield CommitKey(0, int(commit["commit_id"]))
 
     def for_key(self, key: CommitKey) -> BuildJob | None:
         self._own(key)
@@ -192,10 +206,23 @@ class EmbedderResolver:
         self.collector.head_commit_id(self.inner.name)
 
     def next_after(self, frontier: CommitKey) -> BuildJob | None:
+        return next(self._jobs_after(frontier), None)
+
+    def pending_keys(self, frontier: CommitKey, *, selected: BuildJob | None = None):
+        start_hash = None
+        if selected is not None:
+            yield selected.key
+            frontier, start_hash = selected.key, selected.checkout_hash
+        for job in self._jobs_after(frontier, allow_fetch=False, start_hash=start_hash):
+            yield job.key
+
+    def _jobs_after(self, frontier: CommitKey, *, allow_fetch=True, start_hash=None):
         outer_pos, inner_id = frontier
         start = None
         if outer_pos:
-            start = self.collector._commit_hash_from_id(self.outer, outer_pos)
+            start = start_hash or self.collector._commit_hash_from_id(
+                self.outer, outer_pos
+            )
             if not start:
                 raise ValueError(
                     f"{self.outer.name} has no commit at position {outer_pos}"
@@ -205,17 +232,18 @@ class EmbedderResolver:
                     self._git(
                         self.outer, f"show --format= -p {start} -- {self.roll_file}"
                     )
-                )
+                ),
+                allow_fetch=allow_fetch,
             )
             if ends and self._forward(*ends):
                 # Still inside the frontier's roll: the next inner commit
                 # above the one just built, up to the roll's new pin.
-                job = self._first_within(start, *ends, min_id=inner_id + 1)
-                if job:
-                    return job
+                for job in self._jobs_within(start, *ends, min_id=inner_id + 1):
+                    yield job
+                    inner_id = job.key.commit_id
         rng = f"{start}..origin/main" if start else "origin/main"
         for roll, bounds in self._rolls(rng):
-            ends = self._endpoints(bounds)
+            ends = self._endpoints(bounds, allow_fetch=allow_fetch)
             if ends is None or not self._forward(*ends):
                 continue
             if ends[1].id < inner_id:
@@ -223,10 +251,11 @@ class EmbedderResolver:
             # A fresh roll starts at its own old pin -- the chromium-only
             # step -- unless the frontier is already past it (a re-roll after
             # a revert), in which case it resumes there.
-            job = self._first_within(roll, *ends, min_id=inner_id, preserve_first=True)
-            if job:
-                return job
-        return None
+            for job in self._jobs_within(
+                roll, *ends, min_id=inner_id, preserve_first=True
+            ):
+                yield job
+                inner_id = job.key.commit_id
 
     def for_key(self, key: CommitKey) -> BuildJob | None:
         job = self.next_after(key.before())
@@ -292,16 +321,16 @@ class EmbedderResolver:
     # --- the inner side ---
 
     def _endpoints(
-        self, bounds: tuple[str, str] | None
+        self, bounds: tuple[str, str] | None, *, allow_fetch=True
     ) -> tuple[_Point, _Point] | None:
         """Both pins of a roll as main-line points, or None if either is
         nothing the inner series has a place for."""
         if bounds is None:
             return None
-        old, new = (self._main_point(sha) for sha in bounds)
+        old, new = (self._main_point(sha, allow_fetch=allow_fetch) for sha in bounds)
         return (old, new) if old and new else None
 
-    def _main_point(self, sha: str) -> _Point | None:
+    def _main_point(self, sha: str, *, allow_fetch=True) -> _Point | None:
         """The main commit a pin stands for, with the id the series uses.
 
         The pin itself when it is on main; otherwise the commit named by its
@@ -311,7 +340,7 @@ class EmbedderResolver:
         """
         if sha in self._points:
             return self._points[sha]
-        self._ensure_fetched(sha)
+        self._ensure_fetched(sha, allow_fetch=allow_fetch)
         if self._on_main(sha):
             base = sha
         else:
@@ -338,7 +367,7 @@ class EmbedderResolver:
         )
         return res.returncode == 0
 
-    def _ensure_fetched(self, sha: str) -> None:
+    def _ensure_fetched(self, sha: str, *, allow_fetch=True) -> None:
         """Have ``sha`` in the inner checkout, fetching it by hash if not.
 
         The routine fetch brings main; a branch head is not on it, and the
@@ -351,6 +380,8 @@ class EmbedderResolver:
         )
         if have.returncode == 0:
             return
+        if not allow_fetch:
+            raise ValueError(f"backlog endpoint {sha[:12]} is not fetched")
         got = self.collector._run(
             f"git fetch origin {sha}", cwd=src, capture=True, caffeinate=False
         )
@@ -368,7 +399,7 @@ class EmbedderResolver:
         """
         return old.id <= new.id
 
-    def _first_within(
+    def _jobs_within(
         self,
         roll: str,
         old: _Point,
@@ -376,8 +407,8 @@ class EmbedderResolver:
         *,
         min_id: int,
         preserve_first: bool = False,
-    ) -> BuildJob | None:
-        """The lowest inner commit in ``old..=new`` with id >= ``min_id``.
+    ):
+        """The inner commits in ``old..=new`` with id >= ``min_id``.
 
         ``old`` itself is always a candidate -- it is the roll's base point,
         whatever the inner engine's path_filter says -- and the commits
@@ -406,8 +437,9 @@ class EmbedderResolver:
                     )
                 )
             ):
-                return self._job(roll, commit)
-        return None
+                yield self._job(roll, commit)
+                preserve_first = False
+                min_id = int(commit["commit_id"]) + 1
 
     def _job(self, roll: str, commit: dict) -> BuildJob:
         outer = self._outer_commit(roll)
@@ -507,24 +539,36 @@ class DerivedResolver:
         return [e for e in self.bus.entries(self.inner.name) if self.eligible(e)]
 
     def next_after(self, frontier: CommitKey) -> BuildJob | None:
+        return next(self._jobs_after(frontier), None)
+
+    def pending_keys(self, frontier: CommitKey, *, selected=None):
+        # The selected job already resolved the release identity. Counting must
+        # not allocate a number for an app replaced since selection.
+        number = selected.key.embedder_id if selected else self.installed()[1]
+        for entry in self._entries_after(frontier, number):
+            yield CommitKey(number, entry.commit_id)
+
+    def _jobs_after(self, frontier: CommitKey):
         app, number = self.installed()
+        for entry in self._entries_after(frontier, number):
+            yield self._job(number, app, entry)
+
+    def _entries_after(self, frontier: CommitKey, number: int):
         prev_number, w = frontier
         if prev_number and number < prev_number:
             raise ValueError(
-                f"{self.engine.name}: the installed {app.title} is number {number}, "
+                f"{self.engine.name}: the installed app is number {number}, "
                 f"below the series' frontier {frontier}; the series does not go "
                 f"backwards, so nothing is published until a newer one is installed"
             )
         if prev_number and number > prev_number:
-            # The app-only step: same inner commit, new app.
+            # The app-only step uses the frontier's inner commit if retained.
             on_frontier = self.bus.read_entry(self.inner.name, CommitKey(0, w))
             if on_frontier is not None and self.eligible(on_frontier):
-                return self._job(number, app, on_frontier)
-            # Retention took it; the step lands on the next entry instead.
+                yield on_frontier
         for entry in self._candidates():
             if entry.key.commit_id > w:
-                return self._job(number, app, entry)
-        return None
+                yield entry
 
     def for_key(self, key: CommitKey) -> BuildJob | None:
         app, number = self.installed()

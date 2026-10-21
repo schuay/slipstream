@@ -194,3 +194,54 @@ class TestReadApp:
         app = read_app(tmp_path / "Thing.app")
         assert app == HostApp("Thing", "7", "")
         assert app.title == "Thing 7"
+
+
+def test_derived_backlog_tracks_retention_publication_and_release(world, monkeypatch):
+    bus, resolver, state = world
+    frontier = CommitKey(1, 10)
+    assert list(resolver.pending_keys(frontier)) == [CommitKey(1, 11), CommitKey(1, 12)]
+    bus.entry_path("jsc", CommitKey(0, 11)).unlink()
+    bus.publish(_jsc_entry(13, paths=[RUNTIME[0]]))
+    bus.publish(_jsc_entry(14))
+    state["app"] = _app("new release")
+    selected = resolver.next_after(frontier)
+    assert selected.key == CommitKey(2, 10)
+    # Counting uses selection's release, even if the app changes meanwhile.
+    monkeypatch.setattr(
+        resolver, "installed", lambda: pytest.fail("count reread the installed app")
+    )
+    assert list(resolver.pending_keys(frontier, selected=selected)) == [
+        CommitKey(2, 10),
+        CommitKey(2, 12),
+        CommitKey(2, 14),
+    ]
+    bus.entry_path("jsc", CommitKey(0, 10)).unlink()
+    assert list(resolver.pending_keys(frontier, selected=selected)) == [
+        CommitKey(2, 12),
+        CommitKey(2, 14),
+    ]
+
+
+def test_builder_refreshes_derived_snapshot_each_start(world, config):
+    from slipstream.builder import Builder
+
+    bus, resolver, state = world
+    config.engines = {"jsc": resolver.inner, "safari": resolver.engine}
+    config.build.start_from["safari"] = CommitKey(1, 10)
+    builder = Builder(config, bus)
+    builder._resolvers["safari"] = resolver
+    try:
+        selected = builder.next_job("safari")
+        assert builder._backlog("safari", selected, False).startswith("2 builds")
+        bus.publish(_jsc_entry(14))
+        assert builder._backlog("safari", selected, False).startswith("3 builds")
+        bus.entry_path("jsc", CommitKey(0, 12)).unlink()
+        assert builder._backlog("safari", selected, False).startswith("2 builds")
+        state["app"] = _app("next release")
+        selected = builder.next_job("safari")
+        assert selected.key == CommitKey(2, 10)
+        assert builder._backlog("safari", selected, False).startswith("3 builds")
+        bus.entry_path("jsc", CommitKey(0, 10)).unlink()
+        assert builder._backlog("safari", selected, False) == "backlog unavailable"
+    finally:
+        builder.store.close()

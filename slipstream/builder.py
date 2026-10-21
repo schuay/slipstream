@@ -23,6 +23,7 @@ import subprocess
 import time
 import uuid
 from collections.abc import Callable
+from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -63,6 +64,7 @@ DEFAULT_INTERVAL_SECS = 1800.0
 # A cycle drains, but not forever: commits that keep landing must not keep it
 # from re-reading its state, fetching again, or stopping when asked.
 MAX_JOBS_PER_CYCLE = 50
+BACKLOG_BUDGET_SECS = 2.0
 # How many failures the published state file carries. Consumers cat it over
 # ssh every cycle; the count travels separately so nothing is hidden.
 MAX_REPORTED_FAILURES = 50
@@ -417,6 +419,7 @@ class Builder:
         self.log = log or (lambda msg: None)
         self.identity = {"bot": cfg.bot_name, **host.identity()}
         self._resolvers: dict[str, Resolver] = {}
+        self._backlogs: dict[str, tuple[CommitKey, list[CommitKey]] | str] = {}
 
     # --- resolving what to build ---
 
@@ -592,6 +595,49 @@ class Builder:
             )
         return resolver.next_after(frontier)
 
+    def _backlog(self, engine_name: str, job: BuildJob, was_retry: bool) -> str:
+        if was_retry:
+            return "explicit retry"
+        try:
+            resolver = self.resolver(engine_name)
+            frontier = self.frontier(engine_name)
+            if frontier is None:
+                raise ValueError("no effective frontier")
+            # Derived inputs are a bounded retained topic and the selected
+            # release. Refresh at each start to reflect publication/retention.
+            live = isinstance(resolver, DerivedResolver)
+            snapshot = None if live else self._backlogs.get(engine_name)
+            if snapshot is None:
+                deadline = time.monotonic() + BACKLOG_BUDGET_SECS
+                with self.collector.read_budget(BACKLOG_BUDGET_SECS):
+                    candidates = resolver.pending_keys(frontier, selected=job)
+                    keys = []
+                    for key in candidates:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("backlog scan exceeded its time budget")
+                        if key <= (keys[-1] if keys else frontier):
+                            raise ValueError("backlog keys are not in build order")
+                        keys.append(key)
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("backlog scan exceeded its time budget")
+                snapshot = (frontier, keys)
+                if not live:
+                    self._backlogs[engine_name] = snapshot
+            if isinstance(snapshot, str):
+                return "backlog unavailable"
+            floor, keys = snapshot
+            position = bisect_right(keys, frontier)
+            if frontier < floor or position == len(keys) or keys[position] != job.key:
+                raise ValueError("selected job differs from backlog snapshot")
+            count = len(keys) - position
+            noun = "build" if count == 1 else "builds"
+            return f"{count} {noun} including this one (snapshot)"
+        except Exception as exc:
+            # Optional diagnostics must not stop an already selected build.
+            self._backlogs[engine_name] = str(exc)
+            self.log(warning(f"{engine_name}: backlog unavailable: {exc}"))
+            return "backlog unavailable"
+
     # --- one commit ---
 
     def free_gb(self) -> float:
@@ -654,21 +700,28 @@ class Builder:
         state.in_flight = self._in_flight(job, "build")
         self._publish_state(engine_name, state)
         self.lock.set_job(f"{engine_name} {key}")
-        # Said out loud: without -v nothing else reaches the console until the
-        # build has published or failed, and a long one looks like a hang.
 
         row = self.store.get_build_state(engine_name, key)
         was_retry = row is not None and row["status"] == "retry_requested"
         log_path = self.cfg.logs_dir / f"build-{engine_name}-{key}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        backlog = self._backlog(engine_name, job, was_retry)
+        action = "building" if job.compiles else "packaging"
+        parent = (
+            "" if job.compiles else f" from {job.inherits.engine} {job.inherits.key}"
+        )
+        self.log(
+            message(
+                (engine_name, "bold"),
+                f": {action} ",
+                (str(key), "bold"),
+                parent,
+                (f" ({job.hash[:8]})", "dim"),
+                f", {backlog}",
+            )
+        )
         started = time.time()
         if job.compiles:
-            self.log(
-                message(
-                    (f"{engine_name}: building {key}", "bold"),
-                    (f" ({job.hash[:8]})", "dim"),
-                )
-            )
             failure = self.collector.build_at(
                 engine, job.checkout_hash, log_path, pins=job.pins
             )
@@ -682,11 +735,6 @@ class Builder:
                     stalled=stalled,
                     was_retry=was_retry,
                 )
-        else:
-            self.log(
-                f"{engine_name}: packaging {key} from {job.inherits.engine} "
-                f"{job.inherits.key} ({job.hash[:8]})"
-            )
 
         state.in_flight = self._in_flight(job, "package")
         self._publish_state(engine_name, state)
@@ -1038,6 +1086,7 @@ class Builder:
                         if name not in fetched:
                             self.resolver(name).fetch()  # so origin/main is current
                             fetched.add(name)
+                            self._backlogs.pop(name, None)
                         result = self.build_one(name)
                     except FetchError:
                         self.log(warning(f"{name}: skipping until fetch succeeds"))

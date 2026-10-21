@@ -531,3 +531,117 @@ class TestCommitIdLookup:
             {"DEPS": _deps(H[1008], "  'skia': 'x',\n")},
         )
         assert _walk(resolver, CommitKey(5008, 1008)) == [CommitKey(5010, 1008)]
+
+
+@pytest.mark.parametrize(
+    "frontier", [CommitKey(5001, 0), CommitKey(5005, 1004), CommitKey(5008, 1008)]
+)
+def test_backlog_enumeration_matches_chrome_selection(embedder, frontier):
+    with embedder.collector.read_budget(2):
+        keys = list(embedder.pending_keys(frontier))
+    assert keys == _walk(embedder, frontier)
+
+
+def test_identity_backlog_applies_path_and_relevance_filters(embedder, monkeypatch):
+    resolver = IdentityResolver(embedder.collector, embedder.inner)
+    real = embedder.collector.commit_is_relevant
+    monkeypatch.setattr(
+        embedder.collector,
+        "commit_is_relevant",
+        lambda e, sha, **kw: (
+            sha != embedder.collector.commit_metadata_for_id(e, 1004)["hash"]
+            and real(e, sha, **kw)
+        ),
+    )
+    with resolver.collector.read_budget(2):
+        keys = list(resolver.pending_keys(CommitKey(0, 1001)))
+    assert keys == [CommitKey(0, i) for i in (1002, 1003, 1005, 1006, 1008)]
+    assert keys == _walk(resolver, CommitKey(0, 1001))
+
+
+def test_backlog_does_not_fetch_missing_chrome_endpoint(branched, config, tmp_path):
+    v8, cr, _, _ = branched
+    lagging = Repo(tmp_path / "lagging", clone_of=v8.path)
+    v8.commit(1009, "new inner", {"src/new.cc": "9"})
+    head = v8.cut(1009, "15.0.9")
+    cr.commit(5009, "new roll", {"DEPS": _deps(head)})
+    resolver = _resolver(config, lagging.path, cr.path)
+    resolver.fetch()
+    with pytest.raises(ValueError):
+        list(resolver.pending_keys(CommitKey(5008, 1008)))
+    assert (
+        subprocess.run(
+            ["git", "cat-file", "-e", head], cwd=lagging.path, capture_output=True
+        ).returncode
+        != 0
+    )
+    assert resolver.next_after(CommitKey(5008, 1008)).key == CommitKey(5009, 1008)
+    assert (
+        subprocess.run(
+            ["git", "cat-file", "-e", head], cwd=lagging.path, capture_output=True
+        ).returncode
+        == 0
+    )
+
+
+def test_backlog_git_error_is_not_an_empty_queue(embedder, monkeypatch):
+    import slipstream.collector as collector_mod
+
+    original = subprocess.run
+
+    def fail_log(argv, **kw):
+        if isinstance(argv, list) and argv[:2] == ["git", "log"]:
+            return subprocess.CompletedProcess(argv, 128, "", "unreadable history")
+        return original(argv, **kw)
+
+    monkeypatch.setattr(collector_mod.subprocess, "run", fail_log)
+    with pytest.raises(ValueError, match="unreadable history"):
+        with embedder.collector.read_budget(1):
+            list(embedder.pending_keys(CommitKey(5001, 0)))
+
+
+def test_read_budget_times_out_subprocess_and_restores_selection(embedder, monkeypatch):
+    original = subprocess.run
+    timeouts = []
+
+    def timeout(argv, **kw):
+        if "timeout" in kw:
+            timeouts.append(kw["timeout"])
+            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+        return original(argv, **kw)
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+    with pytest.raises(subprocess.TimeoutExpired):
+        with embedder.collector.read_budget(0.5):
+            list(embedder.pending_keys(CommitKey(5001, 0)))
+    assert timeouts and 0 < timeouts[0] <= 0.5
+    assert embedder.next_after(CommitKey(5001, 0)).key == CommitKey(5003, 1001)
+
+
+def test_selected_job_bounds_backlog_without_resolving_frontier_again(
+    embedder, monkeypatch
+):
+    frontier = CommitKey(5001, 0)
+    selected = embedder.next_after(frontier)
+    expected = _walk(embedder, frontier)
+    monkeypatch.setattr(
+        embedder.collector,
+        "_commit_hash_from_id",
+        lambda *a: pytest.fail("duplicate frontier lookup"),
+    )
+    with embedder.collector.read_budget(2):
+        assert list(embedder.pending_keys(frontier, selected=selected)) == expected
+
+
+def test_identity_selected_hash_bounds_backlog(embedder, monkeypatch):
+    resolver = IdentityResolver(embedder.collector, embedder.inner)
+    frontier = CommitKey(0, 1001)
+    selected = resolver.next_after(frontier)
+    expected = _walk(resolver, frontier)
+    monkeypatch.setattr(
+        resolver.collector,
+        "_commit_hash_from_id",
+        lambda *a: pytest.fail("duplicate frontier lookup"),
+    )
+    with resolver.collector.read_budget(2):
+        assert list(resolver.pending_keys(frontier, selected=selected)) == expected

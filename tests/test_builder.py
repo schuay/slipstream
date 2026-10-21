@@ -430,6 +430,9 @@ class TestResolverSeam:
         key = CommitKey(1534000, 101)
 
         class Scripted:
+            def pending_keys(self, frontier, *, selected=None):
+                yield key
+
             def fetch(self):
                 pass
 
@@ -1551,3 +1554,89 @@ def test_build_hooks_cover_packaging_under_machine_lock(builder, monkeypatch):
     assert builder.run_cycle(["v8"], lambda: False) == 4
     assert events == ["pre-build", "package", "post-build"] * 4
     assert not builder.lock.held
+
+
+@pytest.fixture
+def counted_builder(builder, monkeypatch):
+    builder.scans = []
+
+    def commits_after(engine, frontier, *, start_hash=None):
+        builder.scans.append(frontier)
+        for cid in builder.history:
+            if cid > frontier:
+                yield _commit(cid)
+
+    monkeypatch.setattr(builder.collector, "commits_after", commits_after)
+    return builder
+
+
+def test_backlog_counts_jobs_and_reuses_snapshot(counted_builder):
+    b = counted_builder
+    b.history = [100, 101, 110, 150]
+    b.build_one("v8")
+    b.build_one("v8")
+    starts = [line for line in b.logs if ": building " in line]
+    assert len(starts) == 2
+    assert "3 builds including this one (snapshot)" in starts[0]
+    assert "2 builds including this one (snapshot)" in starts[1]
+    assert b.scans == [101]
+
+
+@pytest.mark.parametrize("kind, remaining", [("compile", 3), ("sync", 4)])
+def test_backlog_obeys_terminal_failure_frontier(counted_builder, kind, remaining):
+    b = counted_builder
+    b.failures = [BuildStepError(kind, 1)]
+    b.build_one("v8")
+    b.build_one("v8")
+    starts = [line for line in b.logs if ": building " in line]
+    assert f"{remaining} builds including this one" in starts[-1]
+    assert b.scans == [101]
+
+
+def test_explicit_retry_is_not_counted_as_new_work(counted_builder):
+    b = counted_builder
+    b.failures = [BuildStepError("compile", 1)]
+    b.build_one("v8")
+    b.build_one("v8")
+    assert b.store.request_build_retry("v8", K1(101))
+    b.build_one("v8")
+    start = [line for line in b.logs if ": building " in line][-1]
+    assert "explicit retry" in start and "builds including" not in start
+    assert b.built[-1][0] == "hash101"
+    assert b.scans == [101]
+
+
+def test_count_failure_does_not_prevent_selected_build(counted_builder, monkeypatch):
+    b = counted_builder
+
+    def broken(frontier, *, selected=None):
+        yield K1(101)
+        raise ValueError("later job cannot be resolved")
+
+    monkeypatch.setattr(b.resolver("v8"), "pending_keys", broken)
+    assert b.build_one("v8").published
+    assert any(
+        "backlog unavailable: later job cannot be resolved" in line for line in b.logs
+    )
+    start = [line for line in b.logs if ": building " in line]
+    assert len(start) == 1 and "backlog unavailable" in start[0]
+    assert b.built[0][0] == "hash101"
+    assert b.collector._read_deadline is None
+
+
+def test_count_budget_does_not_prevent_build(counted_builder, monkeypatch):
+    monkeypatch.setattr("slipstream.builder.BACKLOG_BUDGET_SECS", 0)
+    b = counted_builder
+    assert b.build_one("v8").published
+    assert any("backlog unavailable: backlog scan exceeded" in line for line in b.logs)
+
+
+def test_fetch_refreshes_backlog(counted_builder):
+    b = counted_builder
+    assert b.run_cycle(["v8"], lambda: False) == 4
+    b.history += [120, 130]
+    assert b.run_cycle(["v8"], lambda: False) == 2
+    starts = [line for line in b.logs if ": building " in line]
+    assert "2 builds including this one" in starts[-2]
+    assert "1 build including this one" in starts[-1]
+    assert b.scans == [101, 120]

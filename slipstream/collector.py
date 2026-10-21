@@ -12,6 +12,7 @@ import platform
 import subprocess
 import time
 from collections import namedtuple
+from contextlib import contextmanager
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -118,9 +119,47 @@ class BenchCollector:
         # and a blocked git blocks the whole watch loop. Fail fast instead.
         child_env = dict(os.environ if env is None else env)
         child_env.setdefault("GIT_TERMINAL_PROMPT", "0")
+        deadline = getattr(self, "_read_deadline", None)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("backlog scan exceeded its time budget")
+            argv = shlex.split(cmd)
+            if argv[0] != "git" or argv[1] not in {
+                "log",
+                "show",
+                "diff-tree",
+                "merge-base",
+                "cat-file",
+                "rev-parse",
+            }:
+                raise ValueError("backlog scan attempted a non-read-only command")
+            result = subprocess.run(
+                argv,
+                cwd=cwd,
+                env=child_env,
+                capture_output=True,
+                text=True,
+                timeout=remaining,
+            )
+            if result.returncode and not (
+                argv[1] in {"cat-file", "merge-base"} and result.returncode == 1
+            ):
+                raise ValueError(f"backlog git read failed: {result.stderr.strip()}")
+            return result
         return subprocess.run(
             cmd, shell=True, cwd=cwd, env=child_env, capture_output=capture, text=True
         )
+
+    @contextmanager
+    def read_budget(self, seconds):
+        """Bound optional backlog reads without changing normal selection."""
+        previous = getattr(self, "_read_deadline", None)
+        self._read_deadline = time.monotonic() + seconds
+        try:
+            yield
+        finally:
+            self._read_deadline = previous
 
     # --- Commit resolution ---
 
@@ -246,8 +285,12 @@ class BenchCollector:
         this machine has benched. Honours path_filter, so jsc does not build a
         commit that changed nothing it measures.
         """
+        return next(self.commits_after(engine, commit_id), None)
+
+    def commits_after(self, engine: EngineConfig, commit_id: int, *, start_hash=None):
+        """Eligible history in build order, read once for selection or counting."""
         src = engine.require_src_dir()
-        start_hash = self._commit_hash_from_id(engine, commit_id)
+        start_hash = start_hash or self._commit_hash_from_id(engine, commit_id)
         if not start_hash:
             raise ValueError(f"cannot resolve {engine.name} commit {commit_id}")
         path_filter = engine.path_filter or ""
@@ -267,8 +310,8 @@ class BenchCollector:
                 and commit["commit_id"] > commit_id
                 and self.commit_is_relevant(engine, commit["hash"])
             ):
-                return commit
-        return None
+                yield commit
+                commit_id = commit["commit_id"]
 
     def commit_metadata_for_id(
         self, engine: EngineConfig, commit_id: int
