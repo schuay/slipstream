@@ -9,7 +9,7 @@ import signal
 import socket
 import sys
 import urllib.request
-from http.client import IncompleteRead
+from http.client import HTTPConnection, IncompleteRead
 from pathlib import Path
 
 import pytest
@@ -228,6 +228,28 @@ class TestBenchServer:
                 assert r.headers["Content-Type"] == "application/wasm"
                 assert r.headers["Cross-Origin-Embedder-Policy"] == "require-corp"
         assert any("GET /index.html?report=true" in line for line in server.requests)
+
+    def test_keeps_the_connection_alive_across_requests(self, tmp_path):
+        """As Crossbench's server: a browser loads every workload resource
+        over the sockets it already has, including the injected page."""
+        (tmp_path / "index.html").write_text("<body></body>")
+        (tmp_path / "a.js").write_text("1")
+        with BenchServer(tmp_path, inject="sp3-report.mjs") as server:
+            conn = HTTPConnection("127.0.0.1", server.port, timeout=5)
+            try:
+                for path in ("/index.html", "/a.js", "/__slipstream/sp3-report.mjs"):
+                    conn.request("GET", path)
+                    r = conn.getresponse()
+                    assert r.status == 200
+                    assert r.version == 11
+                    assert r.read()
+                    assert not r.will_close
+                sock = conn.sock
+                conn.request("GET", "/a.js")
+                conn.getresponse().read()
+                assert conn.sock is sock
+            finally:
+                conn.close()
 
     def test_takes_the_report(self, tmp_path):
         with BenchServer(tmp_path) as server:

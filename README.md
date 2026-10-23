@@ -258,9 +258,11 @@ into one performance series.
 The local benchmark server uses Crossbench's cross-origin isolation headers
 (`Cross-Origin-Opener-Policy: same-origin` and
 `Cross-Origin-Embedder-Policy: require-corp`), enabling high-resolution timers
-where the browser supports them. It also sends `Cache-Control: no-store`.
-Chrome explicitly suppresses model downloads, crashpad metrics and translation
-triggers alongside its existing benchmarking/background flags. HTTP policy and
+where the browser supports them. It also sends `Cache-Control: no-store` and
+speaks HTTP/1.1 with keep-alive, as Crossbench's server does. Chrome's flags
+follow Crossbench's defaults for current milestones: its version-limited
+suppression switches (search engine choice, model downloads, crashpad metrics,
+translate trigger) do not apply to current trunk and are not passed. HTTP policy and
 Chrome flags are included in the runner configuration hash; adopting them
 changes the measurement baseline for existing browser results.
 

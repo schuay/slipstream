@@ -69,6 +69,9 @@ class _Handler(SimpleHTTPRequestHandler):
     }
 
     server: BenchServer
+    # Keep-alive, as Crossbench's local file server: the browser reuses its
+    # sockets across workload resources instead of reconnecting for each.
+    protocol_version = "HTTP/1.1"
 
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path
@@ -124,6 +127,9 @@ class BenchServer(ThreadingHTTPServer):
     the script to append, and the one page it is appended to."""
 
     daemon_threads = True
+    # Kept-alive connections idle in their handler threads; do not wait on
+    # them at server_close.
+    block_on_close = False
     # TCPServer's default backlog is only five. Bursts of workload scripts
     # can overflow it on macOS, resetting connections before their GETs ever
     # reach the handler and leaving benchmark applications partly loaded.
@@ -132,7 +138,9 @@ class BenchServer(ThreadingHTTPServer):
     @staticmethod
     def conventions() -> tuple[str, ...]:
         """Response policy recorded in every browser runner's provenance."""
-        return tuple(f"HTTP {name}: {value}" for name, value in RESPONSE_HEADERS)
+        return (f"HTTP protocol: {_Handler.protocol_version} keep-alive",) + tuple(
+            f"HTTP {name}: {value}" for name, value in RESPONSE_HEADERS
+        )
 
     def __init__(
         self, root: Path, *, page: str = "index.html", inject: str | None = None

@@ -26,9 +26,10 @@ from .browser import BrowserRunner, Command
 # not). --enable-benchmarking is still benchmarking mode: no updater,
 # metrics, Chrome Labs, model downloads. The background pair keeps the
 # page at full speed if the window is ever not in front.
-# The explicit model-download, crashpad and translation switches match
-# Crossbench's background-work suppression even when benchmarking mode
-# already covers part of it.
+# Crossbench limits its temporary suppression switches (search engine
+# choice, model downloads, crashpad metrics, translate trigger) to the
+# milestones that need them; none apply to current trunk, so neither are
+# they passed here.
 #
 # The window size is crossbench's default viewport. Headless's own default
 # is 800x600, which is exactly Speedometer's workload frame with no room
@@ -40,15 +41,11 @@ CHROMIUM_FLAGS = (
     "--window-size=1500,1000",
     "--no-first-run",
     "--no-default-browser-check",
-    "--disable-search-engine-choice-screen",
     "--disable-field-trial-config",
     "--enable-benchmarking",
     "--disable-component-update",
     "--disable-sync",
     "--disable-background-networking",
-    "--disable-optimization-guide-model-downloads-for-benchmarking",
-    "--disable-crashpad-metrics",
-    "--disable-translate-trigger",
     "--disable-extensions",
     "--disable-background-timer-throttling",
     "--disable-renderer-backgrounding",

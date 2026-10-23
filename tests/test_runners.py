@@ -282,8 +282,8 @@ class TestRunnerProvenance:
     # it together with the change that moved it, never on its own.
     RUNNER_HASHES = {
         "shell": "sha256:fdb9b01694d1f8052ba10fab1323d49e2d18efdecc040d325067d5c93513cd8b",
-        "chromium": "sha256:60a05e56577cd5e3d0f0f8cb3522970a7ae2f3e2c83a6c856d3252e88eff1892",
-        "safari": "sha256:49feac703fd6e7482d9738e309907a198e4971ae871d45b78f0411c7887d88d6",
+        "chromium": "sha256:41fb171786413591555d96b5fe6691a13e5908363c34b6c0901b8f467fc1e0f3",
+        "safari": "sha256:bf03fbd059abcbf62990096b74bcf06817366d0c49d1b971934444a5c25a0bd9",
     }
     SUITE_HASHES = {
         "js2": "sha256:c8c206b3c459a43f8f7305b13be726b06b65cab2b7c7176a9d647acffcd14c14",
