@@ -173,7 +173,7 @@ def test_pre_bench_precedes_preflight_and_post_runs_on_abort(
     collector = BenchCollector(config)
     engine = EngineConfig("v8", tmp_path, "true", "d8", "")
 
-    def preflight(mode, log):
+    def preflight(mode, log, runtime=None):
         assert collector.lock.held
         assert events.read_text().splitlines() == ["pre-bench"]
         with events.open("a") as f:

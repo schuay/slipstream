@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import plistlib
 import shlex
 
 import pytest
@@ -106,7 +107,30 @@ PMSET_BATT_BATTERY = """Now drawing from 'Battery Power'
 """
 
 
-def fake_reader(*, custom, live=PMSET_LIVE, batt=PMSET_BATT_AC, screensaver="0\n"):
+def console_plist(*users):
+    return plistlib.dumps({"IOConsoleUsers": list(users)}).decode()
+
+
+CONSOLE_UNLOCKED = console_plist(
+    {"kCGSSessionOnConsoleKey": True, "kCGSSessionUserNameKey": "bench"}
+)
+CONSOLE_LOCKED = console_plist(
+    {
+        "kCGSSessionOnConsoleKey": True,
+        "kCGSSessionUserNameKey": "bench",
+        "CGSSessionScreenIsLocked": True,
+    }
+)
+
+
+def fake_reader(
+    *,
+    custom,
+    live=PMSET_LIVE,
+    batt=PMSET_BATT_AC,
+    screensaver="0\n",
+    console=CONSOLE_UNLOCKED,
+):
     out = {
         ("sw_vers", "-productVersion"): "26.1\n",
         ("sysctl", "-n", "hw.model"): "Mac15,6\n",
@@ -114,6 +138,8 @@ def fake_reader(*, custom, live=PMSET_LIVE, batt=PMSET_BATT_AC, screensaver="0\n
         ("pmset", "-g"): live,
         ("pmset", "-g", "batt"): batt,
     }
+    if console is not None:
+        out[("ioreg", "-n", "Root", "-d1", "-a")] = console
     if screensaver is not None:
         out[
             (
@@ -339,6 +365,51 @@ class TestChecks:
         assert "screensaver" in {c.name for c in host.failures(host.checks(state))}
 
 
+class TestConsoleLock:
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            (CONSOLE_UNLOCKED, False),
+            (CONSOLE_LOCKED, True),
+            # The login window: a session exists but none is on the console.
+            (console_plist({"kCGSSessionOnConsoleKey": False}), True),
+            (console_plist(), True),
+            (plistlib.dumps({}).decode(), None),
+            ("not a plist", None),
+        ],
+    )
+    def test_parse(self, text, expected):
+        assert host.parse_screen_locked(text) is expected
+
+    def test_unreadable_is_unknown_and_passes(self):
+        state = host.read_state(
+            fake_reader(custom=PMSET_CUSTOM_NO_POWERMODE, console=None)
+        )
+        assert state.screen_locked is None
+        assert _named(host.checks(state, "safari"))["console session unlocked"].ok
+
+    def test_locked_blocks_safari(self):
+        state = host.read_state(
+            fake_reader(custom=PMSET_CUSTOM_NO_POWERMODE, console=CONSOLE_LOCKED)
+        )
+        check = _named(host.checks(state, "safari"))["console session unlocked"]
+        assert check.ok is False
+        assert check.severity == host.BLOCKING
+        assert "RestoreMachineState -bool NO" in check.fix
+        assert check in host.failures(host.checks(state, "safari"))
+
+    @pytest.mark.parametrize("runtime", [None, "shell", "chromium"])
+    def test_locked_only_warns_elsewhere(self, runtime):
+        # Hosts that must keep the screen lock by policy still bench these.
+        state = host.read_state(
+            fake_reader(custom=PMSET_CUSTOM_NO_POWERMODE, console=CONSOLE_LOCKED)
+        )
+        check = _named(host.checks(state, runtime))["console session unlocked"]
+        assert check.ok is False
+        assert check.severity == host.ADVISORY
+        assert check not in host.failures(host.checks(state, runtime))
+
+
 class TestCommands:
     def test_apply_skips_powermode_when_unsupported(self):
         state = host.read_state(fake_reader(custom=PMSET_CUSTOM_NO_POWERMODE))
@@ -443,6 +514,22 @@ class TestPreflight:
         assert host.preflight(mode, logged.append) is False
         assert any("system sleep (AC)" in line for line in logged)
         assert any("sudo pmset -c sleep 0" in line for line in logged)
+
+    def test_locked_session_fails_safari_with_instructions(self, monkeypatch):
+        monkeypatch.setattr(host, "is_macos", lambda: True)
+        ready = host.HostState(
+            on_ac=True,
+            ac={"sleep": "0", "displaysleep": "0", "lowpowermode": "0"},
+            screensaver_idle=0,
+            screen_locked=True,
+        )
+        monkeypatch.setattr(host, "read_state", lambda: ready)
+        logged = []
+        assert host.preflight("warn", logged.append, "chromium") is True
+        assert logged == []
+        assert host.preflight("warn", logged.append, "safari") is False
+        assert any("console session unlocked" in line for line in logged)
+        assert any("RestoreMachineState -bool NO" in line for line in logged)
 
 
 class TestRestoreUndoesEverythingApplyWrites:

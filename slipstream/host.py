@@ -22,6 +22,7 @@ from .service_logging import warning
 import functools
 import json
 import platform
+import plistlib
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -53,7 +54,12 @@ _READ_COMMANDS = {
         "idleTime",
     ],
     "ps": ["ps", "-axo", "comm="],
+    "console": ["ioreg", "-n", "Root", "-d1", "-a"],
 }
+
+# Runtimes that cannot measure in a locked console session; see the
+# "console session unlocked" check.
+LOCK_SENSITIVE_RUNTIMES = frozenset({"safari"})
 
 # Executables whose presence means a browser is up: the browsers themselves,
 # the same names the Safari runner refuses to launch beside, and their
@@ -137,6 +143,25 @@ def parse_therm(text: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def parse_screen_locked(text: str) -> bool | None:
+    """Whether the console session is locked, from `ioreg -n Root -d1 -a`.
+
+    No user on the console (the login window) counts as locked: nothing can
+    draw there either. None when the output is missing or unreadable.
+    """
+    try:
+        root = plistlib.loads(text.encode())
+    except (plistlib.InvalidFileException, ValueError):
+        return None
+    users = root.get("IOConsoleUsers") if isinstance(root, dict) else None
+    if users is None:
+        return None
+    on_console = [u for u in users if u.get("kCGSSessionOnConsoleKey")]
+    if not on_console:
+        return True
+    return bool(on_console[0].get("CGSSessionScreenIsLocked", False))
+
+
 @dataclass(frozen=True)
 class HostState:
     os_version: str | None = None
@@ -147,6 +172,7 @@ class HostState:
     battery: dict[str, str] = field(default_factory=dict)
     screensaver_idle: int | None = None
     browsers: tuple[str, ...] = ()
+    screen_locked: bool | None = None
     raw: dict[str, str] = field(default_factory=dict)
 
 
@@ -184,6 +210,9 @@ def read_state(read: Callable[[list[str]], str | None] | None = None) -> HostSta
         battery=custom.get(_BATTERY, {}),
         screensaver_idle=screensaver_idle,
         browsers=parse_browsers(raw.get("ps", "")),
+        screen_locked=(
+            parse_screen_locked(raw["console"]) if "console" in raw else None
+        ),
         raw=raw,
     )
 
@@ -228,7 +257,9 @@ def _setting(state: HostState, key: str, want: str, name: str, severity: str) ->
     )
 
 
-def checks(state: HostState) -> list[Check]:
+def checks(state: HostState, runtime: str | None = None) -> list[Check]:
+    """``runtime`` is the engine's about to be measured, when there is one:
+    some checks only block the runtimes they break."""
     out = [
         Check(
             name="on AC power",
@@ -273,7 +304,8 @@ def checks(state: HostState) -> list[Check]:
 
     # No supported way to read back whether the screen locks: askForPassword has
     # not been honoured since 10.13.4. A screensaver that never starts on a
-    # display that never sleeps cannot lock, so that is what we check instead.
+    # display that never sleeps cannot lock by itself, so that is what we check
+    # here; whether something else locked it is the console check below.
     if state.screensaver_idle is None:
         out.append(
             Check(
@@ -296,6 +328,37 @@ def checks(state: HostState) -> list[Check]:
                 fix="defaults -currentHost write com.apple.screensaver idleTime -int 0",
             )
         )
+
+    # Safari cannot measure in a locked session: AppKit reports its window
+    # occluded, WebKit then treats the page as hidden and stops rendering, and
+    # every suite stalls until the report timeout. Chrome is unaffected. Besides
+    # screenLock off, built-in Screen Sharing must not re-lock the console on
+    # disconnect, which it does whenever it was locked at connect:
+    #   sudo defaults write /Library/Preferences/com.apple.RemoteManagement \
+    #     RestoreMachineState -bool NO
+    # The alternative is a library injected into SafariForWebKitDevelopment
+    # (DYLD_INSERT_LIBRARIES) that makes -[NSWindow occlusionState] always
+    # report visible; it works but patches the browser host, so it is unused.
+    # Blocking only for the runtimes it breaks: some hosts must keep the lock
+    # by policy and never bench those.
+    lock_fix = (
+        "sysadminctl -screenLock off -password -; "
+        "sudo defaults write /Library/Preferences/com.apple.RemoteManagement "
+        "RestoreMachineState -bool NO; then unlock the session once, at the "
+        "console or over Screen Sharing"
+    )
+    out.append(
+        Check(
+            name="console session unlocked",
+            want="unlocked",
+            got={True: "locked", False: "unlocked", None: "unknown"}[
+                state.screen_locked
+            ],
+            ok=state.screen_locked is not True,
+            severity=BLOCKING if runtime in LOCK_SENSITIVE_RUNTIMES else ADVISORY,
+            fix=lock_fix,
+        )
+    )
 
     out.append(_setting(state, "powermode", "2", "high power mode", ADVISORY))
     # Advisory: the browser runners refuse to launch beside one of these at
@@ -491,7 +554,9 @@ def report(state: HostState, results: list[Check], log: Callable[[str], None]) -
             log(f"  fix: {c.fix}")
 
 
-def preflight(mode: str, log: Callable[[str], None]) -> bool:
+def preflight(
+    mode: str, log: Callable[[str], None], runtime: str | None = None
+) -> bool:
     """Check each measurement job, reporting only on a blocking failure.
 
     Takes the mode rather than a Config: config imports this module.
@@ -499,7 +564,7 @@ def preflight(mode: str, log: Callable[[str], None]) -> bool:
     if mode == "off" or not is_macos():
         return True
     state = read_state()
-    results = checks(state)
+    results = checks(state, runtime)
     ready = not failures(results)
     if not ready:
         report(state, results, log)

@@ -663,7 +663,9 @@ class BenchCollector:
     def bench_at_root(self, engine, commit, run_root, provenance=None):
         with self.job_hooks("bench", engine.name, CommitKey.from_commit(commit)):
             if not self.dry_run:
-                ready = host.preflight(self.cfg.host.preflight, self._log)
+                ready = host.preflight(
+                    self.cfg.host.preflight, self._log, engine.runtime
+                )
                 if not ready and self.cfg.host.preflight == "abort":
                     raise HookError("host is not benchmark-ready after pre-bench")
             return self._bench_with_result_lock(engine, commit, run_root, provenance)
