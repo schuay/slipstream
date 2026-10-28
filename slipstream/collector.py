@@ -594,6 +594,10 @@ class BenchCollector:
         across configs rather than finishing one config before the next, so a
         drift in the machine over the hour lands on every series alike; a
         config past its count simply sits out the remaining rounds.
+
+        A config whose first run fails sits out the rest as well: a broken
+        binary or host fails every run, each only after the suite's timeout.
+        The skipped runs still count towards the total, as failures.
         """
         res_dir = self.cfg.commit_results_dir(engine.name, key)
         res_dir.mkdir(parents=True, exist_ok=True)
@@ -605,10 +609,15 @@ class BenchCollector:
         configs_ok = 0
         configs_total = 0
         score_total = 0
+        failed_first: set[RunSpec] = set()
         for run in range(1, rounds + 1):
             self._log(message("  Run ", (f"{run}/{rounds}", "bold"), ":"))
             for rc in run_configs:
                 if run > rc.runs:
+                    continue
+                if rc in failed_first:
+                    configs_total += 1
+                    self._log(f"    {rc.suite} ({rc.variant}): skipped, run 1 failed")
                     continue
                 # Before the config's progress line, so the wait's log lines
                 # stand on their own and the elapsed time is the measurement's.
@@ -648,6 +657,8 @@ class BenchCollector:
                         self.output.finish(f"OK ({elapsed}s)")
                     else:
                         self.output.finish(f"ERRORS ({elapsed}s)", failed=True)
+                        if run == 1:
+                            failed_first.add(rc)
 
         return BenchOutcome(configs_ok, configs_total, score_total)
 

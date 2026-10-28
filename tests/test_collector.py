@@ -455,6 +455,36 @@ class TestConfiguredMatrix:
             str(tmp_path / "root/out/d8")
         )
 
+    def test_a_failed_first_run_skips_the_rest_of_that_config(
+        self, config, tmp_path, monkeypatch
+    ):
+        """Only the config that failed sits out, and only after its first run:
+        a later failure is noise, not a broken setup."""
+        from slipstream.runners import RunResult
+
+        c = self._collector(config, tmp_path, monkeypatch)
+        config.runs[:] = [
+            RunSpec(engine="v8", suite="js3", variant=v) for v in ("bad", "flaky", "ok")
+        ]
+        fails = {("bad", 1), ("bad", 2), ("bad", 3), ("flaky", 2)}
+        ran = []
+
+        class Runner:
+            def run(self, req):
+                ran.append((req.spec.variant, req.run))
+                return RunResult((req.spec.variant, req.run) not in fails, [])
+
+        monkeypatch.setattr(c, "_runner", lambda engine: Runner())
+        monkeypatch.setattr(c, "cool_down", lambda log: None)
+        outcome = c._run_benchmarks(config.engines["v8"], "109680", tmp_path / "root")
+        assert ran == [
+            ("bad", 1), ("flaky", 1), ("ok", 1),
+            ("flaky", 2), ("ok", 2),
+            ("flaky", 3), ("ok", 3),
+        ]  # fmt: skip
+        # The two skipped runs of "bad" count as failures.
+        assert (outcome.configs_ok, outcome.configs_total) == (5, 9)
+
     def test_a_per_benchmark_run_gets_a_synthesized_overall(
         self, config, tmp_path, monkeypatch
     ):

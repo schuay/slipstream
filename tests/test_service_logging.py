@@ -185,7 +185,9 @@ def test_collector_suites_reach_both_plain_sinks(
         assert not output.out and "..." not in output.err
         persisted = collector.log_file.read_text()
         assert persisted == output.err
-        assert persisted.count("ERRORS (") == outcome.configs_total
+        # Runs after a failed first one are skipped, and say so.
+        assert persisted.count("ERRORS (") == 1
+        assert persisted.count("skipped, run 1 failed") == outcome.configs_total - 1
         assert "literal [red] diagnostic" in persisted
     finally:
         collector.store.close()

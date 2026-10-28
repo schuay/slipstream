@@ -535,7 +535,7 @@ class TestConfig:
             "Runtime": "Run-Time-Score",
         }
         assert config.benchmarks["js3"].report_metrics == {}
-        assert config.benchmarks["js3"].timeout_seconds == 900
+        assert config.benchmarks["js3"].timeout_seconds == 600
 
     def test_js3_names_include_the_worker_only_benchmarks(self, tmp_path):
         # The shell never runs them, but a browser report must have them and

@@ -19,7 +19,7 @@
 cli = "cli.js"
 run_mode = "suite"
 names_file = "js2_names.txt"
-timeout = "15m"
+timeout = "10m"
 score_regex = '^([A-Za-z0-9.-]+) (Stdlib-Score|Tests-Score|Total-Score|Startup-Score|Average-Score|Worst-Case-Score|Run-Time-Score): ([0-9.]+)$'
 suite_score_regex = '^\s+([A-Za-z]+-Score):\s+([0-9.]+)$'
 page = "index.html"
@@ -39,7 +39,7 @@ Runtime = "Run-Time-Score"
 cli = "cli.js"
 run_mode = "suite"
 names_file = "js3_names.txt"
-timeout = "15m"
+timeout = "10m"
 score_regex = '^([A-Za-z0-9-]+)\s+([A-Za-z0-9-]+-Score|Score)\s+([0-9.]+)\s+pts$'
 page = "index.html"
 query = "report=true"
@@ -54,7 +54,7 @@ report_format = "jetstream"
 # Apple Silicon; the timeout leaves room for safari.
 [sp3]
 names_file = "sp3_names.txt"
-timeout = "15m"
+timeout = "10m"
 page = "index.html"
 query = "startAutomatically=true"
 inject = "sp3-report.mjs"

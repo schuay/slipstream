@@ -558,7 +558,7 @@ class TestSpeedometerConfig:
         assert sp3.inject == "sp3-report.mjs"
         assert sp3.report_format == "speedometer"
         assert sp3.report_metrics == {}
-        assert sp3.timeout_seconds == 900
+        assert sp3.timeout_seconds == 600
         assert len(sp3.names) == 21 and sp3.names[-1] == "Overall"
         assert "TodoMVC-React-Complex-DOM" in sp3.names
         assert b"didFinishLastIteration" in sp3.inject_bytes()
