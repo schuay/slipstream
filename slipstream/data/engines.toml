@@ -142,7 +142,6 @@ run_set = [
     "WebKitBuild/Release/_WebKit_SwiftUI.framework",
     "WebKitBuild/Release/libANGLE-shared.dylib",
     "WebKitBuild/Release/libwebrtc.dylib",
-    "WebKitBuild/Release/libWebKitSwift.dylib",
     "WebKitBuild/Release/com.apple.WebKit.Networking.xpc",
     "WebKitBuild/Release/com.apple.WebKit.WebContent.CaptivePortal.xpc",
     "WebKitBuild/Release/com.apple.WebKit.WebContent.xpc",
