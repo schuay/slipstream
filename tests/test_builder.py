@@ -168,6 +168,9 @@ class TestBlobStore:
         old = builder.bus.read_entry("v8", 101).blobs[0]
         (tmp_path / "src" / "out" / "d8").write_bytes(b"binary, rebuilt")
         builder.build_one("v8")
+        # A head publish leaves retention to the start of the next cycle.
+        assert builder.bus.keys("v8") == K(101, 102)
+        builder._retain("v8", builder.bus.read_builder_state("v8"))
         assert builder.bus.keys("v8") == K(102)
         assert not builder.bus.has_blob(old.id)
 

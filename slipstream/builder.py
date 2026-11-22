@@ -304,8 +304,8 @@ def _try_delta(
     """Plan ``archive`` against ``base``, or say why it stays whole.
 
     Patches are stored as they are produced; the ones of a plan that is
-    abandoned, over budget or by an error, are unreferenced and the sweep
-    after the publish reclaims them.
+    abandoned, over budget or by an error, are unreferenced and the next
+    sweep reclaims them.
     """
     size = archive.stat().st_size
     if base is None:
@@ -762,7 +762,8 @@ class Builder:
             cleanup_error = f"published {key}; database cleanup deferred: {e}"
             self.log(warning(f"{engine_name}: {cleanup_error}"))
         state.stall_retry_after = None
-        self._retain(engine_name, state, keep=entry.key)
+        # Retention waits for the start of the next cycle, leaving the bus to
+        # transfer and delivery of what was just published.
         state.stalled_since = None
         state.last_error = cleanup_error
         state.in_flight = None
@@ -782,11 +783,8 @@ class Builder:
         )
         return BuildResult(key=key, published=True)
 
-    def _retain(self, engine_name: str, state: BuilderState, *, keep=None) -> None:
-        dropped = self.bus.prune(
-            self.cfg.build.retain_gb * GB,
-            keep=(engine_name, keep) if keep is not None else None,
-        )
+    def _retain(self, engine_name: str, state: BuilderState) -> None:
+        dropped = self.bus.prune(self.cfg.build.retain_gb * GB)
         # Sweep even with no drops: interrupted publishes and retries orphan
         # objects too. Reclaim before writing state in case the disk is full.
         self.bus.gc()
