@@ -1463,6 +1463,41 @@ class TestMigratedBus:
         builder.bus = Bus(builder.bus.root)
         return builder, protocol
 
+    def test_snapshot_links_only_objects_packaging_can_use(
+        self, migrated, monkeypatch
+    ):
+        builder, protocol = migrated
+        binary = builder.cfg.engines["v8"].src_dir / "out/d8"
+        monkeypatch.setattr(
+            "slipstream.builder.package",
+            lambda src, rs, dest, **kw: dest.write_bytes(binary.read_bytes()),
+        )
+        from slipstream.builder import store_run_set
+
+        seen = []
+
+        def recording(bus, *args, **kwargs):
+            seen.append({p.name for p in bus.blobs_dir.glob("*")})
+            return store_run_set(bus, *args, **kwargs)
+
+        monkeypatch.setattr("slipstream.builder.store_run_set", recording)
+        for content in (b"one", b"two", b"one"):
+            binary.write_bytes(content)
+            assert builder.build_one("v8").published
+        first, second, third = (
+            builder.bus.read_entry("v8", k) for k in (101, 102, 103)
+        )
+        # The third build matches the first tree and bases on the second.
+        assert third.blobs == first.blobs
+        assert seen[-1] == {
+            first.objects()[0].name,
+            second.objects()[0].name,
+        }
+        binary.write_bytes(b"three")
+        assert builder.build_one("v8").published
+        # Neither the first tree nor anything older than the newest is linked.
+        assert seen[-1] == {third.objects()[0].name}
+
     def test_builder_reinstalls_reuse_captured_before_prune(
         self, migrated, monkeypatch
     ):
@@ -1478,17 +1513,15 @@ class TestMigratedBus:
         )
         builder.build_one("v8")
         binary.write_bytes(b"binary")
-        from slipstream.bus import tree_hash
+        from slipstream.builder import store_run_set
 
-        original = tree_hash
-
-        def hash_during_gc(src, rel):
+        def store_during_gc(*args, **kwargs):
             protocol.prune(0)
             protocol.sweep_blobs()
             assert not builder.bus.object_path(first.objects()[0].name).exists()
-            return original(src, rel)
+            return store_run_set(*args, **kwargs)
 
-        monkeypatch.setattr("slipstream.builder.tree_hash", hash_during_gc)
+        monkeypatch.setattr("slipstream.builder.store_run_set", store_during_gc)
         assert builder.build_one("v8").published
         third = builder.bus.read_entry("v8", 103)
         assert third.version == 4 and third.blobs == first.blobs

@@ -244,6 +244,7 @@ def store_run_set(
     engine: str | None = None,
     delta_cfg: DeltaConfig | None = None,
     log: Callable[[str], None] = lambda msg: None,
+    tree_ids: dict[str, str] | None = None,
 ) -> list[Blob]:
     """Store each run set entry once per distinct tree, as a delta when it pays.
 
@@ -265,7 +266,7 @@ def store_run_set(
     stored = _Stored(bus, engine)
     blobs = []
     for entry in run_set:
-        blob_id = tree_hash(src_dir, entry)
+        blob_id = tree_ids[entry] if tree_ids else tree_hash(src_dir, entry)
         dest = bus.blob_path(blob_id)
         if bus.format_version < 4 and dest.exists():
             blobs.append(Blob(entry, blob_id, sha256_file(dest), dest.stat().st_size))
@@ -826,7 +827,13 @@ class Builder:
         return record
 
     def _package_and_publish(
-        self, engine: EngineConfig, job: BuildJob, build_secs: int, *, storage=None
+        self,
+        engine: EngineConfig,
+        job: BuildJob,
+        build_secs: int,
+        *,
+        storage=None,
+        tree_ids=None,
     ) -> Entry:
         if storage is None:
             if protocol := self.bus.protocol:
@@ -837,7 +844,7 @@ class Builder:
         inherited = None
         safari_release = {}
         if job.compiles:
-            blobs = self._store(engine, storage)
+            blobs = self._store(engine, storage, tree_ids)
         elif engine.runtime == "safari":
             releases = self.resolver(engine.name).releases
             safari_release = releases.record
@@ -897,11 +904,26 @@ class Builder:
     def _package_transaction(self, protocol, engine, job, build_secs):
         # A private bus snapshot lets the existing packager reuse and delta-plan
         # captured objects, while every shared operation stays a short transaction.
+        # It holds every manifest but only the objects packaging can use: blobs
+        # of this build's trees, this engine's delta bases, the parent's and
+        # the adopted Safari packages.
+        trees = self._tree_ids(engine, job)
         with protocol.stage() as stage:
             private = Bus(stage.path / "work", _raw=True)
             private.format_version = 4
             with protocol.lock():
                 protocol._recover_all_locked()
+                wanted = {
+                    obj.name: protocol.bus.object_path(obj.name)
+                    for obj in protocol.bus.adopted_objects()
+                }
+
+                def want(entry, objects):
+                    for obj in objects:
+                        wanted.setdefault(
+                            obj.name, protocol.bus.entry_object_path(entry, obj)
+                        )
+
                 if job.inherits:
                     parent = protocol.bus.read_entry(
                         job.inherits.engine, job.inherits.key
@@ -910,22 +932,29 @@ class Builder:
                         raise BuildError(
                             "derived parent changed or was retained away; retry"
                         )
-                for obj in protocol.bus.adopted_objects():
-                    dest = private.object_path(obj.name)
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    if not dest.exists():
-                        os.link(protocol.bus.object_path(obj.name), dest)
+                    want(parent, parent.objects())
+                latest, tree_set = {}, set(trees.values())
                 for name in protocol.bus.engines():
                     for entry in protocol.bus.entries(name):
-                        for obj in entry.objects():
-                            dest = private.object_path(obj.name)
-                            dest.parent.mkdir(parents=True, exist_ok=True)
-                            if not dest.exists():
-                                os.link(
-                                    protocol.bus.entry_object_path(entry, obj), dest
-                                )
+                        for blob in entry.blobs:
+                            if blob.id in tree_set:
+                                want(entry, blob.objects(entry.version))
+                            if name == engine.name:
+                                latest[blob.path] = (entry, blob)
                         private.publish(entry)
-            entry = self._package_and_publish(engine, job, build_secs, storage=private)
+                for entry, blob in latest.values():
+                    want(entry, blob.objects(entry.version))
+                for name, source in wanted.items():
+                    dest = private.object_path(name)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    os.link(source, dest)
+            entry = self._package_and_publish(
+                engine,
+                job,
+                build_secs,
+                storage=private,
+                tree_ids=trees if job.compiles else None,
+            )
             entry.owner_uuid = protocol.ready()["uuid"]
             entry.publication_uuid = str(uuid.uuid4())
             stage.entry, stage.text = entry, entry.to_json()
@@ -935,7 +964,22 @@ class Builder:
             protocol.publish_staged(stage)
             return entry
 
-    def _store(self, engine: EngineConfig, storage=None) -> list[Blob]:
+    @staticmethod
+    def _tree_ids(engine: EngineConfig, job: BuildJob) -> dict[str, str]:
+        """The tree hash of each run set entry this job will store, if any."""
+        if not job.compiles and engine.runtime == "safari":
+            return {}
+        src_dir = engine.require_src_dir()
+        # Missing entries are left for store_run_set to report.
+        return {
+            path: tree_hash(src_dir, path)
+            for path in engine.require_run_set()
+            if (src_dir / path).exists()
+        }
+
+    def _store(
+        self, engine: EngineConfig, storage=None, tree_ids=None
+    ) -> list[Blob]:
         """This engine's own run set into the store, under its delta policy."""
         return store_run_set(
             storage or self.bus,
@@ -944,6 +988,7 @@ class Builder:
             engine=engine.name,
             delta_cfg=self.cfg.build.delta,
             log=lambda msg: self.log(prefixed(f"{engine.name}: ", msg)),
+            tree_ids=tree_ids,
         )
 
     def migrate(self, should_stop=lambda: False) -> None:
