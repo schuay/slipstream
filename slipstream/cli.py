@@ -14,6 +14,7 @@ import typer
 
 from .admission import StopReason
 from .config import load_config
+from .durability import report_lock_holds
 from .models import CommitKey
 from .collector import BenchCollector, FetchError
 from .hooks import HookError
@@ -291,6 +292,7 @@ def bench(
                 raise typer.Exit(1)
 
     log = EventLog("bench")
+    report_lock_holds("bench", log.warning)
     if no_push:
         log("bench only collects; --no-push has no effect")
 
@@ -609,6 +611,7 @@ def deliver(
     cfg = _load_config(config)
 
     echo = EventLog("deliver", log_file)
+    report_lock_holds("deliver", echo.warning)
     should_stop = _shutdown_flag("delivery unit", log=echo)
 
     store = None
@@ -708,6 +711,7 @@ def build(
 
     interval_secs = _parse_interval(interval)
     log = EventLog("build")
+    report_lock_holds("build", log.warning)
     try:
         builder = Builder(
             cfg,
@@ -874,6 +878,7 @@ def transfer(config: Optional[Path] = typer.Option(None), once: bool = False):
     if cfg.bus is None or not cfg.bus.routes:
         raise typer.BadParameter("transfer requires [[bus.routes]]")
     log = EventLog("transfer")
+    report_lock_holds("transfer", log.warning)
     stopped = _shutdown_flag("transfer", log=log)
     try:
         success = Coordinator(cfg, log=log).run(once=once, should_stop=stopped)
