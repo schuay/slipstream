@@ -39,6 +39,8 @@ package()
         message = str(exc.value)
         assert f"by build pid {child.pid} at <string>:" in message
         assert "package" in message
+        # The waiter's failed wait leaves the live holder's record alone.
+        assert f'"pid": {child.pid}' in path.read_text()
     finally:
         child.stdin.close()
         child.wait(timeout=5)
@@ -50,7 +52,9 @@ def test_long_hold_is_reported_on_release(tmp_path, monkeypatch):
     reports = []
     monkeypatch.setattr(durability, "LONG_HOLD_SECONDS", 0)
     monkeypatch.setattr(durability, "_long_hold_log", reports.append)
-    with FileLock(tmp_path / "lock"):
+    with FileLock(tmp_path / "lock", report_holds=True):
+        pass
+    with FileLock(tmp_path / "other"):
         pass
     assert len(reports) == 1
     assert reports[0].startswith("held lock for ")
@@ -60,11 +64,24 @@ def test_long_hold_is_reported_on_release(tmp_path, monkeypatch):
 def test_short_hold_and_failed_wait_are_not_reported(tmp_path, monkeypatch):
     reports = []
     monkeypatch.setattr(durability, "_long_hold_log", reports.append)
-    with FileLock(tmp_path / "lock") as held:
+    with FileLock(tmp_path / "lock", report_holds=True) as held:
         monkeypatch.setattr(durability, "LONG_HOLD_SECONDS", 0)
         with pytest.raises(TimeoutError):
-            with FileLock(held.path, timeout=0):
+            with FileLock(held.path, timeout=0, report_holds=True):
                 pass
         assert reports == []
         monkeypatch.setattr(durability, "LONG_HOLD_SECONDS", 3600)
     assert reports == []
+
+
+def test_unwritable_holder_record_does_not_fail_the_lock(tmp_path, monkeypatch):
+    def full(*args):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(durability.os, "ftruncate", full)
+    with FileLock(tmp_path / "lock") as held:
+        with pytest.raises(TimeoutError):
+            with FileLock(held.path, timeout=0):
+                pass
+    with FileLock(tmp_path / "lock", timeout=0):
+        pass

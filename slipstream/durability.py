@@ -108,7 +108,8 @@ class FileLock:
     """A bounded, cancellable flock; close releases even after a failed wait.
 
     The holder writes who it is into the lock file, so a waiter that times
-    out can name it. Nothing else reads the contents.
+    out can name it. Nothing else reads the contents. With ``report_holds``,
+    a hold over LONG_HOLD_SECONDS is logged on release.
     """
 
     def __init__(
@@ -118,8 +119,10 @@ class FileLock:
         timeout=30.0,
         should_stop=lambda: False,
         log=lambda msg: None,
+        report_holds=False,
     ):
         self.path = path
+        self.report_holds = report_holds
         self.timeout = timeout
         self.should_stop = should_stop
         self.log = log
@@ -166,10 +169,13 @@ class FileLock:
             "site": self._site,
             "since": time.time(),
         }
+        # The record is diagnostic: failing to write it must not fail the lock.
         # Append mode writes at the end, which is offset 0 once truncated.
-        self._file.truncate(0)
-        self._file.write(json.dumps(record))
-        self._file.flush()
+        try:
+            os.ftruncate(self._file.fileno(), 0)
+            os.write(self._file.fileno(), json.dumps(record).encode())
+        except OSError:
+            pass
 
     def _describe_holder(self) -> str:
         try:
@@ -193,11 +199,18 @@ class FileLock:
                 self._acquired = None
                 # Truncate before unlocking so the next waiter never reads a
                 # released holder's record.
-                self._file.truncate(0)
+                os.ftruncate(self._file.fileno(), 0)
+        except OSError:
+            pass
         finally:
             self._file.close()
             self._file = None
-        if held is not None and held >= LONG_HOLD_SECONDS and _long_hold_log:
+        if (
+            self.report_holds
+            and held is not None
+            and held >= LONG_HOLD_SECONDS
+            and _long_hold_log
+        ):
             _long_hold_log(f"held {self.path.name} for {held:.1f}s at {self._site}")
 
     def __exit__(self, *args):

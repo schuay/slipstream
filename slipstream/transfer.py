@@ -422,6 +422,7 @@ class Coordinator:
         self.routes = {}
         self.bounds = {}
         self.failed = set()
+        self.unsaved = set()
         self.health_generation = {}
         self.options = {
             "handshake": cfg.bus.transfer_handshake,
@@ -458,11 +459,15 @@ class Coordinator:
 
     def save_failure(self, engine, record):
         # The failure being recorded may itself be a bus lock timeout. The
-        # record stays current in memory and the next save persists it.
+        # record stays current in memory; a failed engine is never saved by
+        # its own work again, so it is retried from the loop.
         try:
             self.save(engine, record)
         except OSError as exc:
+            self.unsaved.add(engine)
             self.log(warning(f"{engine}: failure not recorded: {exc}"))
+        else:
+            self.unsaved.discard(engine)
 
     def initialize(self, engine, *, once):
         route, source, dest = self.routes[engine]
@@ -692,6 +697,8 @@ class Coordinator:
                     for engine, record in records.items():
                         generation = schedule.snapshot(engine)
                         if engine in self.failed:
+                            if engine in self.unsaved:
+                                self.save_failure(engine, record)
                             schedule.finished(engine, generation)
                             continue
                         if not once and engine not in schedule.ready():
@@ -752,5 +759,7 @@ class Coordinator:
                         schedule.wait(should_stop)
                 return False
             finally:
+                for engine in list(self.unsaved):
+                    self.save_failure(engine, records[engine])
                 if subscriptions:
                     subscriptions.close()

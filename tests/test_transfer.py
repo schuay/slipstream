@@ -1058,3 +1058,47 @@ def test_stage_close_removes_bulk_outside_bus_lock(pair, monkeypatch):
         (stage.path, "locked"),
     ]
     assert not stage.path.exists()
+
+
+def test_conflict_record_lost_to_lock_timeout_is_saved_later(
+    pair, config, monkeypatch
+):
+    src, dst = pair
+    publication(src, 1)
+    route = TransferRoute(
+        "test",
+        ["v8"],
+        BusSource("src", str(src.root)),
+        BusSource("dst", str(dst.root)),
+        src.ready()["uuid"],
+        dst.ready()["uuid"],
+    )
+    config.bus = BusConfig(src.root, routes=[route])
+    coordinator = Coordinator(config, log=lambda _: None)
+    coordinator.save(
+        "v8",
+        {
+            "source": route.source_uuid,
+            "destination": route.destination_uuid,
+            "cursor": None,
+            "pending": None,
+            "retry_after": 0,
+        },
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "step",
+        lambda *a, **k: (_ for _ in ()).throw(BusError("receipt conflict")),
+    )
+    save = coordinator.save
+    contended = iter([True])
+
+    def save_once_contended(engine, record):
+        if record.get("conflict") and next(contended, False):
+            raise TimeoutError("lock wait exceeded 30s: .bus.lock")
+        save(engine, record)
+
+    monkeypatch.setattr(coordinator, "save", save_once_contended)
+    assert not coordinator.run(once=True)
+    progress = read(coordinator.path("v8"))
+    assert progress["conflict"] and progress["last_error"] == "receipt conflict"

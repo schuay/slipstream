@@ -180,7 +180,7 @@ class BusProtocol:
         self.bus = Bus(self.root, _raw=True)
 
     def lock(self):
-        return FileLock(self.root / ".bus.lock")
+        return FileLock(self.root / ".bus.lock", report_holds=True)
 
     def state_path(self, kind, engine):
         return self.root / "state" / kind / f"{component(engine)}.json"
