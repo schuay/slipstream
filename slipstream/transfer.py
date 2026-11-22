@@ -456,6 +456,14 @@ class Coordinator:
             self.local.ready()
             atomic_write(self.path(engine), encoded(record))
 
+    def save_failure(self, engine, record):
+        # The failure being recorded may itself be a bus lock timeout. The
+        # record stays current in memory and the next save persists it.
+        try:
+            self.save(engine, record)
+        except OSError as exc:
+            self.log(warning(f"{engine}: failure not recorded: {exc}"))
+
     def initialize(self, engine, *, once):
         route, source, dest = self.routes[engine]
         src, dst = source.info(), dest.info()
@@ -675,7 +683,7 @@ class Coordinator:
                             record["retry_after"] = time.time() + 1
                             if isinstance(exc, BusError):
                                 record["conflict"] = True
-                            self.save(engine, record)
+                            self.save_failure(engine, record)
                             self.log(error(f"{engine}: {exc}"))
                             self.failed.add(engine)
                 schedule.changed(records)
@@ -719,7 +727,7 @@ class Coordinator:
                             if isinstance(exc, BusError):
                                 record["conflict"] = True
                                 self.failed.add(engine)
-                            self.save(engine, record)
+                            self.save_failure(engine, record)
                             self.log(error(f"{engine}: {exc}"))
                             schedule.finished(
                                 engine,

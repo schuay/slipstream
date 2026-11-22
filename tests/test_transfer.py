@@ -979,3 +979,46 @@ def test_reuse_rejects_wrong_size(pair):
     with dst.stage() as stage:
         with pytest.raises(BusError, match="existing object size mismatch"):
             stage.reuse(entry.to_json())
+
+
+def test_lock_timeout_while_recording_failure_keeps_running(pair, config, monkeypatch):
+    src, dst = pair
+    publication(src, 1)
+    route = TransferRoute(
+        "test",
+        ["v8"],
+        BusSource("src", str(src.root)),
+        BusSource("dst", str(dst.root)),
+        src.ready()["uuid"],
+        dst.ready()["uuid"],
+    )
+    config.bus = BusConfig(src.root, routes=[route])
+    events = []
+    coordinator = Coordinator(config, log=events.append)
+    coordinator.save(
+        "v8",
+        {
+            "source": route.source_uuid,
+            "destination": route.destination_uuid,
+            "cursor": None,
+            "pending": None,
+            "retry_after": 0,
+        },
+    )
+    timeout = TimeoutError("lock wait exceeded 30s: .bus.lock")
+    monkeypatch.setattr(
+        coordinator, "step", lambda *a, **k: (_ for _ in ()).throw(timeout)
+    )
+    save = coordinator.save
+
+    def contended_save(engine, record):
+        if record.get("last_error"):
+            raise timeout
+        save(engine, record)
+
+    monkeypatch.setattr(coordinator, "save", contended_save)
+    assert not coordinator.run(once=True)
+    assert any("failure not recorded" in str(e) for e in events)
+    assert read(coordinator.path("v8"))["cursor"] is None
+    assert Coordinator(config).run(once=True)
+    assert read(coordinator.path("v8"))["cursor"] == "1"
