@@ -146,6 +146,16 @@ class Staging:
     def close(self):
         if self.owner is not None:
             try:
+                # The held .owner keeps gc out, so the bulk can go without the
+                # bus lock. gc's probe of .owner re-creates it and its
+                # directory, so those two go under the bus lock.
+                for child in self.path.iterdir():
+                    if child.name == ".owner":
+                        continue
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
                 with self.protocol.lock():
                     shutil.rmtree(self.path)
             finally:

@@ -1022,3 +1022,39 @@ def test_lock_timeout_while_recording_failure_keeps_running(pair, config, monkey
     assert read(coordinator.path("v8"))["cursor"] is None
     assert Coordinator(config).run(once=True)
     assert read(coordinator.path("v8"))["cursor"] == "1"
+
+
+def test_stage_close_removes_bulk_outside_bus_lock(pair, monkeypatch):
+    import shutil
+
+    from slipstream import bus_protocol
+    from slipstream.durability import FileLock
+
+    src, _ = pair
+    stage = src.stage()
+    work = stage.path / "work" / "blobs"
+    work.mkdir(parents=True)
+    for i in range(3):
+        (work / f"object-{i}").write_bytes(b"x")
+    (stage.path / "link").write_bytes(b"y")
+    observed = []
+    rmtree = shutil.rmtree
+
+    def probing_rmtree(path, *args, **kwargs):
+        try:
+            with FileLock(src.root / ".bus.lock", timeout=0):
+                observed.append((path, "unlocked"))
+        except TimeoutError:
+            observed.append((path, "locked"))
+        if path != stage.path:
+            # gc during the bulk phase must leave the held stage alone.
+            assert stage.path not in src.gc()
+        rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(bus_protocol.shutil, "rmtree", probing_rmtree)
+    stage.close()
+    assert observed == [
+        (stage.path / "work", "unlocked"),
+        (stage.path, "locked"),
+    ]
+    assert not stage.path.exists()
