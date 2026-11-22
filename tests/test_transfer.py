@@ -1011,10 +1011,10 @@ def test_lock_timeout_while_recording_failure_keeps_running(pair, config, monkey
     )
     save = coordinator.save
 
-    def contended_save(engine, record):
+    def contended_save(engine, record, *args):
         if record.get("last_error"):
             raise timeout
-        save(engine, record)
+        save(engine, record, *args)
 
     monkeypatch.setattr(coordinator, "save", contended_save)
     assert not coordinator.run(once=True)
@@ -1093,12 +1093,29 @@ def test_conflict_record_lost_to_lock_timeout_is_saved_later(
     save = coordinator.save
     contended = iter([True])
 
-    def save_once_contended(engine, record):
+    def save_once_contended(engine, record, *args):
         if record.get("conflict") and next(contended, False):
             raise TimeoutError("lock wait exceeded 30s: .bus.lock")
-        save(engine, record)
+        save(engine, record, *args)
 
     monkeypatch.setattr(coordinator, "save", save_once_contended)
     assert not coordinator.run(once=True)
     progress = read(coordinator.path("v8"))
     assert progress["conflict"] and progress["last_error"] == "receipt conflict"
+
+
+def test_stage_close_leaves_owner_to_gc_when_bus_lock_times_out(pair, monkeypatch):
+    from slipstream.durability import FileLock
+
+    src, _ = pair
+    stage = src.stage()
+    (stage.path / "link").write_bytes(b"y")
+    monkeypatch.setattr(
+        src, "lock", lambda timeout=30.0: FileLock(src.root / ".bus.lock", timeout=0)
+    )
+    with FileLock(src.root / ".bus.lock"):
+        stage.close()
+    assert [p.name for p in stage.path.iterdir()] == [".owner"]
+    monkeypatch.undo()
+    assert stage.path in src.gc()
+    assert not stage.path.exists()

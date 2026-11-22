@@ -452,17 +452,17 @@ class Coordinator:
     def path(self, engine):
         return self.local.state_path("transfer", engine)
 
-    def save(self, engine, record):
-        with self.local.lock():
+    def save(self, engine, record, timeout=30.0):
+        with self.local.lock(timeout):
             self.local.ready()
             atomic_write(self.path(engine), encoded(record))
 
-    def save_failure(self, engine, record):
+    def save_failure(self, engine, record, timeout=30.0):
         # The failure being recorded may itself be a bus lock timeout. The
         # record stays current in memory; a failed engine is never saved by
         # its own work again, so it is retried from the loop.
         try:
-            self.save(engine, record)
+            self.save(engine, record, timeout)
         except OSError as exc:
             self.unsaved.add(engine)
             self.log(warning(f"{engine}: failure not recorded: {exc}"))
@@ -698,7 +698,8 @@ class Coordinator:
                         generation = schedule.snapshot(engine)
                         if engine in self.failed:
                             if engine in self.unsaved:
-                                self.save_failure(engine, record)
+                                # Short wait: the other engines' work is next.
+                                self.save_failure(engine, record, timeout=1)
                             schedule.finished(engine, generation)
                             continue
                         if not once and engine not in schedule.ready():
@@ -759,7 +760,9 @@ class Coordinator:
                         schedule.wait(should_stop)
                 return False
             finally:
-                for engine in list(self.unsaved):
-                    self.save_failure(engine, records[engine])
-                if subscriptions:
-                    subscriptions.close()
+                try:
+                    for engine in list(self.unsaved):
+                        self.save_failure(engine, records[engine])
+                finally:
+                    if subscriptions:
+                        subscriptions.close()

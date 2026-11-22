@@ -156,8 +156,12 @@ class Staging:
                         shutil.rmtree(child)
                     else:
                         child.unlink()
-                with self.protocol.lock():
-                    shutil.rmtree(self.path)
+                try:
+                    with self.protocol.lock():
+                        shutil.rmtree(self.path)
+                except TimeoutError:
+                    # Only .owner is left; gc removes it once it is released.
+                    pass
             finally:
                 self.owner.close()
                 self.owner = None
@@ -179,8 +183,8 @@ class BusProtocol:
         self.root = Path(root).expanduser().resolve()
         self.bus = Bus(self.root, _raw=True)
 
-    def lock(self):
-        return FileLock(self.root / ".bus.lock", report_holds=True)
+    def lock(self, timeout=30.0):
+        return FileLock(self.root / ".bus.lock", timeout=timeout, report_holds=True)
 
     def state_path(self, kind, engine):
         return self.root / "state" / kind / f"{component(engine)}.json"
