@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Load as a LaunchAgent in the GUI session: Safari runs and screen-lock
+  checks need it. Interactive avoids background CPU/IO throttling of the
+  measured processes. launchd caps ExitTimeOut for agents at 60s, which is
+  shorter than a commit: run `slipstream window close` and wait for
+  `slipstream window status` to report no active holder before stopping.
+  PATH must include /usr/sbin for sysctl and ioreg.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.slipstream.bench</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/slipstream</string>
+    <string>bench</string>
+    <string>--config</string><string>/ABSOLUTE/PATH/TO/config.toml</string>
+  </array>
+  <key>WorkingDirectory</key><string>/ABSOLUTE/PATH/TO/HOME</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>PYTHONUNBUFFERED</key><string>1</string><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>LegacyTimers</key><true/>
+  <key>ExitTimeOut</key><integer>60</integer>
+  <key>StandardOutPath</key><string>/ABSOLUTE/EXISTING/LOG/DIRECTORY/bench.stdout.log</string>
+  <key>StandardErrorPath</key><string>/ABSOLUTE/EXISTING/LOG/DIRECTORY/bench.stderr.log</string>
+</dict>
+</plist>

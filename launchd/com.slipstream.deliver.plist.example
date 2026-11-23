@@ -17,7 +17,7 @@
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Background</string>
-  <key>KillTimeOut</key><integer>20</integer>
+  <key>ExitTimeOut</key><integer>20</integer>
   <key>StandardOutPath</key><string>/ABSOLUTE/EXISTING/LOG/DIRECTORY/deliver.stdout.log</string>
   <key>StandardErrorPath</key><string>/ABSOLUTE/EXISTING/LOG/DIRECTORY/deliver.stderr.log</string>
 </dict>
