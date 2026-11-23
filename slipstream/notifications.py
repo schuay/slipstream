@@ -33,7 +33,7 @@ class DirectorySubscription:
         root = root.expanduser().absolute()
         self.topics = {name: root / "topics" / "builds" / name for name in engines}
         kinds = (
-            ("retention", "builds", "bench")
+            ("retention", "builds")
             if role == "transfer"
             else ("retention", "upstream-loss")
         )

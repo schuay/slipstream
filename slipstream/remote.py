@@ -22,7 +22,6 @@ from pathlib import Path
 from .bus import (
     BLOB_SUFFIX,
     BusError,
-    BenchState,
     Bus,
     BuilderState,
     Entry,
@@ -240,19 +239,3 @@ class SshSource:
                 res.returncode, f"ssh {self.host}", res.stdout, res.stderr
             )
         return state_from_json(res.stdout, BuilderState, f"{self.host}:{path}")
-
-    def bench_state(self, engine: str) -> BenchState:
-        """What the far bencher knows, including the environment block.
-
-        A dead bencher beside a live builder looks entirely healthy from here
-        without it.
-        """
-        path = quote_remote(f"{self.root}/state/bench/{engine}.json")
-        res = self._ssh(f"[ -f {path} ] || exit {MISSING_EXIT}; cat {path}")
-        if res.returncode != 0:
-            if self._missing(res):
-                return BenchState()
-            raise subprocess.CalledProcessError(
-                res.returncode, f"ssh {self.host}", res.stdout, res.stderr
-            )
-        return state_from_json(res.stdout, BenchState, f"{self.host}:{path}")

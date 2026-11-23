@@ -165,19 +165,6 @@ class LocalSource:
             state.lowest_retained = CommitKey.parse(lowest) if lowest else None
         return state
 
-    def bench_state(self, engine: str):
-        if protocol := self.bus.protocol:
-            from .bus_protocol import read
-            from .bus import state_from_json, BenchState
-            import json
-
-            path = protocol.state_path("peer-health", engine)
-            if path.exists():
-                snapshot = read(path).get("source", {}).get("bench")
-                if snapshot:
-                    return state_from_json(json.dumps(snapshot), BenchState)
-        return self.bus.read_bench_state(engine)
-
 
 def open_source(source: BusSource) -> LocalSource:
     if source.is_local:

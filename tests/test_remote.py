@@ -350,10 +350,6 @@ class TestUnreachableIsNotMissing:
         with pytest.raises(subprocess.CalledProcessError):
             unreachable.builder_state("v8")
 
-    def test_bench_state_raises(self, unreachable):
-        with pytest.raises(subprocess.CalledProcessError):
-            unreachable.bench_state("v8")
-
     def test_a_missing_entry_is_still_none(self, remote):
         _publish(remote.far, 100)
         assert remote.source.read_entry("v8", 999) is None

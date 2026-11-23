@@ -199,12 +199,8 @@ class LocalEndpoint:
         return self.protocol.skip(engine, key, owner)
 
     def health(self, engine):
-        result = {}
-        for kind in ("builds", "bench"):
-            path = self.protocol.state_path(kind, engine)
-            if path.exists():
-                result[kind] = read(path)
-        return result
+        path = self.protocol.state_path("builds", engine)
+        return {"builds": read(path)} if path.exists() else {}
 
     def mirror(self, engine, health):
         with self.protocol.lock():
