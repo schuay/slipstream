@@ -67,6 +67,42 @@ bound, published builds, and terminal build failures. Lowering the bound does
 not rewind completed work; explicit `build --retry ENGINE=KEY` requests can
 still select historical failures below it.
 
+## macOS services
+
+Run daemons as LaunchAgents from the templates in `launchd/`. Fill in the
+paths, create the log directory (launchd does not), and install:
+
+```sh
+mkdir -p ~/Library/Logs/slipstream
+cp com.slipstream.deliver.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.slipstream.deliver.plist
+```
+
+With `svc=gui/$(id -u)/com.slipstream.deliver`:
+
+| Task | Command |
+| --- | --- |
+| Stop | `launchctl bootout $svc` |
+| Start | `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.slipstream.deliver.plist` |
+| Restart | `launchctl kickstart -k $svc` |
+| Status | `launchctl print $svc` (state, pid, last exit code) |
+| Logs | `tail -F ~/Library/Logs/slipstream/*.log` |
+
+`bench` must run in the GUI session (Safari, screen-lock checks) and is
+`Interactive` so measurements are not throttled. launchd kills an agent 60s
+after a stop request, which is shorter than a commit and skips the post-bench
+hook. Drain it first:
+
+```sh
+slipstream window close
+slipstream window status   # wait for "machine activity: no active holder"
+launchctl bootout gui/$(id -u)/com.slipstream.bench
+slipstream window reset    # after restarting
+```
+
+To upgrade, stop all services, run `uv tool install --force .`, and start
+them again. Unattended recovery after a reboot needs automatic login.
+
 ## Independent artifact transfer
 
 `slipstream transfer` supports building on either machine while both benchmark
