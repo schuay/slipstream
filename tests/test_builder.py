@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from slipstream import host
 from slipstream.builder import BuildError, Builder, build_cfg_hash, package
 from slipstream.bus import ENTRY_VERSION, Bus
 from slipstream.collector import BuildStepError
@@ -1005,6 +1006,23 @@ class TestReportedFrontier:
 
 
 class TestStatePublishing:
+    def test_the_builder_env_is_published(self, builder):
+        builder.build_one("v8")
+        env = builder.bus.read_builder_state("v8").env
+        assert {k: v for k, v in env.items() if k != "since"} == host.builder_env()
+        assert env["since"] > 0
+
+    def test_since_moves_only_when_the_env_changes(self, builder, monkeypatch):
+        builder.build_one("v8")
+        first = builder.bus.read_builder_state("v8").env["since"]
+        builder.build_one("v8")
+        assert builder.bus.read_builder_state("v8").env["since"] == first
+        changed = {**host.builder_env(), "os_version": "99.0"}
+        monkeypatch.setattr("slipstream.host.builder_env", lambda: changed)
+        builder.build_one("v8")
+        env = builder.bus.read_builder_state("v8").env
+        assert env["os_version"] == "99.0" and env["since"] > first
+
     def test_a_stalled_cycle_still_refreshes_the_state_file(self, builder):
         """An operator diagnosing a stall must not keep reading a floor error
         from a disk problem that was fixed days ago."""
@@ -1466,9 +1484,7 @@ class TestMigratedBus:
         builder.bus = Bus(builder.bus.root)
         return builder, protocol
 
-    def test_snapshot_links_only_objects_packaging_can_use(
-        self, migrated, monkeypatch
-    ):
+    def test_snapshot_links_only_objects_packaging_can_use(self, migrated, monkeypatch):
         builder, protocol = migrated
         binary = builder.cfg.engines["v8"].src_dir / "out/d8"
         monkeypatch.setattr(

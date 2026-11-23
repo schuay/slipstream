@@ -480,8 +480,20 @@ class BuilderState:
     # deployment and each invocation is a new process.
     stall_retry_after: float | None = None
     in_flight: dict | None = None
+    # The builder's machine identity and slipstream version, with ``since``,
+    # the time those values took effect, so a divergence check reports when
+    # the two boxes parted rather than only that they currently differ.
+    env: dict = field(default_factory=dict)
     updated_at: float = 0.0
     version: int = VERSION
+
+
+def stamp_env(previous: dict, current: dict) -> dict:
+    """``current`` with ``since`` carried over from ``previous`` if the values
+    are unchanged, or set to now if they are not."""
+    unchanged = {k: v for k, v in previous.items() if k != "since"} == current
+    since = previous.get("since") if unchanged else None
+    return {**current, "since": since or time.time()}
 
 
 @dataclass
@@ -489,11 +501,6 @@ class BenchState:
     """What a bencher knows. Separate from the builder's file because the two
     are separate processes and a shared file would clobber whichever wrote
     first.
-
-    ``env`` records the inputs shared between the boxes -- slipstream version,
-    OS, run configs, harness revisions -- with ``since``, the time those values
-    took effect, so a divergence check reports when the two boxes parted rather
-    than only that they currently agree.
     """
 
     KEY_FIELDS = ("cursor", "skipped_dropped", "skipped_upstream", "skipped_permanent")
@@ -523,7 +530,6 @@ class BenchState:
     # sweep would reclaim it before the next entry could reuse it; this keeps
     # exactly one entry's worth per engine, which is the whole cache.
     blobs: list[str] = field(default_factory=list)
-    env: dict = field(default_factory=dict)
     updated_at: float = 0.0
     version: int = VERSION
 

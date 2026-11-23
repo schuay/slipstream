@@ -26,12 +26,20 @@ def invoke(path, *args):
     return CliRunner().invoke(cli.app, [*args, "--config", str(path)])
 
 
+def test_status_omits_an_expired_override(window_config):
+    bench_window.write_override(
+        "open", 3600, now=datetime.now(UTC) - timedelta(hours=2)
+    )
+    result = invoke(window_config, "window", "status")
+    assert result.exit_code == 0, result.output
+    assert "override:" not in result.output
+
+
 def test_controls_and_status_without_daemon_bus_or_db(window_config, tmp_path):
     result = invoke(window_config, "window", "status")
     assert result.exit_code == 0, result.output
     assert "Normal use permitted" in result.output
     assert f"for {window_config}" in result.output
-    assert "Restart affected benchers" in result.output
     assert bench_window.read_override() is None
     assert list(bench_window.override_path().parent.iterdir()) == []
     result = invoke(window_config, "window", "open", "--for", "6h")

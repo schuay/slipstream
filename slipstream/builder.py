@@ -38,6 +38,7 @@ from .bus import (
     Entry,
     patch_name,
     sha256_file,
+    stamp_env,
     tree_hash,
 )
 from .bus_protocol import staging_fds
@@ -975,9 +976,7 @@ class Builder:
             if (src_dir / path).exists()
         }
 
-    def _store(
-        self, engine: EngineConfig, storage=None, tree_ids=None
-    ) -> list[Blob]:
+    def _store(self, engine: EngineConfig, storage=None, tree_ids=None) -> list[Blob]:
         """This engine's own run set into the store, under its delta policy."""
         return store_run_set(
             storage or self.bus,
@@ -1089,6 +1088,7 @@ class Builder:
         failures = [dict(r) for r in self.store.build_failures(engine_name)]
         state.failed_total = len(failures)
         state.failed = failures[-MAX_REPORTED_FAILURES:]
+        state.env = stamp_env(state.env, host.builder_env())
         self.bus.write_builder_state(engine_name, state)
 
     # --- the loop ---

@@ -611,3 +611,10 @@ def identity() -> dict:
         "os_version": os_version(),
         "toolchain": toolchain(),
     }
+
+
+def builder_env() -> dict:
+    """What a builder publishes about itself for consumers to compare."""
+    from . import __version__
+
+    return {"slipstream_version": __version__, **identity()}

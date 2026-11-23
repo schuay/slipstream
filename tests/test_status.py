@@ -18,8 +18,9 @@ from slipstream.bus import (
 )
 from slipstream.collector import BenchCollector
 from slipstream.lock import MachineLock
-from slipstream.config import BusConfig, BusSource, EngineConfig, RunSpec
-from slipstream.status import collect_status, compare_env, render
+from slipstream.config import BusConfig, BusSource, EngineConfig
+from slipstream import host
+from slipstream.status import collect_status, render
 from keys import K1
 
 
@@ -240,6 +241,17 @@ class TestLocalFacts:
         store.record_run_env("v8", 101, {"source": "local"})
         _, st = _status(env)
         assert st.provenance == {"bus": 1, "local": 1}
+        lines = []
+        render(_status(env)[0], lines.append)
+        assert "  recent binaries: bus 1, local 1" in lines
+
+    def test_a_single_provenance_is_not_rendered(self, env):
+        env.collector.store.record_run_env("v8", 100, {"source": "bus"})
+        report, st = _status(env)
+        assert st.provenance == {"bus": 1}
+        lines = []
+        render(report, lines.append)
+        assert not any("recent binaries" in line for line in lines)
 
     def test_the_machine_lock_holder_is_named(self, env):
         env.collector.lock.role = "watch"
@@ -273,82 +285,39 @@ class TestLocalFacts:
         assert "build" in report.lock_waiters[0] and "v8 101" in report.lock_waiters[0]
         lines = []
         render(report, lines.append)
-        assert any(line.startswith("  1. build") for line in lines)
+        assert any(line.startswith("  queued 1: build") for line in lines)
 
 
 class TestEnvironmentDivergence:
-    def test_reports_what_differs_and_since_when(self, env):
+    def test_reports_what_differs_from_the_builder_and_since_when(self, env):
         since = time.time() - 3 * 7 * 86400
-        env.bus.write_bench_state(
-            "v8",
-            BenchState(
-                env={
-                    "slipstream_version": "0.0.1",
-                    "os_version": "26.0",
-                    "harness": {"js3": "def5678"},
-                    "run_configs": ["js3/default"],
-                    "since": since,
-                }
-            ),
-        )
-        _, st = _status(env)
+        theirs = {
+            **host.builder_env(),
+            "slipstream_version": "0.0.1",
+            "os_version": "26.0",
+            "since": since,
+        }
+        env.bus.write_builder_state("v8", BuilderState(env=theirs))
+        report, st = _status(env)
         assert st.env_since == since
-        assert any("slipstream_version" in line for line in st.env_divergence)
-        assert any("harness" in line for line in st.env_divergence)
+        assert [line.split(":")[0] for line in st.env_divergence] == [
+            "slipstream_version",
+            "os_version",
+        ]
+        lines = []
+        render(report, lines.append)
+        assert any("differs from the source's builder" in line for line in lines)
 
-    def test_no_divergence_when_they_match(self, env):
-        from slipstream.status import local_env
-
-        mine = local_env(env.cfg, env.collector)
-        env.bus.write_bench_state("v8", BenchState(env={**mine, "since": 1.0}))
+    def test_hw_model_is_not_compared(self, env):
+        theirs = {**host.builder_env(), "hw_model": "Mac14,6", "since": 1.0}
+        env.bus.write_builder_state("v8", BuilderState(env=theirs))
         _, st = _status(env)
         assert st.env_divergence == []
 
-
-class TestCompareEnv:
-    def test_run_configs_compared_as_sets(self):
-        local = {"run_configs": ["a", "b"], "harness": {}}
-        assert compare_env(local, {"run_configs": ["b", "a"]}) == []
-        (line,) = compare_env(local, {"run_configs": ["a"]})
-        assert "only here ['b']" in line
-
-    def test_a_different_repeat_count_is_a_divergence(self):
-        """The same series measured five times on one box and three on the
-        other differ in noise; the count rides on the entry so this shows."""
-        local = {"run_configs": ["js3/default@3", "sp3/default@5"], "harness": {}}
-        assert (
-            compare_env(local, {"run_configs": ["sp3/default@5", "js3/default@3"]})
-            == []
-        )
-        (line,) = compare_env(
-            local, {"run_configs": ["js3/default@3", "sp3/default@3"]}
-        )
-        assert "only here ['sp3/default@5']" in line
-        assert "only there ['sp3/default@3']" in line
-
-    def test_keys_absent_from_the_source_are_not_reported(self):
-        assert compare_env({"harness": {}}, {}) == []
-
-    def test_how_the_engine_is_driven_is_a_shared_input(self):
-        local = {"runner_cfg_hash": "sha256:a"}
-        assert compare_env(local, {"runner_cfg_hash": "sha256:a"}) == []
-        (line,) = compare_env(local, {"runner_cfg_hash": "sha256:b"})
-        assert line.startswith("runner_cfg_hash: here 'sha256:a', there 'sha256:b'")
-
-    def test_how_a_suite_is_driven_is_compared_per_suite(self):
-        """One suite's protocol changing is one series' problem, so the
-        line names the suite; a suite only one box runs is not a
-        divergence, the run_configs line covers that."""
-        local = {"suite_cfg_hash": {"js3": "sha256:a", "sp3": "sha256:s"}}
-        assert compare_env(local, {"suite_cfg_hash": {"js3": "sha256:a"}}) == []
-        assert compare_env(local, {"suite_cfg_hash": {"js2": "sha256:z"}}) == []
-        (line,) = compare_env(
-            local, {"suite_cfg_hash": {"js3": "sha256:a", "sp3": "sha256:t"}}
-        )
-        assert line == "suite_cfg_hash[sp3]: here 'sha256:s', there 'sha256:t'"
-        # A box from before the key existed has nothing to disagree with.
-        assert compare_env({}, {"suite_cfg_hash": {"js3": "sha256:a"}}) == []
-        assert compare_env(local, {"suite_cfg_hash": None}) == []
+    def test_a_builder_that_publishes_no_env_shows_no_divergence(self, env):
+        env.bus.write_builder_state("v8", BuilderState(frontier=100))
+        _, st = _status(env)
+        assert st.env_divergence == [] and st.env_since is None
 
 
 def test_render_produces_lines(env):
@@ -358,48 +327,8 @@ def test_render_produces_lines(env):
     lines = []
     render(report, lines.append)
     text = "\n".join(lines)
-    assert "free space" in text and "machine lock" in text and "v8 (bus" in text
-
-
-class TestPerEngineRunConfigs:
-    def test_an_engine_with_fewer_variants_does_not_look_divergent(
-        self, config, tmp_path, monkeypatch
-    ):
-        """local_env used to union every engine's configs and compare that
-        against one engine's, so jsc always looked different from itself."""
-        from slipstream.status import local_env
-
-        config.runs.append(
-            RunSpec(
-                engine="v8",
-                suite="js3",
-                flags=("--turbolev-future",),
-                variant="turbolev_future",
-            )
-        )
-        config.engines["v8"] = EngineConfig(
-            name="v8",
-            src_dir=None,
-            build_cmd="true",
-            binary_path="out/d8",
-            id_regex=r"#([0-9]+)",
-        )
-        config.engines["jsc"] = EngineConfig(
-            name="jsc",
-            src_dir=None,
-            build_cmd="true",
-            binary_path="jsc",
-            id_regex=r"/([0-9]+)@",
-        )
-        collector = BenchCollector(config, role="status")
-        monkeypatch.setattr(collector, "harness_revs", lambda: {})
-        jsc = local_env(config, collector, "jsc")["run_configs"]
-        v8 = local_env(config, collector, "v8")["run_configs"]
-        assert "js3/turbolev_future@3" in v8
-        assert "js3/turbolev_future@3" not in jsc
-        assert (
-            compare_env(local_env(config, collector, "jsc"), {"run_configs": jsc}) == []
-        )
+    assert "free space" in text and "machine activity" in text and "v8 (bus" in text
+    assert "machine lock" not in text and "recent binaries" not in text
 
 
 class TestUnreachableSource:
@@ -578,7 +507,6 @@ class TestWindowStatus:
         lines = self.render_window(env)
         assert "Normal use permitted" in lines
         assert "for /selected/config.toml" in lines
-        assert "benchers retain startup configuration" in lines
         env.cfg.bench.allowed_windows = None
         assert "Benchmarking permitted" in self.render_window(env)
 

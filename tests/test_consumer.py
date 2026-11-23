@@ -497,7 +497,7 @@ class TestProvenance:
 
 
 class TestBenchState:
-    def test_reports_cursor_lag_and_environment(self, setup, scored):
+    def test_reports_cursor_lag_and_counts(self, setup, scored):
         for cid in (100, 101):
             setup.publish(cid)
         _drain(setup)
@@ -505,11 +505,6 @@ class TestBenchState:
         assert state.cursor == K1(101) and state.lag == 0
         assert state.bot == setup.cfg.bot_name
         assert state.status_counts == {"ok": 2}
-        assert state.env["harness"] == {"js3": "abc1234"}
-        assert state.env["suite_cfg_hash"] == setup.collector.suite_cfg_hashes(
-            setup.cfg.engines["v8"]
-        )
-        assert state.env["since"] > 0
 
     def test_lag_counts_unbenched_entries(self, setup, monkeypatch):
         for cid in (100, 101, 102):
@@ -525,23 +520,6 @@ class TestBenchState:
         state = setup.bus.read_bench_state("v8")
         assert done == [100]
         assert state.cursor == K1(100) and state.lag == 2
-
-    def test_since_is_kept_while_the_environment_is_unchanged(self, setup, scored):
-        setup.publish(100)
-        _drain(setup)
-        first = setup.bus.read_bench_state("v8").env["since"]
-        setup.publish(101)
-        _drain(setup)
-        assert setup.bus.read_bench_state("v8").env["since"] == first
-
-    def test_since_moves_when_the_environment_changes(self, setup, scored, monkeypatch):
-        setup.publish(100)
-        _drain(setup)
-        first = setup.bus.read_bench_state("v8").env["since"]
-        monkeypatch.setattr(setup.collector, "harness_revs", lambda: {"js3": "def5678"})
-        setup.publish(101)
-        _drain(setup)
-        assert setup.bus.read_bench_state("v8").env["since"] > first
 
 
 class TestCursorRecovery:
@@ -817,30 +795,6 @@ class TestTransportFailures:
         setup.bus.entry_path("v8", 100).unlink()
         _drain(setup)
         assert setup.consumer.cursor(setup.source, "v8") == K1(101)
-
-
-class TestRunsInTheEnvBlock:
-    def test_runs_is_published(self, setup, scored):
-        """It is one of the shared inputs that can silently differ per box.
-        What goes out is the number of rounds: the largest count among the
-        engine's [[run]] entries."""
-        setup.cfg.runs[:] = [
-            RunSpec(engine="v8", suite="js3", runs=5),
-            RunSpec(engine="v8", suite="js3", variant="x", flags=("--x",), runs=2),
-        ]
-        setup.publish(100)
-        _drain(setup)
-        assert setup.bus.read_bench_state("v8").env["runs"] == 5
-
-    def test_a_change_moves_since(self, setup, scored):
-        setup.publish(100)
-        _drain(setup)
-        first = setup.bus.read_bench_state("v8").env["since"]
-        setup.cfg.runs[:] = [RunSpec(engine="v8", suite="js3", runs=5)]
-        setup.publish(101)
-        _drain(setup)
-        state = setup.bus.read_bench_state("v8")
-        assert state.env["runs"] == 5 and state.env["since"] > first
 
 
 class TestRunRootTrim:

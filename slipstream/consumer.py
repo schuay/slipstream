@@ -29,7 +29,6 @@ from pathlib import Path
 
 from .service_logging import warning, error as log_error, message
 from .admission import AdmissionStopped, CollectionResult, StopReason
-from . import __version__, host
 from .bus import (
     BenchState,
     Bus,
@@ -212,7 +211,6 @@ class BusConsumer:
             raise ConsumerError(
                 "configured bus needs offline migration or ownership reconciliation"
             )
-        self.identity = host.identity()
 
     # --- cursors ---
 
@@ -800,24 +798,6 @@ class BusConsumer:
             # it must not raise for the same reason the cycle did.
             state.lag = -1
         state.status_counts = self.store.status_counts(engine_name, self.cfg.platform)
-        engine = self.cfg.engines[engine_name]
-        env = {
-            "slipstream_version": __version__,
-            "hw_model": self.identity["hw_model"],
-            "os_version": self.identity["os_version"],
-            "runs": self.collector.max_runs(engine),
-            "run_configs": self.collector.run_config_labels(engine),
-            "runner_cfg_hash": self.collector._runner(engine).cfg_hash(),
-            "suite_cfg_hash": self.collector.suite_cfg_hashes(engine),
-            "harness": self.collector.harness_revs(),
-        }
-        # `since` is when these values took effect, so a divergence report can
-        # say when the two boxes parted rather than only that they differ now.
-        if {k: v for k, v in state.env.items() if k != "since"} != env:
-            env["since"] = time.time()
-        else:
-            env["since"] = state.env.get("since", time.time())
-        state.env = env
         self.bus.write_bench_state(engine_name, state)
 
 

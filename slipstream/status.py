@@ -19,7 +19,7 @@ from pathlib import Path
 
 from datetime import UTC, datetime
 
-from . import __version__, host
+from . import host
 from . import bench_window
 from .bus import Bus, BusError, cursor_path, read_cursor
 from .config import BusSource, Config
@@ -183,7 +183,9 @@ def render_window(report, echo):
     if next_time:
         echo(f"  next policy change: {next_time}")
     override = report.override
-    if isinstance(override, bench_window.Override):
+    if isinstance(override, bench_window.Override) and (
+        override.expires_at is None or override.expires_at > datetime.now(UTC)
+    ):
         expiry = (
             instant(override.expires_at)
             if override.expires_at
@@ -205,11 +207,8 @@ def render_window(report, echo):
         )
     for blocker in report.blockers:
         echo(f"  {blocker}")
-    for waiter in report.waiters:
-        echo(f"  queued: {waiter}")
-    echo(
-        "  Configured-policy view: benchers must use this policy. Restart affected benchers after TOML changes; benchers retain startup configuration."
-    )
+    for i, waiter in enumerate(report.waiters, 1):
+        echo(f"  queued {i}: {waiter}")
 
 
 def _dir_bytes(path: Path) -> int:
@@ -223,57 +222,16 @@ def _dir_bytes(path: Path) -> int:
     return total
 
 
-def local_env(cfg: Config, collector, engine: str | None = None) -> dict:
-    """This machine's copy of the inputs both boxes share.
-
-    ``run_configs`` is per engine, because that is how the consumer records it:
-    comparing a union over every configured engine against one engine's list
-    reports a difference on every engine with fewer variants than the busiest.
-    """
-    identity = host.identity()
-    env = {
-        "slipstream_version": __version__,
-        "hw_model": identity["hw_model"],
-        "os_version": identity["os_version"],
-        "harness": collector.harness_revs(),
-    }
-    if engine is not None:
-        env["run_configs"] = collector.run_config_labels(cfg.engines[engine])
-        env["runner_cfg_hash"] = collector._runner(cfg.engines[engine]).cfg_hash()
-        env["suite_cfg_hash"] = collector.suite_cfg_hashes(cfg.engines[engine])
-    return env
-
-
 def compare_env(local: dict, remote: dict) -> list[str]:
-    """Which shared inputs the two boxes disagree on.
+    """Where this machine differs from the source's builder.
 
-    run_configs is compared as a set because the two boxes build it from their
-    own engine lists; its entries carry the repeat count (``suite/variant@N``),
-    so a series one box measures five times and the other three shows up
-    here as an entry only each side has. suite_cfg_hash per suite, naming
-    the suite, because one suite's protocol changing is one series' problem;
-    the rest are compared as read.
+    hw_model is published but not compared: the two boxes are different
+    machines by design.
     """
     out = []
-    for key in ("slipstream_version", "os_version", "harness", "runner_cfg_hash"):
+    for key in ("slipstream_version", "os_version", "toolchain"):
         if key in remote and remote[key] != local.get(key):
             out.append(f"{key}: here {local.get(key)!r}, there {remote[key]!r}")
-    if "suite_cfg_hash" in remote:
-        mine = local.get("suite_cfg_hash") or {}
-        theirs = remote["suite_cfg_hash"] or {}
-        for suite in sorted(set(mine) & set(theirs)):
-            if mine[suite] != theirs[suite]:
-                out.append(
-                    f"suite_cfg_hash[{suite}]: here {mine[suite]!r}, "
-                    f"there {theirs[suite]!r}"
-                )
-    if "run_configs" in remote and "run_configs" in local:
-        missing = set(remote["run_configs"]) - set(local["run_configs"])
-        extra = set(local["run_configs"]) - set(remote["run_configs"])
-        if missing or extra:
-            out.append(
-                f"run_configs: only here {sorted(extra)}, only there {sorted(missing)}"
-            )
     return out
 
 
@@ -335,14 +293,7 @@ def collect_status(
         st.driven_by = "bus"
         st.source = source.name
         try:
-            _fill_bus_status(
-                cfg,
-                bus,
-                source,
-                name,
-                st,
-                local_env(cfg, collector, name) if collector is not None else None,
-            )
+            _fill_bus_status(cfg, bus, source, name, st)
         except TRANSPORT_ERRORS as e:
             # An unreachable source is the case this command exists for, so it
             # reports rather than raising. CalledProcessError, which is how
@@ -352,7 +303,7 @@ def collect_status(
     return report
 
 
-def _fill_bus_status(cfg, bus, source, name, st, mine):
+def _fill_bus_status(cfg, bus, source, name, st):
     handle = open_source(source)
     cursor_file = cursor_path(cfg.out_dir, source.name, name)
     try:
@@ -395,12 +346,9 @@ def _fill_bus_status(cfg, bus, source, name, st, mine):
         # contiguous, so a gap between those two is not evidence of a drop.
         st.dropped_unread_up_to = builder.highest_dropped
 
-    # The source's own bencher block, so a divergence is reported against the
-    # box the artifacts came from rather than against nothing.
-    theirs = handle.bench_state(name).env
-    if theirs and mine is not None:
-        st.env_divergence = compare_env(mine, theirs)
-        st.env_since = theirs.get("since")
+    if builder.env:
+        st.env_divergence = compare_env(host.builder_env(), builder.env)
+        st.env_since = builder.env.get("since")
 
     st.blob_gb = bus.footprint(name) / GB
     st.roots_gb = _dir_bytes(bus.root / "roots" / name) / GB
@@ -424,14 +372,6 @@ def render(report: BusStatus, echo) -> None:
     if report.window is not None:
         render_window(report.window, echo)
     echo(f"free space: {report.free_gb:.0f}GB")
-    if report.paused_until:
-        echo(f"PAUSED by operator until {when(report.paused_until)}")
-    if report.lock_holder:
-        echo(f"machine lock: held by {report.lock_holder}")
-    else:
-        echo("machine lock: free")
-    for i, waiter in enumerate(report.lock_waiters, 1):
-        echo(f"  {i}. {waiter}")
 
     for st in report.engines:
         echo("")
@@ -459,9 +399,7 @@ def render(report: BusStatus, echo) -> None:
             if progress.get("last_error"):
                 echo(f"  transfer error: {progress['last_error']}")
         if st.peer_age is not None:
-            echo(
-                f"  peer snapshot fetched {int(st.peer_age)}s ago (source timestamps preserved)"
-            )
+            echo(f"  peer snapshot fetched {int(st.peer_age)}s ago")
         if st.driven_by == "bus":
             echo(f"  frontier {st.frontier}, cursor {st.cursor}, lag {st.lag}")
             if st.builder_age is not None:
@@ -520,14 +458,14 @@ def render(report: BusStatus, echo) -> None:
             echo(f"  disk: {st.blob_gb:.1f}GB payloads, {st.roots_gb:.1f}GB run roots")
             if st.env_divergence:
                 echo(
-                    f"  environment differs from the source"
+                    f"  environment differs from the source's builder"
                     f"{f' (since {when(st.env_since)})' if st.env_since else ''}:"
                 )
                 for line in st.env_divergence:
                     echo(f"    {line}")
         counts = ", ".join(f"{k} {v}" for k, v in sorted(st.status_counts.items()))
         echo(f"  benched: {counts or 'nothing yet'}")
-        if st.provenance:
+        if len(st.provenance) > 1:
             split = ", ".join(f"{k} {v}" for k, v in sorted(st.provenance.items()))
             echo(f"  recent binaries: {split}")
         if st.orphan_scores:
