@@ -258,11 +258,12 @@ class CommitStore:
         # busy_timeout first, so the WAL conversion below (and every later op)
         # waits on a concurrent writer rather than raising immediately.
         self.conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
-        self.conn.execute("PRAGMA synchronous=FULL")
-        # WAL lets delivery's reader coexist with the collector's
-        # writer instead of deadlocking on lock promotion. It is a persistent
-        # property of the db file, so setting it on any connection converts it.
-        self.conn.execute("PRAGMA journal_mode=WAL")
+        if not (readonly and pre_existing):
+            self.conn.execute("PRAGMA synchronous=FULL")
+            # WAL lets delivery's reader coexist with the collector's
+            # writer instead of deadlocking on lock promotion. It is a persistent
+            # property of the db file, so setting it on any connection converts it.
+            self.conn.execute("PRAGMA journal_mode=WAL")
         try:
             # Before the backup and before any schema work: a db from a newer
             # slipstream is refused whole, readonly or not, since even its
@@ -662,25 +663,97 @@ class CommitStore:
         so they must not be marked pushed, and the count is worth surfacing:
         it means a bench wrote scores without the metadata that goes with them.
 
-        ``lo``/``hi`` bound the scan to a commit range. The background pusher
-        runs this after every benched commit and is meant to be cheap, and
-        unbounded it is a DISTINCT LEFT JOIN over the engine's whole history.
-        A range rather than an id list, so the caller's set can be any size.
+        ``lo``/``hi`` bound the scan to a commit range. Uses a recursive
+        index skip-scan over ``scores``'s primary key so each distinct
+        ``commit_id`` costs one B-tree seek rather than scanning every
+        benchmark/metric/run row.
 
         One embedder at a time: the git-driven frontier asks about its own
         series (embedder 0); delivery asks about the key it is shipping.
         """
         rows = self.conn.execute(
-            "SELECT DISTINCT s.commit_id FROM scores s"
-            " LEFT JOIN commits c ON s.engine=c.engine"
-            "   AND s.embedder_id=c.embedder_id AND s.commit_id=c.commit_id"
-            " WHERE s.engine=? AND s.platform=? AND s.embedder_id=? AND c.hash IS NULL"
-            "   AND (? IS NULL OR s.commit_id >= ?)"
-            "   AND (? IS NULL OR s.commit_id <= ?)"
-            " ORDER BY s.commit_id",
-            (engine, platform, embedder_id, lo, lo, hi, hi),
+            """
+            WITH RECURSIVE cids(cid) AS (
+                SELECT (
+                    SELECT commit_id FROM scores
+                    WHERE engine = ?1 AND platform = ?2 AND embedder_id = ?3
+                      AND (?4 IS NULL OR commit_id >= ?4)
+                      AND (?5 IS NULL OR commit_id <= ?5)
+                    ORDER BY commit_id LIMIT 1
+                )
+                UNION ALL
+                SELECT (
+                    SELECT commit_id FROM scores
+                    WHERE engine = ?1 AND platform = ?2 AND embedder_id = ?3
+                      AND commit_id > cid
+                      AND (?5 IS NULL OR commit_id <= ?5)
+                    ORDER BY commit_id LIMIT 1
+                )
+                FROM cids WHERE cid IS NOT NULL
+            )
+            SELECT cid FROM cids
+            WHERE cid IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM commits c
+                  WHERE c.engine = ?1 AND c.embedder_id = ?3 AND c.commit_id = cid
+              )
+            ORDER BY cid
+            """,
+            (engine, platform, embedder_id, lo, hi),
         ).fetchall()
         return [r[0] for r in rows]
+
+    def keys_missing_commit_row(self, engine: str, platform: str) -> list[CommitKey]:
+        """All commit keys (across every embedder) with scores but no ``commits`` row.
+
+        Two-level B-tree skip-scan over ``scores``'s primary key
+        ``(engine, platform, embedder_id, commit_id, ...)`` so ``bus status``
+        checks a multi-million-row store in milliseconds.
+        """
+        rows = self.conn.execute(
+            """
+            WITH RECURSIVE
+            embedders_in_scores(emb) AS (
+                SELECT (
+                    SELECT embedder_id FROM scores
+                    WHERE engine = ?1 AND platform = ?2
+                    ORDER BY embedder_id LIMIT 1
+                )
+                UNION ALL
+                SELECT (
+                    SELECT embedder_id FROM scores
+                    WHERE engine = ?1 AND platform = ?2 AND embedder_id > emb
+                    ORDER BY embedder_id LIMIT 1
+                )
+                FROM embedders_in_scores WHERE emb IS NOT NULL
+            ),
+            keys_in_scores(emb, cid) AS (
+                SELECT emb, (
+                    SELECT commit_id FROM scores
+                    WHERE engine = ?1 AND platform = ?2 AND embedder_id = emb
+                    ORDER BY commit_id LIMIT 1
+                )
+                FROM embedders_in_scores WHERE emb IS NOT NULL
+                UNION ALL
+                SELECT emb, (
+                    SELECT commit_id FROM scores
+                    WHERE engine = ?1 AND platform = ?2
+                      AND embedder_id = emb AND commit_id > cid
+                    ORDER BY commit_id LIMIT 1
+                )
+                FROM keys_in_scores WHERE cid IS NOT NULL
+            )
+            SELECT emb, cid FROM keys_in_scores
+            WHERE cid IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM commits c
+                  WHERE c.engine = ?1 AND c.embedder_id = emb AND c.commit_id = cid
+              )
+            ORDER BY emb, cid
+            """,
+            (engine, platform),
+        ).fetchall()
+        return [CommitKey(r[0], r[1]) for r in rows]
 
     def key_missing_commit_row(self, engine: str, platform: str, key) -> bool:
         """Whether one key has scores but no ``commits`` row (see above)."""

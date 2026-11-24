@@ -472,6 +472,28 @@ class TestBusCommands:
         assert self._invoke(["bus", "status", "--config", str(cfg)]).exit_code == 0
         assert list(db.parent.glob("*.bak")) == before
 
+    def test_status_succeeds_while_writer_holds_db_transaction(self, tmp_path):
+        import sqlite3
+
+        from slipstream.store import CommitStore
+
+        cfg = self._cfg(tmp_path)
+        db = tmp_path / "metadata" / "slipstream.db"
+        s = CommitStore(db, bot="box1")
+        s.mark_done("v8", "arm64", 100, status="ok")
+        s.close()
+
+        writer = sqlite3.connect(str(db))
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("INSERT OR REPLACE INTO meta VALUES ('in_flight', '1')")
+        try:
+            res = self._invoke(["bus", "status", "--config", str(cfg)])
+            assert res.exit_code == 0, res.output
+            assert not (tmp_path / "logs").exists()
+        finally:
+            writer.rollback()
+            writer.close()
+
     def test_reset_cursor_for_an_unwatched_engine(self, tmp_path):
         """The engine named by --reset-cursor need not be one being watched."""
         p = tmp_path / "config.toml"

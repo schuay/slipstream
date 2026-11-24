@@ -116,12 +116,13 @@ class LocalSource:
     the state a consumer is supposed to treat as a real error.
     """
 
-    def __init__(self, source: BusSource):
+    def __init__(self, source: BusSource, *, readonly: bool = False):
         self.name = source.name
+        self.readonly = readonly
         self.bus = Bus(source.local_root)
 
     def keys_above(self, engine: str, cursor) -> list[CommitKey]:
-        return self.bus.keys_above(engine, cursor)
+        return self.bus.keys_above(engine, cursor, readonly=self.readonly)
 
     def read_entry(self, engine: str, key) -> Entry | None:
         return self.bus.read_entry(engine, key)
@@ -147,18 +148,16 @@ class LocalSource:
             from .bus import state_from_json, BuilderState
 
             peer = protocol.state_path("peer-health", engine)
-            if (
-                protocol.ready()["owners"][engine] != protocol.ready()["uuid"]
-                and peer.exists()
-            ):
+            ready = protocol.ready()
+            if ready["owners"][engine] != ready["uuid"] and peer.exists():
                 snapshot_state = read(peer).get("source", {}).get("builds")
                 if snapshot_state:
-                    import json
-
                     state = state_from_json(json.dumps(snapshot_state), BuilderState)
-            snapshot = protocol.snapshot(engine)
-            from .bus_protocol import read
-
+            snapshot = (
+                protocol.peek_snapshot(engine)
+                if self.readonly
+                else protocol.snapshot(engine)
+            )
             drop = snapshot["retention"]["highest_dropped"]
             state.highest_dropped = CommitKey.parse(drop) if drop else None
             lowest = snapshot["retention"]["lowest_retained"]

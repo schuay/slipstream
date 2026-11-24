@@ -647,8 +647,13 @@ class Bus:
                 keys.append(key)
         return sorted(keys)
 
-    def keys_above(self, engine: str, cursor) -> list[CommitKey]:
-        keys = self.keys(engine)
+    def keys_above(
+        self, engine: str, cursor, *, readonly: bool = False
+    ) -> list[CommitKey]:
+        if readonly and (protocol := self.protocol):
+            keys = protocol.peek_keys(engine)
+        else:
+            keys = self.keys(engine)
         if cursor is None:
             return keys
         cursor = CommitKey.of(cursor)
@@ -665,8 +670,12 @@ class Bus:
             return None
         return Entry.from_json(text, str(path))
 
-    def entries(self, engine: str) -> list[Entry]:
+    def entries(self, engine: str, *, readonly: bool = False) -> list[Entry]:
         """Every readable entry of the engine, ascending by key."""
+        if protocol := self.protocol:
+            return (
+                protocol.peek_entries(engine) if readonly else protocol.entries(engine)
+            )
         found = []
         for key in self.keys(engine):
             entry = self.read_entry(engine, key)
@@ -800,11 +809,11 @@ class Bus:
         keys = self.keys(engine)
         return keys[0] if keys else None
 
-    def footprint(self, engine: str) -> int:
+    def footprint(self, engine: str, *, readonly: bool = False) -> int:
         """Bytes of the distinct stored objects the engine's entries name.
         A base shared by a group of delta entries is counted once."""
         seen: dict[str, int] = {}
-        for entry in self.entries(engine):
+        for entry in self.entries(engine, readonly=readonly):
             for obj in entry.objects():
                 seen.setdefault(obj.name, obj.bytes)
         return sum(seen.values())

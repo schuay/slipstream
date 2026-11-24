@@ -66,6 +66,21 @@ def _open_store(cfg, **kwargs):
         raise typer.Exit(1)
 
 
+def _open_readonly_store(cfg):
+    """Open an existing store read-only for status commands, migrating only if
+    the db predates the current schema."""
+    from .store import SCHEMA_VERSION
+
+    db = cfg.metadata_dir / "slipstream.db"
+    if not db.exists():
+        return None
+    store = _open_store(cfg, readonly=True)
+    if store.get_meta("schema_version") != SCHEMA_VERSION:
+        store.close()
+        return _open_store(cfg, backup=False)
+    return store
+
+
 def _shutdown_flag(label: str = "current commit", log=None):
     """Install SIGINT/SIGTERM handlers; returns a callable reading the flag.
 
@@ -938,24 +953,20 @@ def bus_status(
             typer.echo(f"Error: engine '{name}' not configured.", err=True)
             raise typer.Exit(1)
     # Policy status must also work on a fresh host without creating a DB.
-    collector = (
-        _open_collector(cfg, role="status", backup=False)
-        if (cfg.metadata_dir / "slipstream.db").exists()
-        else None
-    )
+    store = _open_readonly_store(cfg)
     try:
         render(
             collect_status(
                 cfg,
-                collector,
+                store,
                 engines,
                 str(config or "~/.config/slipstream/config.toml"),
             ),
             typer.echo,
         )
     finally:
-        if collector is not None:
-            collector.store.close()
+        if store is not None:
+            store.close()
 
 
 @bus_app.command("gc")

@@ -55,7 +55,15 @@ class CommitKey(NamedTuple):
     @classmethod
     def parse(cls, text: str) -> CommitKey:
         """The CLI and filename form: ``109680`` or ``1534000-109680``."""
-        m = _KEY_RE.match(text.strip())
+        s = text.strip()
+        if s.isascii():
+            head, sep, tail = s.partition("-")
+            if not sep and head.isdigit():
+                return cls(0, int(head))
+            if sep and head.isdigit() and tail.isdigit():
+                return cls(int(head), int(tail))
+            raise ValueError(f"not a commit key: {text!r}")
+        m = _KEY_RE.match(s)
         if not m:
             raise ValueError(f"not a commit key: {text!r}")
         return cls(int(m.group(1) or 0), int(m.group(2)))

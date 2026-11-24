@@ -1060,9 +1060,7 @@ def test_stage_close_removes_bulk_outside_bus_lock(pair, monkeypatch):
     assert not stage.path.exists()
 
 
-def test_conflict_record_lost_to_lock_timeout_is_saved_later(
-    pair, config, monkeypatch
-):
+def test_conflict_record_lost_to_lock_timeout_is_saved_later(pair, config, monkeypatch):
     src, dst = pair
     publication(src, 1)
     route = TransferRoute(
@@ -1119,3 +1117,22 @@ def test_stage_close_leaves_owner_to_gc_when_bus_lock_times_out(pair, monkeypatc
     monkeypatch.undo()
     assert stage.path in src.gc()
     assert not stage.path.exists()
+
+
+def test_entries_recovers_once_not_per_manifest(pair, monkeypatch):
+    from slipstream.bus import Bus
+
+    src, _ = pair
+    for cid in (1, 2, 3, 4):
+        publication(src, cid, data=f"data-{cid}".encode(), tree=f"t{cid}")
+    recovers = []
+    real_recover = BusProtocol._recover_locked
+
+    def count_recover(self, engine):
+        recovers.append(engine)
+        return real_recover(self, engine)
+
+    monkeypatch.setattr(BusProtocol, "_recover_locked", count_recover)
+    bus = Bus(src.root)
+    assert [e.commit_id for e in bus.entries("v8")] == [1, 2, 3, 4]
+    assert recovers == ["v8"]

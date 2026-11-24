@@ -328,6 +328,38 @@ class TestScoresWithoutCommitRow:
             )
         assert store.commit_ids_missing_commit_row("v8", "arm64") == [101]
 
+    def test_keys_missing_commit_row_spans_all_embedders(self, store):
+        store.upsert_commit("chrome", "h1", CommitKey(10, 100), "d", 0, "t", "e1")
+        for key in (
+            CommitKey(0, 50),
+            CommitKey(10, 100),
+            CommitKey(10, 101),
+            CommitKey(11, 100),
+        ):
+            store.insert_scores(
+                "chrome",
+                "arm64",
+                key,
+                0,
+                [
+                    {
+                        "suite": "js3",
+                        "flags": "default",
+                        "benchmark": f"b{i}",
+                        "metric": "Total-Score",
+                        "run": 1,
+                        "score": float(i),
+                    }
+                    for i in range(5)
+                ],
+            )
+        assert store.keys_missing_commit_row("chrome", "arm64") == [
+            CommitKey(0, 50),
+            CommitKey(10, 101),
+            CommitKey(11, 100),
+        ]
+        assert store.keys_missing_commit_row("jsc", "arm64") == []
+
 
 class TestClearScores:
     def test_clears_scores_only(self, store):

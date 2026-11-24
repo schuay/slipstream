@@ -364,6 +364,84 @@ class BusProtocol:
             self._recover_locked(engine)
             return self.bus.read_entry(engine, key)
 
+    def entries(self, engine):
+        with self.lock():
+            self._recover_locked(engine)
+            return self.bus.entries(engine)
+
+    def _peek_topic(self, engine):
+        """Read-only view of an engine's post-recovery keys and retention state.
+
+        Used by status reporting so inspecting a live bus never acquires
+        ``.bus.lock``, mutates journals, or issues device-cache flushes.
+        """
+        ready = self.ready()
+        if engine not in ready["owners"]:
+            raise BusError(f"no configured owner for {engine}")
+        journal = read(self.state_path("acceptance", engine))
+        retention = read(self.state_path("retention", engine))
+        if not {"pending", "highest_dropped", "lowest_retained"} <= retention.keys():
+            raise BusError("invalid retention record")
+        pending_raw = retention["pending"]
+        if not isinstance(pending_raw, list) or len(pending_raw) > 256:
+            raise BusError("invalid pending prune batch")
+        try:
+            pending = {CommitKey.parse(item["key"]) for item in pending_raw}
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BusError(f"malformed operational state for {engine}: {exc}") from exc
+
+        prepared = None
+        if journal.get("state") == "prepared":
+            if not {"manifest", "identity"} <= journal.keys():
+                raise BusError("incomplete acceptance record")
+            prepared = Entry.from_json(journal["manifest"])
+
+        keys = set(self.bus.keys(engine)) - pending
+        if prepared is not None and prepared.key not in pending:
+            keys.add(prepared.key)
+        sorted_keys = sorted(keys)
+
+        old_drop = retention.get("highest_dropped")
+        drop_candidates = list(pending) + (
+            [CommitKey.parse(old_drop)] if old_drop else []
+        )
+        retention_view = {
+            **retention,
+            "highest_dropped": str(max(drop_candidates)) if drop_candidates else None,
+            "lowest_retained": str(sorted_keys[0]) if sorted_keys else None,
+            "pending": [],
+        }
+        return ready, sorted_keys, prepared, pending, retention_view
+
+    def peek_keys(self, engine):
+        _, sorted_keys, _, _, _ = self._peek_topic(engine)
+        return sorted_keys
+
+    def peek_entries(self, engine):
+        _, sorted_keys, prepared, pending, _ = self._peek_topic(engine)
+        prepared_key = (
+            prepared.key
+            if prepared is not None and prepared.key not in pending
+            else None
+        )
+        found = []
+        for key in sorted_keys:
+            if key == prepared_key:
+                found.append(prepared)
+                continue
+            entry = self.bus.read_entry(engine, key)
+            if entry is not None:
+                found.append(entry)
+        return found
+
+    def peek_snapshot(self, engine):
+        ready, sorted_keys, _, _, retention_view = self._peek_topic(engine)
+        return {
+            "uuid": ready["uuid"],
+            "keys": [str(k) for k in sorted_keys],
+            "retention": retention_view,
+        }
+
     def snapshot(self, engine):
         with self.lock():
             self._recover_locked(engine)

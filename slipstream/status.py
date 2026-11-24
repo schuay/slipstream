@@ -12,6 +12,7 @@ age of the file it was read from.
 
 from __future__ import annotations
 
+import os
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -23,7 +24,7 @@ from . import host
 from . import bench_window
 from .bus import Bus, BusError, cursor_path, read_cursor
 from .config import BusSource, Config
-from .consumer import TRANSPORT_ERRORS, open_source
+from .consumer import LocalSource, TRANSPORT_ERRORS, open_source
 from .lock import Holder, MachineLock, paused_until
 from .models import CommitKey
 from .store import CommitStore
@@ -213,10 +214,19 @@ def render_window(report, echo):
 
 def _dir_bytes(path: Path) -> int:
     total = 0
-    for p in path.rglob("*"):
+    stack = [os.fspath(path)]
+    while stack:
+        current = stack.pop()
         try:
-            if p.is_file() and not p.is_symlink():
-                total += p.stat().st_size
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        pass
         except OSError:
             pass
     return total
@@ -241,7 +251,9 @@ def collect_status(
     engines: list[str] | None = None,
     config_label: str = "~/.config/slipstream/config.toml",
 ) -> BusStatus:
-    store: CommitStore | None = collector.store if collector is not None else None
+    store: CommitStore | None = (
+        getattr(collector, "store", collector) if collector is not None else None
+    )
     bus = Bus(cfg.bus.root) if cfg.bus else None
     names = engines or list(cfg.engines)
     report = BusStatus()
@@ -274,7 +286,9 @@ def collect_status(
                         )
                         if route.source.is_local:
                             st.transfer["backlog"] = len(
-                                bus.keys_above(name, st.transfer["cursor"])
+                                bus.keys_above(
+                                    name, st.transfer["cursor"], readonly=True
+                                )
                             )
                 if peer.exists():
                     st.peer_age = time.time() - read(peer)["fetched_at"]
@@ -282,9 +296,7 @@ def collect_status(
                 st.error = str(exc)
         if store is not None:
             st.status_counts = store.status_counts(name, cfg.platform)
-            st.orphan_scores = len(
-                store.commit_ids_missing_commit_row(name, cfg.platform)
-            )
+            st.orphan_scores = len(store.keys_missing_commit_row(name, cfg.platform))
             st.provenance = store.run_env_source_counts(name)
         source: BusSource | None = cfg.bus.source_for(name) if cfg.bus else None
         if source is None:
@@ -305,6 +317,8 @@ def collect_status(
 
 def _fill_bus_status(cfg, bus, source, name, st):
     handle = open_source(source)
+    if isinstance(handle, LocalSource):
+        handle.readonly = True
     cursor_file = cursor_path(cfg.out_dir, source.name, name)
     try:
         st.cursor = read_cursor(cursor_file)
@@ -350,7 +364,7 @@ def _fill_bus_status(cfg, bus, source, name, st):
         st.env_divergence = compare_env(host.builder_env(), builder.env)
         st.env_since = builder.env.get("since")
 
-    st.blob_gb = bus.footprint(name) / GB
+    st.blob_gb = bus.footprint(name, readonly=True) / GB
     st.roots_gb = _dir_bytes(bus.root / "roots" / name) / GB
 
 

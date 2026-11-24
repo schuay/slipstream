@@ -209,6 +209,77 @@ class TestStatusDoesNotTakeTheLock:
         assert report.lock_holder and "watch" in report.lock_holder
         holder.release()
 
+    def test_v4_status_neither_takes_bus_lock_nor_flushes(self, env, monkeypatch):
+        """A migrated bus must be inspectable while transfer or build holds
+        .bus.lock, and status must never issue device-cache flushes."""
+        import hashlib
+        import json
+        import uuid
+
+        from slipstream.bus_protocol import BusProtocol
+        from slipstream.durability import FileLock
+
+        protocol = BusProtocol(env.bus.root)
+        owner = protocol.bus_uuid()
+        protocol.migrate({"v8": owner})
+        for cid in (100, 101):
+            payload = f"payload-{cid}".encode()
+            sha = hashlib.sha256(payload).hexdigest()
+            entry = Entry(
+                "v8",
+                cid,
+                f"hash{cid}",
+                "2026-09-06",
+                1757116800,
+                f"commit {cid}",
+                "sha256:cfg",
+                [Blob("out", f"tree{cid}", sha, len(payload))],
+                version=4,
+                owner_uuid=owner,
+                publication_uuid=str(uuid.uuid4()),
+            )
+            with protocol.stage() as stage:
+                p = stage.path / entry.objects()[0].name
+                p.write_bytes(payload)
+                stage.paths[p.name] = p
+                stage.entry, stage.text = entry, entry.to_json()
+                protocol.publish_staged(stage)
+        protocol.write_builder_state("v8", BuilderState(frontier=101))
+        write_cursor(cursor_path(env.cfg.out_dir, "local", "v8"), 100)
+
+        root_dir = env.bus.root / "roots" / "v8" / "100" / "sub"
+        root_dir.mkdir(parents=True)
+        (root_dir / "d8").write_bytes(b"r" * 500)
+        (root_dir / "link").symlink_to(root_dir / "d8")
+
+        monkeypatch.setattr(
+            "slipstream.durability.flush_file",
+            lambda fd: pytest.fail("bus status flushed a file"),
+        )
+        monkeypatch.setattr(
+            BusProtocol,
+            "lock",
+            lambda self, timeout=30.0: pytest.fail("bus status took .bus.lock"),
+        )
+        with FileLock(env.bus.root / ".bus.lock", timeout=0):
+            _, st = _status(env)
+        assert (st.frontier, st.cursor, st.lag) == (K1(101), K1(100), 1)
+        assert st.blob_gb == pytest.approx(22 / 1_000_000_000)
+        assert st.roots_gb == pytest.approx(500 / 1_000_000_000)
+
+        # Unrecovered pending prunes are reflected in memory without mutating disk.
+        write_cursor(cursor_path(env.cfg.out_dir, "local", "v8"), 99)
+        ret_path = protocol.state_path("retention", "v8")
+        ret = json.loads(ret_path.read_text())
+        ret["pending"] = [{"key": "100", "sha256": "deadbeef"}]
+        ret_bytes = json.dumps(ret).encode()
+        ret_path.write_bytes(ret_bytes)
+        _, st = _status(env)
+        assert st.lowest_retained == K1(101)
+        assert st.dropped_unread_up_to == K1(100)
+        assert st.blob_gb == pytest.approx(11 / 1_000_000_000)
+        assert ret_path.read_bytes() == ret_bytes
+
 
 class TestLocalFacts:
     def test_status_counts_and_orphans(self, env):
@@ -233,6 +304,34 @@ class TestLocalFacts:
         )
         _, st = _status(env)
         assert st.status_counts == {"ok": 1, "failed": 1}
+        assert st.orphan_scores == 1
+
+    def test_orphan_scores_include_embedded_engines(self, env):
+        from slipstream.models import CommitKey
+
+        store = env.collector.store
+        for emb in (1534000, 1534001):
+            store.insert_scores(
+                "v8",
+                env.cfg.platform,
+                CommitKey(emb, 100),
+                0,
+                [
+                    {
+                        "suite": "js3",
+                        "flags": "default",
+                        "benchmark": "b",
+                        "metric": "Total-Score",
+                        "run": run,
+                        "score": 1.0,
+                    }
+                    for run in (1, 2)
+                ],
+            )
+        store.upsert_commit(
+            "v8", "h", CommitKey(1534000, 100), "d", 0, "t", embedder_hash="cr"
+        )
+        _, st = _status(env)
         assert st.orphan_scores == 1
 
     def test_provenance_split(self, env):
