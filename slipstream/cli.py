@@ -906,6 +906,32 @@ def transfer(config: Optional[Path] = typer.Option(None), once: bool = False):
         raise typer.Exit(1)
 
 
+@app.command("archive")
+def archive(config: Optional[Path] = typer.Option(None), once: bool = False):
+    """Keep every build on the [bus.archive] target, on its own schedule.
+
+    Takes no machine lock: like transfer, a run is disk and network I/O.
+    --once archives every engine now, regardless of the schedule.
+    """
+    from .archive import Archiver
+
+    cfg = _load_config(config)
+    if cfg.bus is None or cfg.bus.archive is None:
+        raise typer.BadParameter("archive requires a [bus.archive] section")
+    log = EventLog("archive")
+    report_lock_holds("archive", log.warning)
+    stopped = _shutdown_flag("archive", log=log)
+    try:
+        success = Archiver(cfg, log=log).run(once=once, should_stop=stopped)
+    except (OSError, RuntimeError) as exc:
+        log.error(f"Archive failed: {exc}")
+        raise typer.Exit(1)
+    finally:
+        log.close()
+    if once and not success:
+        raise typer.Exit(1)
+
+
 @bus_app.command("subscribe")
 def bus_subscribe(
     root: Annotated[Path, typer.Argument(help="Bus root on this machine")],

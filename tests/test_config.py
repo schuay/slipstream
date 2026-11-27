@@ -973,3 +973,67 @@ def test_transfer_route_validation(tmp_path, invalid):
         data["sources"] = [{"name": "legacy", "root": "/remote", "ssh_host": "m6"}]
     with pytest.raises(ValueError):
         _parse_bus(data, {"v8": object()})
+
+
+class TestArchiveConfig:
+    OWNER = "00000000-0000-0000-0000-000000000001"
+
+    def _parse(self, tmp_path, archive):
+        from slipstream.config import _parse_bus
+
+        data = {
+            "root": str(tmp_path),
+            "owners": {"v8": self.OWNER},
+            "archive": archive,
+        }
+        return _parse_bus(data, {"v8": object(), "jsc": object()}).archive
+
+    def test_absent(self, tmp_path):
+        from slipstream.config import _parse_bus
+
+        assert _parse_bus({"root": str(tmp_path)}, {}).archive is None
+
+    def test_parses(self, tmp_path):
+        archive = self._parse(
+            tmp_path,
+            {
+                "target": "nas:/volume1/slipstream",
+                "engines": ["v8"],
+                "every_hours": 168,
+                "at": "03:00",
+                "bwlimit": "50m",
+            },
+        )
+        assert archive.target == "nas:/volume1/slipstream"
+        assert archive.engines == ["v8"]
+        assert (archive.every_hours, archive.at, archive.bwlimit) == (
+            168,
+            "03:00",
+            "50m",
+        )
+        assert archive.at_minutes == 180
+
+    def test_defaults(self, tmp_path):
+        archive = self._parse(tmp_path, {"target": "/a", "engines": ["v8"]})
+        assert (archive.every_hours, archive.at, archive.bwlimit) == (24, None, None)
+
+    @pytest.mark.parametrize(
+        "change, match",
+        [
+            ({"extra": 1}, "extra"),
+            ({"target": ""}, "target"),
+            ({"engines": []}, "engines"),
+            ({"engines": ["v8", "v8"]}, "engines"),
+            ({"engines": ["d8"]}, "no \\[engines.d8\\]"),
+            ({"engines": ["jsc"]}, "owners"),
+            ({"every_hours": 0}, "every_hours"),
+            ({"every_hours": True}, "every_hours"),
+            ({"at": "3:00"}, "HH:MM"),
+            ({"at": "24:00"}, "HH:MM"),
+            ({"at": "03:00", "every_hours": 12}, "whole number of days"),
+            ({"bwlimit": 50}, "bwlimit"),
+        ],
+    )
+    def test_validation(self, tmp_path, change, match):
+        with pytest.raises(ValueError, match=match):
+            self._parse(tmp_path, {"target": "/a", "engines": ["v8"], **change})

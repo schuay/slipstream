@@ -69,6 +69,7 @@ class EngineStatus:
     roots_gb: float = 0.0
     error: str | None = None
     transfer: dict = field(default_factory=dict)
+    archive: dict = field(default_factory=dict)
     peer_age: float | None = None
 
 
@@ -294,6 +295,9 @@ def collect_status(
                     st.peer_age = time.time() - read(peer)["fetched_at"]
             except (OSError, BusError) as exc:
                 st.error = str(exc)
+            archive = cfg.bus.archive
+            if archive is not None and name in archive.engines:
+                st.archive = _archive_status(bus, archive, name)
         if store is not None:
             st.status_counts = store.status_counts(name, cfg.platform)
             st.orphan_scores = len(store.keys_missing_commit_row(name, cfg.platform))
@@ -312,6 +316,26 @@ def collect_status(
             # SshSource signals every transport failure, is not a RuntimeError.
             st.error = str(e)
         report.engines.append(st)
+    return report
+
+
+def _archive_status(bus, archive, name) -> dict:
+    """The archive's record for one engine, with its backlog and age."""
+    from .archive import ArchiveError, read_state
+
+    try:
+        state = read_state(bus.protocol, name)
+    except ArchiveError as exc:
+        return {"error": str(exc)}
+    if state is None:
+        return {"never": True, "every_hours": archive.every_hours}
+    report = dict(state, every_hours=archive.every_hours)
+    try:
+        report["backlog"] = len(bus.keys_above(name, state["cursor"], readonly=True))
+    except (OSError, BusError, ValueError) as exc:
+        report["error"] = str(exc)
+    if state.get("last_success_at"):
+        report["age"] = time.time() - state["last_success_at"]
     return report
 
 
@@ -379,6 +403,33 @@ def _key_of(record: dict) -> str:
     return str(CommitKey.from_commit(record))
 
 
+def _render_archive(archive: dict, echo) -> None:
+    if archive.get("never"):
+        echo("  archive: never run")
+    elif "cursor" in archive:
+        age = archive.get("age")
+        late = age is not None and age > archive["every_hours"] * 3600 * 1.5
+        last = (
+            f"last success {age / 3600:.1f}h ago"
+            if age is not None
+            else "no successful run"
+        )
+        echo(
+            f"  archive: cursor {archive['cursor'] or 'none'}, backlog "
+            f"{archive.get('backlog', 'unknown')}, {last} (every "
+            f"{archive['every_hours']:g}h){', OVERDUE' if late else ''}"
+        )
+        if archive.get("skipped_dropped"):
+            echo(
+                f"  archive skipped through {archive['skipped_dropped']}: "
+                f"retention dropped them first"
+            )
+        if archive.get("last_error"):
+            echo(f"  archive error: {archive['last_error']}")
+    if archive.get("error"):
+        echo(f"  archive error: {archive['error']}")
+
+
 def render(report: BusStatus, echo) -> None:
     def when(ts):
         return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
@@ -412,6 +463,8 @@ def render(report: BusStatus, echo) -> None:
             )
             if progress.get("last_error"):
                 echo(f"  transfer error: {progress['last_error']}")
+        if st.archive:
+            _render_archive(st.archive, echo)
         if st.peer_age is not None:
             echo(f"  peer snapshot fetched {int(st.peer_age)}s ago")
         if st.driven_by == "bus":

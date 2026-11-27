@@ -625,3 +625,38 @@ def test_safari_acquisition_error_remains_visible_while_publishing(env):
     )
     _, status = _status(env)
     assert status.builder_error == "Safari acquisition: frozen release conflict"
+
+
+def test_archive_rows(env):
+    from test_archive import publish as publish_v4
+
+    from slipstream.archive import empty_state
+    from slipstream.bus_protocol import BusProtocol, encoded
+    from slipstream.config import ArchiveConfig
+    from slipstream.durability import atomic_write
+
+    protocol = BusProtocol(env.bus.root)
+    protocol.migrate({"v8": protocol.bus_uuid()})
+    env.cfg.bus.archive = ArchiveConfig("nas:/a", ["v8"], every_hours=24)
+    lines = []
+    render(collect_status(env.cfg, env.collector, ["v8"]), lines.append)
+    assert "  archive: never run" in lines
+
+    for key in (1, 2, 3):
+        publish_v4(protocol, key, {"out": f"b{key}".encode()})
+    state = empty_state("nas:/a")
+    state.update(
+        cursor="1",
+        skipped_dropped="0",
+        last_success_at=time.time() - 40 * 3600,
+        last_error="rsync exited 12",
+    )
+    atomic_write(protocol.state_path("archive", "v8"), encoded(state))
+    _, st = _status(env)
+    assert st.archive["backlog"] == 2
+    lines = []
+    render(collect_status(env.cfg, env.collector, ["v8"]), lines.append)
+    (row,) = [line for line in lines if line.startswith("  archive: cursor")]
+    assert "cursor 1, backlog 2" in row and "OVERDUE" in row and "40.0h ago" in row
+    assert "  archive error: rsync exited 12" in lines
+    assert any("archive skipped through 0" in line for line in lines)

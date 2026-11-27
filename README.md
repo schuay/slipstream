@@ -116,6 +116,30 @@ Both endpoints must run the same transfer protocol version; update both
 machines before restarting transfer. This upgrade does not require another
 bus migration.
 
+## Artifact archive
+
+`slipstream archive` keeps every build of a migrated bus forever on dumb
+storage, written with rsync over ssh (no slipstream on the target):
+
+```toml
+[bus.archive]
+target = "nas:/volume1/slipstream"   # rsync destination; must exist
+engines = ["v8", "jsc", "chrome", "safari"]
+every_hours = 24                     # 168 for weekly
+at = "03:00"                         # optional, local time; whole days only
+bwlimit = "50m"                      # optional, rsync --bwlimit
+```
+
+Objects land under `objects/<aa>/<name>` and the exact manifest bytes under
+`manifests/<engine>/<key>/<sha256>.json`; deltas stay deltas, so restoring
+needs slipstream's delta reader. Objects are uploaded before manifests, so a
+manifest on the target never names a missing object, and nothing is ever
+deleted there. The per-engine cursor is `state/archive/<engine>.json`; a
+changed target refuses to start. rsync 3.2.4 or later (for `--fsync`) is
+needed on both ends, which macOS's own `/usr/bin/rsync` is not: put
+Homebrew's first on the service's `PATH`. Run `slipstream archive --once`
+for the first upload, then the daemon from `launchd/`.
+
 ## Measuring
 
 ```sh

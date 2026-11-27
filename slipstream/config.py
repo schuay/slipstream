@@ -284,6 +284,30 @@ class TransferRoute:
 
 
 @dataclass
+class ArchiveConfig:
+    """Where ``slipstream archive`` keeps every build, and how often it runs.
+
+    ``target`` is an rsync destination (``host:/path`` or a local path).
+    Without ``at`` a run starts ``every_hours`` after the last successful
+    one started; with it, at ``at`` local time on the day that interval
+    ends, so a late run does not push every later one back.
+    """
+
+    target: str
+    engines: list[str]
+    every_hours: float = 24
+    at: str | None = None  # "HH:MM", local time
+    bwlimit: str | None = None  # rsync --bwlimit
+
+    @property
+    def at_minutes(self) -> int | None:
+        if self.at is None:
+            return None
+        hours, minutes = self.at.split(":")
+        return int(hours) * 60 + int(minutes)
+
+
+@dataclass
 class BusConfig:
     root: Path
     sources: list[BusSource] = field(default_factory=list)
@@ -292,6 +316,7 @@ class BusConfig:
     transfer_handshake: float = 30
     transfer_inactivity: float = 120
     transfer_deadline: float = 3600
+    archive: ArchiveConfig | None = None
 
     def source_for(self, engine: str) -> BusSource | None:
         """The source an engine is benched from, or None if it is git-driven."""
@@ -939,6 +964,7 @@ def _parse_bus(data, engines: dict[str, EngineConfig]) -> BusConfig | None:
             "transfer_handshake",
             "transfer_inactivity",
             "transfer_deadline",
+            "archive",
         ),
         "[bus]",
     )
@@ -1055,7 +1081,55 @@ def _parse_bus(data, engines: dict[str, EngineConfig]) -> BusConfig | None:
         transfer_handshake=_positive(data, "transfer_handshake", 30, "[bus]"),
         transfer_inactivity=_positive(data, "transfer_inactivity", 120, "[bus]"),
         transfer_deadline=_positive(data, "transfer_deadline", 3600, "[bus]"),
+        archive=_parse_archive(data.get("archive"), engines, owners),
     )
+
+
+def _parse_archive(data, engines, owners) -> ArchiveConfig | None:
+    if data is None:
+        return None
+    section = "[bus.archive]"
+    if not isinstance(data, dict):
+        raise ValueError(f"{section} must be a table")
+    _reject_unknown(
+        data, ("target", "engines", "every_hours", "at", "bwlimit"), section
+    )
+    target = data.get("target")
+    if not isinstance(target, str) or not target:
+        raise ValueError(f"{section} needs a target")
+    names = data.get("engines")
+    if (
+        not isinstance(names, list)
+        or not names
+        or any(not isinstance(n, str) for n in names)
+        or len(set(names)) != len(names)
+    ):
+        raise ValueError(f"{section} engines must be a non-empty list of names")
+    for name in names:
+        if name not in engines:
+            raise ValueError(
+                f"{section} archives {name!r}, which has no [engines.{name}] table"
+            )
+        if name not in owners:
+            raise ValueError(
+                f"{section} archives {name!r}, which [bus] owners does not list; "
+                f"the archive reads migrated buses only"
+            )
+    every_hours = _positive(data, "every_hours", 24, section)
+    at = data.get("at")
+    if at is not None:
+        if not isinstance(at, str) or not re.fullmatch(
+            r"([01][0-9]|2[0-3]):[0-5][0-9]", at
+        ):
+            raise ValueError(f"{section} at must be HH:MM, got {at!r}")
+        if every_hours % 24:
+            raise ValueError(
+                f"{section} with at, every_hours must be a whole number of days"
+            )
+    bwlimit = data.get("bwlimit")
+    if bwlimit is not None and (not isinstance(bwlimit, str) or not bwlimit):
+        raise ValueError(f"{section} bwlimit must be an rsync --bwlimit string")
+    return ArchiveConfig(target, list(names), every_hours, at, bwlimit)
 
 
 def _parse_build(data: dict, engines: dict[str, EngineConfig]) -> BuildConfig:
