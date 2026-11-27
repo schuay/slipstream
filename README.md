@@ -123,7 +123,7 @@ storage, written with rsync over ssh (no slipstream on the target):
 
 ```toml
 [bus.archive]
-target = "nas:/volume1/slipstream"   # rsync destination; must exist
+target = "archive-host:/srv/slipstream"   # rsync destination; must exist
 engines = ["v8", "jsc", "chrome", "safari"]
 every_hours = 24                     # 168 for weekly
 at = "03:00"                         # optional, local time; whole days only

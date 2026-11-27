@@ -997,14 +997,14 @@ class TestArchiveConfig:
         archive = self._parse(
             tmp_path,
             {
-                "target": "nas:/volume1/slipstream",
+                "target": "archive-host:/srv/slipstream",
                 "engines": ["v8"],
                 "every_hours": 168,
                 "at": "03:00",
                 "bwlimit": "50m",
             },
         )
-        assert archive.target == "nas:/volume1/slipstream"
+        assert archive.target == "archive-host:/srv/slipstream"
         assert archive.engines == ["v8"]
         assert (archive.every_hours, archive.at, archive.bwlimit) == (
             168,
