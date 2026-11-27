@@ -547,20 +547,27 @@ class BusProtocol:
             if path.exists() and manifest_text(path) != stage.text:
                 raise BusError("conflicting existing publication")
             if cap_bytes is not None:
-                from .retention import OverCap, cap_message
-
-                incoming = sum(
-                    obj.bytes
-                    for obj in entry.objects()
-                    if not self.bus.object_path(obj.name).exists()
-                )
-                if self.bus.used_bytes() + incoming > cap_bytes:
-                    raise OverCap(cap_message(cap_bytes))
+                self._check_cap_locked(entry, cap_bytes)
             self._install_locked(stage)
             journal = {"state": "prepared", "identity": ident, "manifest": stage.text}
             self._write("acceptance", entry.engine, journal)
             self._recover_locked(entry.engine)
             return read(self.state_path("acceptance", entry.engine))
+
+    def _check_cap_locked(self, entry, cap_bytes):
+        from .retention import OverCap, cap_message
+
+        incoming = sum(
+            obj.bytes
+            for obj in entry.objects()
+            if not self.bus.object_path(obj.name).exists()
+        )
+        if self.bus.used_bytes() + incoming > cap_bytes:
+            raise OverCap(cap_message(cap_bytes))
+
+    def check_cap(self, entry, cap_bytes):
+        with self.lock():
+            self._check_cap_locked(entry, cap_bytes)
 
     def publish(self, entry):
         raise BusError("version 4 publication requires a protected staging transaction")

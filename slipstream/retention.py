@@ -121,7 +121,9 @@ def _derived_limits(cfg, bus: Bus, engine: str):
         except BusError:
             frontier = None
         # Derived keys are (release, inner commit); inner keys are (0, commit).
-        yield CommitKey(0, frontier.commit_id) if frontier else None
+        # The entry at the frontier stays too: a newly adopted release is
+        # first published on that same inner commit.
+        yield CommitKey(0, frontier.commit_id - 1) if frontier else None
 
 
 def holding_gate(cfg, root, engine: str, oldest: CommitKey | None) -> GateCursor | None:

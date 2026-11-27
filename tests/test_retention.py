@@ -150,7 +150,9 @@ class TestDeadPrefix:
         assert Policy(builder_box).prune(protocol) == {}, "no safari frontier yet"
         protocol.write_builder_state("safari", BuilderState(frontier=CommitKey(7, 2)))
         Policy(builder_box).prune(protocol)
-        assert keys(protocol, "jsc") == [3, 4]
+        # The entry at the frontier stays: a new release is first published
+        # on that same inner commit.
+        assert keys(protocol, "jsc") == [2, 3, 4]
 
     def test_freed_objects_are_swept(self, builder_box, protocol):
         first = publish(protocol, 1, {"out": b"one"})
@@ -275,7 +277,13 @@ class TestCap:
         # A destination at its cap, whatever its gates.
         dest = coordinator.routes["v8"][2]
         dest.policy = type(
-            "Capped", (), {"cap_bytes": 100, "prune": lambda self, bus: {}}
+            "Capped",
+            (),
+            {
+                "cap_bytes": 100,
+                "prune": lambda self, bus: {},
+                "release": lambda self, bus, *a, **k: {},
+            },
         )()
         assert not coordinator.run(once=True)
         record = read(src.state_path("transfer", "v8"))
@@ -390,16 +398,34 @@ class TestEarlyArchive:
         assert archiver.due(now)["v8"] > now + 500
 
 
-def test_the_endpoint_follows_local_config_not_the_peers_budget(tmp_path, monkeypatch):
-    """An endpoint started by a peer applies this machine's cap and gates."""
-    from test_transfer import remote_endpoint
-
+def test_a_bus_at_its_cap_releases_dead_entries_before_refusing(bencher_box, tmp_path):
+    """Without this a caught-up bencher at its cap refuses forever: its
+    consumer has nothing to bench, so nothing else would release."""
     src = BusProtocol(tmp_path / "src")
     owner = src.bus_uuid()
     src.migrate({"v8": owner})
     dst = BusProtocol(tmp_path / "dst")
     dst.bus_uuid()
     dst.migrate({"v8": owner})
+    bencher_box.bus.root = dst.root
+    bencher_box.bus.sources = [BusSource("local", str(dst.root), engines=["v8"])]
+    for key in (1, 2, 3):
+        publish(src, key, {"out": bytes([key]) * 600})
+    # Delivered under the old budget, then benched to the newest.
+    budget = LocalEndpoint(dst.root, 1e12)
+    for key in (1, 2):
+        with src.capture("v8", key) as stage:
+            budget.accept(stage)
+    bench_cursor(bencher_box, 2)
+    bencher_box.build.retain_gb = 1300 / 1e9  # 1200 held + 600 incoming > cap
+    gated = LocalEndpoint(dst.root, 1e12, policy=Policy(bencher_box))
+    with src.capture("v8", 3) as stage:
+        gated.accept(stage)  # refused if 1 were still held
+    # 1 went to make room, then 2, benched and no longer newest, after.
+    assert [k.commit_id for k in dst.keys("v8")] == [3]
+
+
+def _home_config(tmp_path, dst, gated):
     home = tmp_path / "home"
     (home / ".config" / "slipstream").mkdir(parents=True)
     (home / ".config" / "slipstream" / "config.toml").write_text(
@@ -407,14 +433,46 @@ def test_the_endpoint_follows_local_config_not_the_peers_budget(tmp_path, monkey
         f'[engines.v8]\nsrc_dir = "{tmp_path}"\n'
         f'[benchmarks.js3]\ndir = "{tmp_path}"\n'
         '[[run]]\nengine = "v8"\nsuite = "js3"\n'
-        f'[bus]\nroot = "{dst.root}"\nrelease_after = ["bench"]\n'
-        f'[[bus.sources]]\nname = "local"\nroot = "{dst.root}"\n'
+        f'[bus]\nroot = "{dst.root}"\n'
+        + ('release_after = ["bench"]\n' if gated else "")
+        + f'[[bus.sources]]\nname = "local"\nroot = "{dst.root}"\n'
         "[build]\nretain_gb = 0.000001\n"  # 1000 bytes
     )
-    monkeypatch.setenv("HOME", str(home))
+    return home
+
+
+@pytest.mark.parametrize("gated", [True, False])
+def test_the_endpoint_applies_local_gates_or_else_the_peers_budget(
+    tmp_path, monkeypatch, gated
+):
+    from test_transfer import remote_endpoint
+
+    from slipstream import transfer
+
+    src = BusProtocol(tmp_path / "src")
+    owner = src.bus_uuid()
+    src.migrate({"v8": owner})
+    dst = BusProtocol(tmp_path / "dst")
+    dst.bus_uuid()
+    dst.migrate({"v8": owner})
+    monkeypatch.setenv("HOME", str(_home_config(tmp_path, dst, gated)))
     publish(src, 1, {"out": b"q" * 2000})
     remote, _ = remote_endpoint(dst, monkeypatch)  # passes --retain-bytes 1e9
+    sent = []
+    real_send = transfer.Wire.send_objects
+    monkeypatch.setattr(
+        transfer.Wire,
+        "send_objects",
+        lambda self, stage, names: sent.append(names) or real_send(self, stage, names),
+    )
     with src.capture("v8", 1) as stage:
-        with pytest.raises(OSError, match="destination over cap"):
+        if gated:
+            with pytest.raises(OSError, match="destination over cap"):
+                remote.accept(stage)
+        else:
             remote.accept(stage)
-    assert dst.keys("v8") == []
+    if gated:
+        assert sent == [], "refused before any object was sent"
+        assert dst.keys("v8") == []
+    else:
+        assert [k.commit_id for k in dst.keys("v8")] == [1]

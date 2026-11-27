@@ -21,7 +21,7 @@ import time
 import threading
 from contextlib import contextmanager
 
-from .bus import BusError
+from .bus import BusError, Entry
 from .bus_protocol import BusProtocol, encoded, identity, read
 from .durability import FileLock, atomic_write
 from .models import CommitKey
@@ -190,11 +190,26 @@ class LocalEndpoint:
         self.policy = policy or Policy(retain_bytes=retain_bytes)
 
     def install(self, stage):
-        """Accept under this bus's cap, then release what is dead."""
+        """Accept under this bus's cap, then release what is dead.
+
+        Under a cap, what is already dead is released first: otherwise a bus
+        that sits at its cap refuses every accept, and nothing else on a
+        caught-up bencher would ever release.
+        """
+        if self.policy.cap_bytes is not None:
+            self.policy.release(self.protocol)
         receipt = self.protocol.accept(stage, self.policy.cap_bytes)
         self.policy.prune(self.protocol)
         self.protocol.sweep_blobs()
         return receipt
+
+    def check_cap(self, text):
+        """Refuse an over-cap publication before its objects are sent, so a
+        refused retry does not resend them. ``accept`` checks again."""
+        if self.policy.cap_bytes is None:
+            return
+        self.policy.release(self.protocol)
+        self.protocol.check_cap(Entry.from_json(text), self.policy.cap_bytes)
 
     def info(self):
         return self.protocol.ready()
@@ -380,6 +395,7 @@ def serve(
                         {"transfer_version": TRANSFER_VERSION, "receipt": receipt}
                     )
                     return
+                endpoint.check_cap(request["manifest"])
                 with endpoint.protocol.stage() as stage:
                     missing = stage.reuse(request["manifest"])
                     wire.json(

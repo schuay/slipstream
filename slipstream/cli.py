@@ -871,10 +871,10 @@ def bus_endpoint(
 ):
     """Serve one bounded transfer session; never takes the machine lock.
 
-    Retention follows this machine's own config ([bus] release_after and
-    [build] retain_gb); --retain-bytes, which a peer passes from its config,
-    is ignored then. A machine with no config file at all has no policy of
-    its own and keeps the peer's budget. Opens no database.
+    With [bus] release_after in this machine's config, retention follows its
+    gates and [build] retain_gb cap, and --retain-bytes, which a peer passes
+    from its config, is ignored. Without it (or without a config file) the
+    peer's budget applies as before. Opens no database.
     """
     import sys
     from .config import _DEFAULT_CONFIG_PATH
@@ -886,7 +886,9 @@ def bus_endpoint(
         cfg = None
     else:
         cfg = _load_config(None)
-        policy = Policy(cfg)
+        # Ungated, the peer's budget applies as it always did; gated, this
+        # machine's cap and gates do.
+        policy = Policy(cfg) if Policy(cfg).gated else Policy(retain_bytes=retain_bytes)
     if (
         cfg is not None
         and cfg.bus is not None

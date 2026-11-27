@@ -161,8 +161,9 @@ keeps only its newest build; the newest build of every engine is always kept,
 and so is every build a derived engine built here (Safari) has not packaged
 yet. `retain_gb` becomes a cap: at it the builder pauses and transfer accept
 refuses, retried until a gate frees something. `bus status` names the gate
-holding each engine's oldest build. `bus endpoint` applies the receiving
-machine's own config, so upgrade the receiving side first.
+holding each engine's oldest build. A receiving machine with
+`release_after` set applies its own gates and cap to transfers, ignoring the
+sender's budget; upgrade and configure the receiving side first.
 
 ## Measuring
 

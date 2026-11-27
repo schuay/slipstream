@@ -346,6 +346,13 @@ class TestSchedule:
             self._cfg(at="03:00", every_hours=168), state, self._at("2026-11-28 03:00")
         ) == self._at("2026-12-04 03:00")
 
+    def test_a_weekly_run_that_succeeds_after_midnight_does_not_drift(self):
+        # The 03:00 slot failed and retried until 00:30 the next day.
+        state = {"last_success_at": self._at("2026-11-28 00:30")}
+        assert next_run_at(
+            self._cfg(at="03:00", every_hours=168), state, self._at("2026-11-28 01:00")
+        ) == self._at("2026-12-04 03:00")
+
     def test_a_failure_retries_with_backoff(self):
         state = {
             "last_success_at": self._at("2026-11-27 03:00"),
@@ -401,3 +408,54 @@ def test_a_real_rsync_round_trip_into_a_local_directory(protocol, target):
         path = target / "objects" / obj.name[:2] / obj.name
         assert _sha(path.read_bytes()) == obj.sha256
         assert path.stat().st_mode & 0o777 == 0o444
+
+
+def test_a_failure_never_moves_the_cursor_back(protocol, target, monkeypatch):
+    publish(protocol, 1, {"out": b"one"})
+    archiver = make(protocol, target)
+    assert archiver.run(once=True)
+    publish(protocol, 2, {"out": b"two"})
+    other = make(protocol, target)
+    real = archiver.rsync
+
+    def overlapping(*args):
+        real(*args)
+        if args[-1].endswith("/manifests/"):
+            assert other.run_engine("v8")  # another writer finishes first
+
+    monkeypatch.setattr(archiver, "rsync", overlapping)
+    assert not archiver.run_engine("v8")
+    state = read_state(protocol, "v8")
+    assert state["cursor"] == "2" and state["last_success_at"]
+    assert "cursor moved" in state["last_error"]
+
+
+def test_the_daemon_survives_an_unreadable_state_file(protocol, target, monkeypatch):
+    publish(protocol, 1, {"out": b"one"})
+    archiver = make(protocol, target)
+    path = protocol.state_path("archive", "v8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{")
+    assert not archiver.run_engine("v8")
+    calls = []
+    monkeypatch.setattr(archiver, "wait", lambda secs, stop: None)
+    monkeypatch.setattr(archiver, "check_targets", lambda: None)
+    archiver.run(should_stop=lambda: calls.append(1) or len(calls) > 3)
+    assert any("unreadable archive state" in str(m) for m in archiver.logs)
+
+
+def test_the_backoff_holds_when_the_failure_cannot_be_recorded(
+    protocol, target, monkeypatch
+):
+    publish(protocol, 1, {"out": b"one"})
+    runner = FakeRsync()
+    runner.fail["/objects/"] = "connection reset"
+    archiver = make(protocol, target, runner=runner)
+
+    def unwritable(engine, state):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(archiver, "_save_locked", unwritable)
+    assert not archiver.run_engine("v8")
+    now = time.time()
+    assert archiver.due(now)["v8"] >= now + 50

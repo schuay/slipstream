@@ -114,7 +114,9 @@ def next_run_at(cfg: ArchiveConfig, state: dict | None, now: float) -> float:
     A failed run is retried at ``retry_after``, ahead of the schedule.
     Without ``at``: ``every_hours`` after the last successful run started.
     With it: at ``at`` today when nothing has succeeded yet, and otherwise
-    at ``at`` on the day the interval since the last success ends.
+    ``every_hours`` after the slot the last success served (the latest
+    ``at`` at or before its start), so a run that succeeds late, even past
+    midnight after retries, moves no later run.
     """
     state = state or {}
     last = state.get("last_success_at")
@@ -123,11 +125,19 @@ def next_run_at(cfg: ArchiveConfig, state: dict | None, now: float) -> float:
         return retry
     if cfg.at_minutes is None:
         return now if last is None else last + cfg.every_hours * 3600
-    day = datetime.fromtimestamp(now if last is None else last)
-    if last is not None:
-        day += timedelta(hours=cfg.every_hours)
     hours, minutes = divmod(cfg.at_minutes, 60)
-    return day.replace(hour=hours, minute=minutes, second=0, microsecond=0).timestamp()
+
+    def at_on(day: datetime) -> datetime:
+        return day.replace(hour=hours, minute=minutes, second=0, microsecond=0)
+
+    if last is None:
+        return at_on(datetime.fromtimestamp(now)).timestamp()
+    started = datetime.fromtimestamp(last)
+    slot = at_on(started)
+    if slot > started:
+        slot -= timedelta(days=1)
+    # Re-anchored to ``at`` local time, so a DST change moves nothing.
+    return at_on(slot + timedelta(hours=cfg.every_hours)).timestamp()
 
 
 def retry_delay(failures: int) -> float:
@@ -145,6 +155,9 @@ class Archiver:
         self.protocol = BusProtocol(cfg.bus.root)
         self.bus = Bus(cfg.bus.root)
         self.policy = Policy(cfg)
+        # Backoff kept in memory too, for when the state cannot be written.
+        self._retry: dict[str, float] = {}
+        self._failures: dict[str, int] = {}
         ready = self.protocol.ready()
         self.protocol.expected_uuid = ready["uuid"]
         for engine in self.archive.engines:
@@ -269,9 +282,9 @@ class Archiver:
     def run_engine(self, engine: str) -> bool:
         """Archive everything above the cursor. Returns False on failure."""
         started = time.time()
-        state = self.state(engine)
-        cursor = CommitKey.parse(state["cursor"]) if state.get("cursor") else None
         try:
+            state = self.state(engine)
+            cursor = CommitKey.parse(state["cursor"]) if state.get("cursor") else None
             # The stage is closed outside the bus lock: closing takes it.
             stage = self.protocol.stage()
             with stage:
@@ -310,15 +323,11 @@ class Archiver:
                     )
                     self._save_locked(engine, current)
         except (OSError, BusError, ArchiveError, ValueError) as exc:
-            state["failures"] = state.get("failures", 0) + 1
-            state["last_error"] = str(exc)
-            state["retry_after"] = time.time() + retry_delay(state["failures"])
             self.log(error(f"{engine}: archive run failed: {exc}"))
-            try:
-                self.save(engine, state)
-            except OSError as save_exc:
-                self.log(warning(f"{engine}: failure not recorded: {save_exc}"))
+            self._record_failure(engine, exc)
             return False
+        self._retry.pop(engine, None)
+        self._failures.pop(engine, None)
         if skipped is not None and (cursor is None or skipped > cursor):
             self.log(
                 warning(
@@ -335,6 +344,27 @@ class Archiver:
             )
         self.after_batch(engine, archived)
         return True
+
+    def _record_failure(self, engine: str, exc: Exception) -> None:
+        """Record a failed run on the state as it is now, never on the copy
+        the run started from: another writer may have advanced the cursor.
+        The backoff also holds in memory, for when the record cannot be
+        written either."""
+        failures = self._failures.get(engine, 0) + 1
+        try:
+            with self.protocol.lock():
+                current = self.state(engine)
+                failures = current.get("failures", 0) + 1
+                current.update(
+                    failures=failures,
+                    last_error=str(exc),
+                    retry_after=time.time() + retry_delay(failures),
+                )
+                self._save_locked(engine, current)
+        except (OSError, BusError, ArchiveError) as save_exc:
+            self.log(warning(f"{engine}: failure not recorded: {save_exc}"))
+        self._failures[engine] = failures
+        self._retry[engine] = time.time() + retry_delay(failures)
 
     def after_batch(self, engine: str, archived: list) -> None:
         """The archive gate advanced: release what it was holding."""
@@ -369,8 +399,14 @@ class Archiver:
     def due(self, now: float, *, announce: bool = False) -> dict[str, float]:
         due = {}
         for engine in self.archive.engines:
-            state = self.state(engine)
-            at = next_run_at(self.archive, state, now)
+            try:
+                state = self.state(engine)
+            except ArchiveError as exc:
+                if announce:
+                    self.log(error(f"{engine}: {exc}"))
+                due[engine] = now + 60
+                continue
+            at = max(next_run_at(self.archive, state, now), self._retry.get(engine, 0))
             if at > now and self.early(engine, state, now):
                 if announce:
                     self.log(
