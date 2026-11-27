@@ -96,6 +96,10 @@ def parse_key_stem(stem: str) -> CommitKey | None:
         return None
 
 
+# A release point meaning every entry is dead (no gate applies), newest aside.
+RELEASE_ALL = object()
+
+
 class BusError(RuntimeError):
     """The bus root holds something this version cannot read."""
 
@@ -473,6 +477,9 @@ class BuilderState:
     failed_total: int = 0
     safari_acquisition_error: str | None = None
     publishing_paused_by_floor: bool = False
+    # Gated retention only: the bus is at its [build] retain_gb cap, so the
+    # builder waits for a gate to release something rather than evicting.
+    publishing_paused_by_cap: bool = False
     last_error: str | None = None
     stalled_since: float | None = None
     # When a stalled engine may be attempted again. Persisted rather than held
@@ -751,8 +758,15 @@ class Bus:
 
     # --- retention ---
 
-    def prune(self, retain_bytes: float, keep=None) -> dict[str, list[CommitKey]]:
+    def prune(
+        self, retain_bytes: float | None, keep=None, *, release=None
+    ) -> dict[str, list[CommitKey]]:
         """Apply one artifact budget across every engine in this bus.
+
+        With ``release`` (engine -> the highest key every applicable gate has
+        passed, ``RELEASE_ALL`` when no gate applies, None when nothing may
+        go), the budget is ignored and every dead entry is dropped instead:
+        the prefix of each topic at or below its release point (D018).
 
         Evict the oldest eligible build by built_at, taking only the oldest
         key of each engine so every surviving topic remains contiguous.
@@ -760,11 +774,24 @@ class Bus:
         Preserve each topic's newest key (its build frontier), and, for a
         just-published retry, the whole suffix starting at ``keep=(engine, key)``.
         These protections can exceed a budget smaller than the required blobs.
-        The caller holds the machine lock, records drops and sweeps blobs.
+        The caller records drops and sweeps blobs. On a migrated bus the
+        protocol prunes under the bus lock alone: every reader of objects
+        (packaging, provisioning, transfer) first hardlinks what it needs
+        into private staging under that lock. A legacy bus needs the machine
+        lock held.
         """
         if protocol := self.protocol:
-            return protocol.prune(retain_bytes, keep)
+            return protocol.prune(retain_bytes, keep, release=release)
         topics = {engine: self.entries(engine) for engine in self.engines()}
+        floors = {
+            engine: entries[-1].key for engine, entries in topics.items() if entries
+        }
+        if keep is not None:
+            engine, key = keep
+            if engine in floors:
+                floors[engine] = min(floors[engine], CommitKey.of(key))
+        if release is not None:
+            return self._prune_dead(topics, floors, release)
         refs: Counter[str] = Counter()
         sizes: dict[str, int] = {}
         for entries in topics.values():
@@ -776,13 +803,6 @@ class Bus:
             refs[obj.name] += 1
             sizes[obj.name] = obj.bytes
         used = sum(sizes.values())
-        floors = {
-            engine: entries[-1].key for engine, entries in topics.items() if entries
-        }
-        if keep is not None:
-            engine, key = keep
-            floors[engine] = min(floors[engine], CommitKey.of(key))
-
         candidates = []
 
         def offer(engine, index):
@@ -807,6 +827,35 @@ class Bus:
                     used -= sizes[name]
             offer(engine, index + 1)
         return dropped
+
+    def _prune_dead(self, topics, floors, release) -> dict[str, list[CommitKey]]:
+        dropped: dict[str, list[CommitKey]] = {}
+        for engine, entries in topics.items():
+            point = release.get(engine)
+            if point is None:
+                continue
+            for entry in entries:
+                if entry.key >= floors[engine]:
+                    break
+                if point is not RELEASE_ALL and entry.key > point:
+                    break
+                self._delete_pruned(engine, entry.key)
+                dropped.setdefault(engine, []).append(entry.key)
+        return dropped
+
+    def used_bytes(self, *, readonly: bool = False) -> int:
+        """Bytes of every distinct object the manifests and adopted Safari
+        packages name: what retention's budget and cap count."""
+        sizes: dict[str, int] = {}
+        for engine in self.engines():
+            for entry in self.entries(engine, readonly=readonly):
+                for name, obj in distinct_objects(
+                    entry.all_blobs, entry.version
+                ).items():
+                    sizes[name] = obj.bytes
+        for obj in self.adopted_objects():
+            sizes[obj.name] = obj.bytes
+        return sum(sizes.values())
 
     def _delete_pruned(self, engine, key):
         self.entry_path(engine, key).unlink(missing_ok=True)

@@ -510,7 +510,13 @@ class BusProtocol:
             ):
                 raise BusError(f"corrupt existing object: {obj.name}")
 
-    def accept(self, stage):
+    def accept(self, stage, cap_bytes=None):
+        """Install a staged publication from another bus.
+
+        With ``cap_bytes`` (gated retention), refuse with a retryable
+        ``OverCap`` when the objects this bus does not hold yet would take
+        its footprint past the cap; nothing live is evicted to make room.
+        """
         ident = identity(stage.text)
         entry = Entry.from_json(stage.text)
         if entry != stage.entry:
@@ -540,6 +546,16 @@ class BusProtocol:
             path = self.bus.entry_path(entry.engine, entry.key)
             if path.exists() and manifest_text(path) != stage.text:
                 raise BusError("conflicting existing publication")
+            if cap_bytes is not None:
+                from .retention import OverCap, cap_message
+
+                incoming = sum(
+                    obj.bytes
+                    for obj in entry.objects()
+                    if not self.bus.object_path(obj.name).exists()
+                )
+                if self.bus.used_bytes() + incoming > cap_bytes:
+                    raise OverCap(cap_message(cap_bytes))
             self._install_locked(stage)
             journal = {"state": "prepared", "identity": ident, "manifest": stage.text}
             self._write("acceptance", entry.engine, journal)
@@ -582,7 +598,7 @@ class BusProtocol:
             state.updated_at = time.time()
             atomic_write(self.bus.bench_state_path(engine), state_to_json(state))
 
-    def prune(self, retain_bytes, keep=None):
+    def prune(self, retain_bytes, keep=None, *, release=None):
         # Select with the existing shared-object budget algorithm on a metadata
         # snapshot; its unlink calls are redirected to collecting candidates.
         with self.lock():
@@ -593,7 +609,9 @@ class BusProtocol:
                 def _delete_pruned(inner, engine, key):
                     candidates.setdefault(engine, []).append(CommitKey.of(key))
 
-            SelectionBus(self.root, _raw=True).prune(retain_bytes, keep)
+            SelectionBus(self.root, _raw=True).prune(
+                retain_bytes, keep, release=release
+            )
             for engine, keys in candidates.items():
                 for start in range(0, len(keys), 256):
                     state = read(self.state_path("retention", engine))

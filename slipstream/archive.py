@@ -31,7 +31,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta
 
-from .bus import BusError, Entry
+from .bus import Bus, BusError, Entry
 from .bus_protocol import (
     BusProtocol,
     digest,
@@ -43,6 +43,7 @@ from .bus_protocol import (
 from .config import ArchiveConfig, Config
 from .durability import atomic_write
 from .models import CommitKey
+from .retention import Policy
 from .service_logging import error, success, warning
 
 STATE_VERSION = 1
@@ -142,6 +143,8 @@ class Archiver:
         self.log = log
         self.runner = runner
         self.protocol = BusProtocol(cfg.bus.root)
+        self.bus = Bus(cfg.bus.root)
+        self.policy = Policy(cfg)
         ready = self.protocol.ready()
         self.protocol.expected_uuid = ready["uuid"]
         for engine in self.archive.engines:
@@ -315,7 +318,6 @@ class Archiver:
                 self.save(engine, state)
             except OSError as save_exc:
                 self.log(warning(f"{engine}: failure not recorded: {save_exc}"))
-            self.after_failure(engine, exc)
             return False
         if skipped is not None and (cursor is None or skipped > cursor):
             self.log(
@@ -335,18 +337,49 @@ class Archiver:
         return True
 
     def after_batch(self, engine: str, archived: list) -> None:
-        """Hook for what follows an advanced cursor."""
-
-    def after_failure(self, engine: str, exc: Exception) -> None:
-        """Hook for what follows a failed run."""
+        """The archive gate advanced: release what it was holding."""
+        if self.policy.gated:
+            self.policy.release(self.bus, self.log, label=f"{engine}: ")
 
     # --- the loop ---
 
-    def due(self, now: float) -> dict[str, float]:
-        return {
-            engine: next_run_at(self.archive, self.state(engine), now)
-            for engine in self.archive.engines
-        }
+    def early(self, engine: str, state: dict, now: float) -> bool:
+        """Run ahead of schedule: the builder is paused at the cap and this
+        engine's oldest live entry is held by the archive gate. Nothing else
+        moves a run forward, and a failed run still waits out its backoff."""
+        from .retention import holding_gate
+
+        if not self.policy.gated:
+            return False
+        if state.get("last_error") and (state.get("retry_after") or 0) > now:
+            return False
+        try:
+            paused = any(
+                self.bus.read_builder_state(name).publishing_paused_by_cap
+                for name in self.bus.engines()
+            )
+            if not paused:
+                return False
+            keys = self.bus.keys(engine)
+        except (OSError, BusError):
+            return False
+        held = holding_gate(self.cfg, self.bus.root, engine, keys[0] if keys else None)
+        return held is not None and held.gate == "archive"
+
+    def due(self, now: float, *, announce: bool = False) -> dict[str, float]:
+        due = {}
+        for engine in self.archive.engines:
+            state = self.state(engine)
+            at = next_run_at(self.archive, state, now)
+            if at > now and self.early(engine, state, now):
+                if announce:
+                    self.log(
+                        f"{engine}: builder paused at the cap with the archive "
+                        f"holding; running early"
+                    )
+                at = now
+            due[engine] = at
+        return due
 
     def run(self, *, once: bool = False, should_stop=lambda: False) -> bool:
         """Run when due; with ``once``, run every engine now and return
@@ -357,7 +390,7 @@ class Archiver:
             return all([self.run_engine(e) for e in self.archive.engines])
         while not should_stop():
             now = time.time()
-            for engine, at in self.due(now).items():
+            for engine, at in self.due(now, announce=True).items():
                 if should_stop():
                     break
                 if at <= now:

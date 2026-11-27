@@ -27,6 +27,7 @@ from .durability import FileLock, atomic_write
 from .models import CommitKey
 from .notifications import Subscriptions, WorkSchedule
 from .remote import SSH_OPTIONS, quote_remote
+from .retention import CAP_REFUSAL, Policy
 
 
 TRANSFER_VERSION = 2
@@ -182,9 +183,18 @@ class Wire:
 
 
 class LocalEndpoint:
-    def __init__(self, root, retain_bytes, expected_uuid=None):
+    def __init__(self, root, retain_bytes, expected_uuid=None, policy=None):
         self.protocol = BusProtocol(root, expected_uuid)
         self.retain_bytes = retain_bytes
+        # This machine's retention policy; a bare budget when none is given.
+        self.policy = policy or Policy(retain_bytes=retain_bytes)
+
+    def install(self, stage):
+        """Accept under this bus's cap, then release what is dead."""
+        receipt = self.protocol.accept(stage, self.policy.cap_bytes)
+        self.policy.prune(self.protocol)
+        self.protocol.sweep_blobs()
+        return receipt
 
     def info(self):
         return self.protocol.ready()
@@ -218,10 +228,7 @@ class LocalEndpoint:
     def accept(self, capture):
         if capture.protocol.root == self.protocol.root:
             # A pull already received directly into destination-owned staging.
-            receipt = self.protocol.accept(capture)
-            self.protocol.prune(self.retain_bytes)
-            self.protocol.sweep_blobs()
-            return receipt
+            return self.install(capture)
         # Link/copy into destination-owned staging before touching its bus.
         with self.protocol.stage() as stage:
             receipt = self.protocol.receipt(capture.entry.engine)
@@ -236,10 +243,7 @@ class LocalEndpoint:
                 dest = stage.path / (obj.name + ".partial")
                 shutil.copyfile(capture.paths[obj.name], dest)
                 stage.paths[obj.name] = dest
-            receipt = self.protocol.accept(stage)
-        self.protocol.prune(self.retain_bytes)
-        self.protocol.sweep_blobs()
-        return receipt
+            return self.install(stage)
 
 
 class RemoteEndpoint:
@@ -343,9 +347,17 @@ class RemoteEndpoint:
 
 
 def serve(
-    root, reader, writer, retain_bytes, *, deadline=3600, inactivity=120, handshake=30
+    root,
+    reader,
+    writer,
+    retain_bytes,
+    *,
+    deadline=3600,
+    inactivity=120,
+    handshake=30,
+    policy=None,
 ):
-    endpoint = LocalEndpoint(root, retain_bytes)
+    endpoint = LocalEndpoint(root, retain_bytes, policy=policy)
     wire = Wire(
         reader, writer, total=deadline, inactivity=inactivity, handshake=handshake
     )
@@ -375,9 +387,7 @@ def serve(
                     )
                     wire.receive_objects(stage)
                     with disconnected_client(reader):
-                        receipt = endpoint.protocol.accept(stage)
-                        endpoint.protocol.prune(retain_bytes)
-                        endpoint.protocol.sweep_blobs()
+                        receipt = endpoint.install(stage)
                 wire.json(receipt)
             elif op == "capture":
                 with endpoint.protocol.capture(
@@ -420,6 +430,7 @@ class Coordinator:
         self.failed = set()
         self.unsaved = set()
         self.health_generation = {}
+        self.policy = Policy(cfg)
         self.options = {
             "handshake": cfg.bus.transfer_handshake,
             "inactivity": cfg.bus.transfer_inactivity,
@@ -430,7 +441,10 @@ class Coordinator:
             def endpoint(spec, expected_uuid):
                 return (
                     LocalEndpoint(
-                        spec.local_root, cfg.build.retain_gb * 1e9, expected_uuid
+                        spec.local_root,
+                        cfg.build.retain_gb * 1e9,
+                        expected_uuid,
+                        policy=self.policy,
                     )
                     if spec.is_local
                     else RemoteEndpoint(
@@ -520,6 +534,10 @@ class Coordinator:
         self.save(engine, record)
         if pending["op"] == "skip":
             self.log(warning(f"{engine}: skipped unavailable history through {key}"))
+        route, _, _ = self.routes[engine]
+        if self.policy.gated and route.source.is_local:
+            # The transfer gate just advanced on this bus.
+            self.policy.release(self.local, self.log, label=f"{engine}: ")
 
     def step(self, engine, record, *, once=False):
         route, source, dest = self.routes[engine]
@@ -724,6 +742,13 @@ class Coordinator:
                                 else self.retry_delay(record, artifact=False),
                             )
                         except (OSError, EOFError, BusError, ValueError) as exc:
+                            # A destination at its cap refuses until a gate
+                            # there advances: report the change, not each retry.
+                            repeated = (
+                                isinstance(exc, OSError)
+                                and str(exc).startswith(CAP_REFUSAL)
+                                and record.get("last_error") == str(exc)
+                            )
                             record["last_error"] = str(exc)
                             record["failures"] = record.get("failures", 0) + 1
                             delay = min(60, 2 ** min(record["failures"] - 1, 6))
@@ -732,7 +757,8 @@ class Coordinator:
                                 record["conflict"] = True
                                 self.failed.add(engine)
                             self.save_failure(engine, record)
-                            self.log(error(f"{engine}: {exc}"))
+                            if not repeated:
+                                self.log(error(f"{engine}: {exc}"))
                             schedule.finished(
                                 engine,
                                 generation,

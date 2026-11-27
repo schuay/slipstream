@@ -660,3 +660,32 @@ def test_archive_rows(env):
     assert "cursor 1, backlog 2" in row and "OVERDUE" in row and "40.0h ago" in row
     assert "  archive error: rsync exited 12" in lines
     assert any("archive skipped through 0" in line for line in lines)
+
+
+def test_retention_rows_name_the_holding_gate_and_the_cap(env):
+    from test_archive import publish as publish_v4
+
+    from slipstream.bus_protocol import BusProtocol
+
+    protocol = BusProtocol(env.bus.root)
+    owner = protocol.bus_uuid()
+    protocol.migrate({"v8": owner})
+    for key in (1, 2):
+        publish_v4(protocol, key, {"out": f"b{key}".encode()})
+    env.cfg.bus.release_after = ["bench"]
+    env.cfg.runs = [r for r in env.cfg.runs if r.engine == "v8"]
+    env.cfg.build.retain_gb = 4 / 1e9
+    protocol.write_builder_state("v8", BuilderState(publishing_paused_by_cap=True))
+    report, st = _status(env)
+    assert st.retention["live_entries"] == 2
+    assert st.retention["holding"]["gate"] == "bench"
+    lines = []
+    render(report, lines.append)
+    assert any(line.startswith("artifacts:") and "AT CAP" in line for line in lines), (
+        lines
+    )
+    assert "  v8: builder paused at the cap" in lines
+    assert "  oldest live entry held by bench: cursor none" in lines
+    assert any(
+        line.startswith("  retention after bench: 2 live entries") for line in lines
+    )

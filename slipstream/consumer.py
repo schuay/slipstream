@@ -48,6 +48,7 @@ from .collector import BenchCollector, BenchOutcome, outcome_status
 from .config import BusSource, Config, EngineConfig
 from .delta import BlockReader, DeltaMismatch, reconstruct
 from .models import CommitKey
+from .retention import Policy
 
 GB = 1_000_000_000
 
@@ -190,6 +191,7 @@ class BusConsumer:
         if cfg.bus is None:
             raise ConsumerError("no [bus] section in config")
         self.bus = Bus(cfg.bus.root)
+        self.policy = Policy(cfg)
         if cfg.bus.owners and (
             not self.bus.protocol
             or self.bus.protocol.ready()["owners"] != cfg.bus.owners
@@ -223,6 +225,10 @@ class BusConsumer:
 
             with protocol.lock():
                 atomic_write(self.cursor_file(source, engine), f"{CommitKey.of(key)}\n")
+            if self.policy.gated:
+                # The bench gate just advanced. Outside the machine lock, as
+                # the transfer endpoint already prunes (D018).
+                self.policy.release(self.bus, self.log, label=f"{engine}: ")
         else:
             write_cursor(self.cursor_file(source, engine), key)
 

@@ -317,6 +317,9 @@ class BusConfig:
     transfer_inactivity: float = 120
     transfer_deadline: float = 3600
     archive: ArchiveConfig | None = None
+    # Gates an entry must pass before retention frees it (D018). Empty: the
+    # [build] retain_gb byte budget evicts the oldest builds, as before.
+    release_after: list[str] = field(default_factory=list)
 
     def source_for(self, engine: str) -> BusSource | None:
         """The source an engine is benched from, or None if it is git-driven."""
@@ -574,6 +577,34 @@ class Config:
             )
         return runs
 
+    def release_gates(self, engine: str) -> list[str]:
+        """The declared release gates that apply to ``engine`` on this bus.
+
+        ``bench`` when a [[run]] names the engine and a [[bus.sources]] entry
+        claims it; ``transfer`` when an outbound route from this bus carries
+        it; ``archive`` when [bus.archive] lists it. An engine none of them
+        applies to is dead as soon as it is published, newest entry aside.
+        """
+        bus = self.bus
+        if bus is None:
+            return []
+        gates = []
+        for gate in bus.release_after:
+            if gate == "bench":
+                applies = bus.source_for(engine) is not None and any(
+                    r.engine == engine for r in self.runs
+                )
+            elif gate == "transfer":
+                applies = any(
+                    route.source.is_local and engine in route.engines
+                    for route in bus.routes
+                )
+            else:
+                applies = bus.archive is not None and engine in bus.archive.engines
+            if applies:
+                gates.append(gate)
+        return gates
+
     def require_bot_name(self) -> str:
         if not self.bot_name:
             raise ValueError(
@@ -790,7 +821,7 @@ def load_config(user_config_path: Path | None = None) -> Config:
     delivery_cfg = DeliveryConfig(**delivery_data)
     validate_delivery_identities(push_cfg, relays)
 
-    return Config(
+    cfg = Config(
         config_path=path.absolute(),
         out_dir=out_dir,
         results_dir=results_dir,
@@ -806,6 +837,8 @@ def load_config(user_config_path: Path | None = None) -> Config:
         bench=bench_cfg,
         delivery=delivery_cfg,
     )
+    validate_release_after(cfg)
+    return cfg
 
 
 def _reject_unknown(data: dict, allowed, section: str, settable=None) -> None:
@@ -965,6 +998,7 @@ def _parse_bus(data, engines: dict[str, EngineConfig]) -> BusConfig | None:
             "transfer_inactivity",
             "transfer_deadline",
             "archive",
+            "release_after",
         ),
         "[bus]",
     )
@@ -1082,7 +1116,43 @@ def _parse_bus(data, engines: dict[str, EngineConfig]) -> BusConfig | None:
         transfer_inactivity=_positive(data, "transfer_inactivity", 120, "[bus]"),
         transfer_deadline=_positive(data, "transfer_deadline", 3600, "[bus]"),
         archive=_parse_archive(data.get("archive"), engines, owners),
+        release_after=_parse_release_after(data.get("release_after", [])),
     )
+
+
+RELEASE_GATES = ("bench", "transfer", "archive")
+
+
+def _parse_release_after(value) -> list[str]:
+    if not isinstance(value, list) or any(not isinstance(g, str) for g in value):
+        raise ValueError("[bus] release_after must be a list of gate names")
+    unknown = sorted(set(value) - set(RELEASE_GATES))
+    if unknown:
+        raise ValueError(
+            f"[bus] release_after has unknown gates {unknown}; "
+            f"known gates are {list(RELEASE_GATES)}"
+        )
+    if len(set(value)) != len(value):
+        raise ValueError("[bus] release_after names a gate twice")
+    return list(value)
+
+
+def validate_release_after(cfg: Config) -> None:
+    """Refuse a declared gate that applies to no engine: it is a typo or a
+    forgotten section, and silently releasing on fewer gates frees what the
+    operator meant to keep."""
+    if cfg.bus is None:
+        return
+    for gate in cfg.bus.release_after:
+        if not any(gate in cfg.release_gates(name) for name in cfg.engines):
+            raise ValueError(
+                f"[bus] release_after gate {gate!r} applies to no engine: "
+                + {
+                    "bench": "no engine has both a [[run]] entry and a bus source",
+                    "transfer": "no [[bus.routes]] entry leaves this bus",
+                    "archive": "there is no [bus.archive] section",
+                }[gate]
+            )
 
 
 def _parse_archive(data, engines, owners) -> ArchiveConfig | None:

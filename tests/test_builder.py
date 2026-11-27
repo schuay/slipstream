@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from slipstream import host
-from slipstream.builder import BuildError, Builder, build_cfg_hash, package
+from slipstream.builder import GB, BuildError, Builder, build_cfg_hash, package
 from slipstream.bus import ENTRY_VERSION, Bus
 from slipstream.collector import BuildStepError
 from slipstream.config import DeltaConfig, EngineConfig
@@ -1850,3 +1850,31 @@ def test_fetch_refreshes_backlog(counted_builder):
     assert "2 builds including this one" in starts[-2]
     assert "1 build including this one" in starts[-1]
     assert b.scans == [101, 120]
+
+
+class TestCapPause:
+    """Under gated retention the budget is a cap: at it, the builder waits."""
+
+    def test_pauses_at_the_cap_and_resumes_below_it(self, builder, monkeypatch):
+        full = {"value": True}
+        monkeypatch.setattr(
+            builder.policy, "over_cap", lambda bus: (full["value"], 600 * GB)
+        )
+        result = builder.build_one("v8")
+        assert result.key is None and not result.published
+        assert builder.built == []
+        state = builder.bus.read_builder_state("v8")
+        assert state.publishing_paused_by_cap and "cap" in state.last_error
+        builder.build_one("v8")
+        entering = [m for m in builder.logs if "waiting for a release gate" in m]
+        assert len(entering) == 1, "logged on entering the state only"
+
+        full["value"] = False
+        assert builder.build_one("v8").published
+        state = builder.bus.read_builder_state("v8")
+        assert not state.publishing_paused_by_cap and state.last_error is None
+        assert any("below the cap again" in m for m in builder.logs)
+
+    def test_without_gates_there_is_no_cap(self, builder):
+        assert builder.policy.over_cap(builder.bus) == (False, 0)
+        assert builder.build_one("v8").published

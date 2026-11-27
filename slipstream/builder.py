@@ -48,6 +48,7 @@ from .config import Config, DeltaConfig, EngineConfig
 from .delta import DeltaError
 from .lock import MachineLock
 from .models import CommitKey
+from .retention import Policy
 from .resolve import (
     BuildJob,
     DerivedResolver,
@@ -485,6 +486,7 @@ class Builder:
         self.collector = BenchCollector(cfg, verbose=verbose, role="build")
         self.store = self.collector.store
         self.lock = MachineLock("build")
+        self.policy = Policy(cfg)
         self.log = log or (lambda msg: None)
         self.identity = {"bot": cfg.bot_name, **host.identity()}
         self._resolvers: dict[str, Resolver] = {}
@@ -728,6 +730,9 @@ class Builder:
         # Enforce the cap even while idle, stalled or below the disk floor.
         self._retain(engine_name, state)
 
+        if self._paused_by_cap(engine_name, state):
+            return BuildResult()
+
         if self.free_gb() < self.cfg.build.min_free_gb:
             # The artifact cap is fixed; unrelated disk use can still pause us.
             state.publishing_paused_by_floor = True
@@ -856,8 +861,35 @@ class Builder:
         )
         return BuildResult(key=key, published=True)
 
+    def _paused_by_cap(self, engine_name: str, state: BuilderState) -> bool:
+        """Under gated retention, wait at the cap instead of evicting.
+
+        Logged on entering and leaving the state only: the pause can last
+        as long as a stopped consumer or an unreachable archive target.
+        """
+        full, used = self.policy.over_cap(self.bus)
+        if full:
+            if not state.publishing_paused_by_cap:
+                self.log(
+                    warning(
+                        f"{engine_name}: paused, artifacts at the "
+                        f"{self.cfg.build.retain_gb:g}GB cap ({used / GB:.0f}GB); "
+                        f"waiting for a release gate"
+                    )
+                )
+            state.publishing_paused_by_cap = True
+            state.last_error = f"artifacts at the {self.cfg.build.retain_gb:g}GB cap"
+            state.in_flight = None
+            self._publish_state(engine_name, state)
+            return True
+        if state.publishing_paused_by_cap:
+            self.log(f"{engine_name}: below the cap again, resuming")
+            state.publishing_paused_by_cap = False
+            state.last_error = None
+        return False
+
     def _retain(self, engine_name: str, state: BuilderState) -> None:
-        dropped = self.bus.prune(self.cfg.build.retain_gb * GB)
+        dropped = self.policy.prune(self.bus)
         # Sweep even with no drops: interrupted publishes and retries orphan
         # objects too. Reclaim before writing state in case the disk is full.
         self.bus.gc()
@@ -878,6 +910,20 @@ class Builder:
                     or protocol.ready()["owners"][name] == protocol.ready()["uuid"]
                 ):
                     self._publish_state(name, retained_state)
+        if protocol := self.bus.protocol:
+            # Under gated retention transfer, the archive and the consumer
+            # prune too. The bus's own retention record has what they dropped.
+            from .bus_protocol import read
+
+            recorded = read(protocol.state_path("retention", engine_name)).get(
+                "highest_dropped"
+            )
+            if recorded:
+                state.highest_dropped = max(
+                    k
+                    for k in (state.highest_dropped, CommitKey.parse(recorded))
+                    if k is not None
+                )
 
     @staticmethod
     def _in_flight(job: BuildJob, phase: str) -> dict:

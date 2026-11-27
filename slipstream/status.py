@@ -70,6 +70,8 @@ class EngineStatus:
     error: str | None = None
     transfer: dict = field(default_factory=dict)
     archive: dict = field(default_factory=dict)
+    # Gated retention: what keeps the oldest live entry, and what is live.
+    retention: dict = field(default_factory=dict)
     peer_age: float | None = None
 
 
@@ -81,6 +83,8 @@ class BusStatus:
     lock_waiters: list[str] = field(default_factory=list)
     paused_until: float | None = None
     window: WindowStatus | None = None
+    # Gated retention: footprint against the cap, and builders paused at it.
+    cap: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -269,6 +273,8 @@ def collect_status(
     holder = report.window.holder
     report.lock_holder = str(holder) if holder else None
     report.lock_waiters = report.window.waiters
+    if bus and bus.protocol and cfg.bus.release_after:
+        report.cap = _cap_status(cfg, bus)
 
     for name in names:
         st = EngineStatus(engine=name)
@@ -298,6 +304,8 @@ def collect_status(
             archive = cfg.bus.archive
             if archive is not None and name in archive.engines:
                 st.archive = _archive_status(bus, archive, name)
+            if cfg.bus.release_after:
+                st.retention = _retention_status(cfg, bus, name)
         if store is not None:
             st.status_counts = store.status_counts(name, cfg.platform)
             st.orphan_scores = len(store.keys_missing_commit_row(name, cfg.platform))
@@ -337,6 +345,45 @@ def _archive_status(bus, archive, name) -> dict:
     if state.get("last_success_at"):
         report["age"] = time.time() - state["last_success_at"]
     return report
+
+
+def _retention_status(cfg, bus, name) -> dict:
+    from .retention import holding_gate
+
+    try:
+        keys = bus.keys_above(name, None, readonly=True)
+        report = {
+            "gates": cfg.release_gates(name),
+            "live_entries": len(keys),
+            "live_bytes": bus.footprint(name, readonly=True),
+        }
+        held = holding_gate(cfg, bus.root, name, keys[0] if keys else None)
+    except (OSError, BusError, ValueError) as exc:
+        return {"error": str(exc)}
+    if held is not None:
+        report["holding"] = {
+            "gate": held.gate,
+            "cursor": str(held.cursor) if held.cursor else None,
+            "error": held.error,
+            "age": time.time() - held.updated_at if held.updated_at else None,
+        }
+    return report
+
+
+def _cap_status(cfg, bus) -> dict:
+    try:
+        paused = [
+            name
+            for name in bus.engines()
+            if bus.read_builder_state(name).publishing_paused_by_cap
+        ]
+        return {
+            "used": bus.used_bytes(readonly=True),
+            "cap": cfg.build.retain_gb * GB,
+            "builders_paused": paused,
+        }
+    except (OSError, BusError) as exc:
+        return {"error": str(exc)}
 
 
 def _fill_bus_status(cfg, bus, source, name, st):
@@ -403,6 +450,25 @@ def _key_of(record: dict) -> str:
     return str(CommitKey.from_commit(record))
 
 
+def _render_retention(retention: dict, echo) -> None:
+    if retention.get("error"):
+        echo(f"  retention: unreadable: {retention['error']}")
+        return
+    gates = ", ".join(retention["gates"]) or "none (released at publish)"
+    echo(
+        f"  retention after {gates}: {retention['live_entries']} live entries, "
+        f"{retention['live_bytes'] / GB:.1f}GB"
+    )
+    held = retention.get("holding")
+    if held:
+        age = f", written {held['age'] / 3600:.1f}h ago" if held.get("age") else ""
+        why = f" ({held['error']})" if held.get("error") else ""
+        echo(
+            f"  oldest live entry held by {held['gate']}: cursor "
+            f"{held['cursor'] or 'none'}{age}{why}"
+        )
+
+
 def _render_archive(archive: dict, echo) -> None:
     if archive.get("never"):
         echo("  archive: never run")
@@ -437,6 +503,18 @@ def render(report: BusStatus, echo) -> None:
     if report.window is not None:
         render_window(report.window, echo)
     echo(f"free space: {report.free_gb:.0f}GB")
+    if report.cap:
+        cap = report.cap
+        if cap.get("error"):
+            echo(f"artifact cap: unreadable: {cap['error']}")
+        else:
+            at_cap = cap["used"] >= cap["cap"]
+            echo(
+                f"artifacts: {cap['used'] / GB:.1f}GB of a {cap['cap'] / GB:g}GB cap"
+                + (" (AT CAP: accept refuses, the builder pauses)" if at_cap else "")
+            )
+            for name in cap["builders_paused"]:
+                echo(f"  {name}: builder paused at the cap")
 
     for st in report.engines:
         echo("")
@@ -465,6 +543,8 @@ def render(report: BusStatus, echo) -> None:
                 echo(f"  transfer error: {progress['last_error']}")
         if st.archive:
             _render_archive(st.archive, echo)
+        if st.retention:
+            _render_retention(st.retention, echo)
         if st.peer_age is not None:
             echo(f"  peer snapshot fetched {int(st.peer_age)}s ago")
         if st.driven_by == "bus":

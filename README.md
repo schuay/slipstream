@@ -140,6 +140,30 @@ needed on both ends, which macOS's own `/usr/bin/rsync` is not: put
 Homebrew's first on the service's `PATH`. Run `slipstream archive --once`
 for the first upload, then the daemon from `launchd/`.
 
+## Gated retention
+
+By default `[build] retain_gb` is a byte budget: the oldest builds are
+evicted once it is exceeded. Declaring release gates frees a build when it is
+dead instead:
+
+```toml
+[bus]
+release_after = ["transfer", "archive"]   # a builder that only delivers
+# release_after = ["bench"]               # a bencher
+```
+
+A build is dead once every declared gate that applies to its engine has
+passed it: `bench` (a `[[run]]` entry and a bus source name the engine; this
+machine's consumer cursor), `transfer` (an outbound route carries it; the
+transfer cursor) and `archive` (`[bus.archive]` lists it; the archive
+cursor). An unreadable cursor frees nothing; an engine no gate applies to
+keeps only its newest build; the newest build of every engine is always kept,
+and so is every build a derived engine built here (Safari) has not packaged
+yet. `retain_gb` becomes a cap: at it the builder pauses and transfer accept
+refuses, retried until a gate frees something. `bus status` names the gate
+holding each engine's oldest build. `bus endpoint` applies the receiving
+machine's own config, so upgrade the receiving side first.
+
 ## Measuring
 
 ```sh

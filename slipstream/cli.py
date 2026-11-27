@@ -869,10 +869,36 @@ def bus_endpoint(
     inactivity: float = 120,
     handshake: float = 30,
 ):
-    """Serve one bounded transfer session; never takes the machine lock."""
+    """Serve one bounded transfer session; never takes the machine lock.
+
+    Retention follows this machine's own config ([bus] release_after and
+    [build] retain_gb); --retain-bytes, which a peer passes from its config,
+    is ignored then. A machine with no config file at all has no policy of
+    its own and keeps the peer's budget. Opens no database.
+    """
     import sys
+    from .config import _DEFAULT_CONFIG_PATH
+    from .retention import Policy
     from .transfer import serve
 
+    if not _DEFAULT_CONFIG_PATH.exists():
+        policy = Policy(retain_bytes=retain_bytes)
+        cfg = None
+    else:
+        cfg = _load_config(None)
+        policy = Policy(cfg)
+    if (
+        cfg is not None
+        and cfg.bus is not None
+        and cfg.bus.release_after
+        and cfg.bus.root != root.expanduser().resolve()
+    ):
+        typer.echo(
+            f"Error: endpoint root {root} is not this machine's bus root "
+            f"{cfg.bus.root}, whose gates it would release by",
+            err=True,
+        )
+        raise typer.Exit(1)
     serve(
         root,
         sys.stdin.fileno(),
@@ -881,6 +907,7 @@ def bus_endpoint(
         deadline=deadline,
         inactivity=inactivity,
         handshake=handshake,
+        policy=policy,
     )
 
 
