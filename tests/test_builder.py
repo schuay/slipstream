@@ -348,6 +348,158 @@ class TestDeltaStore:
         assert (dest / "out" / "d8").read_bytes() == payload
 
 
+class TestDeltaGroupAverage:
+    """A group closes when the next delta would cost more than the group's
+    average bytes per entry so far; the ratio stays the outer cap."""
+
+    @pytest.fixture
+    def delta_builder(self, builder, config, monkeypatch):
+        monkeypatch.setattr("slipstream.builder.package", package)
+        config.build.delta = DeltaConfig(block_mb=1, max_ratio=0.5, min_mb=0, workers=1)
+        builder.history = list(range(100, 140))
+        builder.d8 = builder.cfg.engines["v8"].src_dir / "out" / "d8"
+        builder.d8.write_bytes(_payload(seed=1))
+        return builder
+
+    def _publish(self, builder, payload=None):
+        if payload is not None:
+            builder.d8.write_bytes(payload)
+        result = builder.build_one("v8")
+        assert result.published
+        return builder.bus.read_entry("v8", result.key)
+
+    def _group(self, builder):
+        return builder.bus.read_builder_state("v8").delta_groups["out/d8"]
+
+    def test_a_delta_above_the_group_average_is_stored_whole_and_is_the_next_base(
+        self, delta_builder
+    ):
+        base = self._publish(delta_builder)
+        # Nine small deltas pull the average to a tenth of the base or so.
+        for edits in range(20, 29):
+            assert self._publish(delta_builder, _payload(1, edits)).blobs[0].is_delta
+        group = self._group(delta_builder)
+        assert group["entries"] == 10
+        average = group["bytes"] / group["entries"]
+        # Well inside the 50% ratio, but above the average.
+        rebased = self._publish(delta_builder, _payload(1, 8000))
+        (blob,) = rebased.blobs
+        assert not blob.is_delta, "the old ratio-only rule would accept this delta"
+        assert blob.bytes * 0.5 > average
+        assert any(
+            "exceeds the group average" in m and "over 10 entries" in m
+            for m in delta_builder.logs
+        )
+        assert self._group(delta_builder) == {
+            "base_sha256": blob.sha256,
+            "entries": 1,
+            "bytes": blob.bytes,
+        }
+        after = self._publish(delta_builder, _payload(1, 8010))
+        assert after.blobs[0].delta.base_id == blob.id != base.blobs[0].id
+
+    def test_a_delta_below_the_average_is_accepted_and_the_totals_advance(
+        self, delta_builder
+    ):
+        (base,) = self._publish(delta_builder).blobs
+        assert self._group(delta_builder) == {
+            "base_sha256": base.sha256,
+            "entries": 1,
+            "bytes": base.bytes,
+        }
+        (blob,) = self._publish(delta_builder, _payload(1, 2000)).blobs
+        assert blob.is_delta
+        assert self._group(delta_builder) == {
+            "base_sha256": base.sha256,
+            "entries": 2,
+            "bytes": base.bytes + blob.delta.plan.patch_bytes,
+        }
+
+    def test_the_ratio_still_caps_when_it_is_the_lower_limit(self, delta_builder):
+        self._publish(delta_builder)
+        # Average is the whole base here; the ratio's half of it binds.
+        (blob,) = self._publish(delta_builder, _payload(seed=2)).blobs
+        assert not blob.is_delta
+        assert any("exceeds 50%" in m for m in delta_builder.logs)
+        assert not any("group average" in m for m in delta_builder.logs)
+
+    def test_a_ratio_of_zero_still_disables_deltas(self, delta_builder, config):
+        config.build.delta.max_ratio = 0
+        self._publish(delta_builder)
+        assert not self._publish(delta_builder, _payload(1, 20)).blobs[0].is_delta
+
+    def test_the_totals_survive_a_restart(self, delta_builder, config):
+        (base,) = self._publish(delta_builder).blobs
+        (first,) = self._publish(delta_builder, _payload(1, 2000)).blobs
+        fresh = Builder(config, Bus(delta_builder.bus.root))
+        fresh.lock.path = delta_builder.lock.path
+        fresh.collector = delta_builder.collector
+        fresh.store = delta_builder.store
+        fresh.d8 = delta_builder.d8
+        (second,) = self._publish(fresh, _payload(1, 2100)).blobs
+        assert second.delta.base_id == base.id
+        assert self._group(fresh) == {
+            "base_sha256": base.sha256,
+            "entries": 3,
+            "bytes": base.bytes
+            + first.delta.plan.patch_bytes
+            + second.delta.plan.patch_bytes,
+        }
+
+    @pytest.mark.parametrize("record", [None, "other", "torn"])
+    def test_totals_are_rebuilt_from_the_bus_without_a_matching_record(
+        self, delta_builder, record
+    ):
+        (base,) = self._publish(delta_builder).blobs
+        patches = [
+            self._publish(delta_builder, _payload(1, e)).blobs[0].delta.plan.patch_bytes
+            for e in (2000, 2100)
+        ]
+        # The same tree again: one member, not two.
+        self._publish(delta_builder, _payload(1, 2100))
+        state = delta_builder.bus.read_builder_state("v8")
+        if record is None:
+            state.delta_groups = {}
+        elif record == "torn":
+            state.delta_groups["out/d8"] = {"base_sha256": base.sha256}
+        else:
+            state.delta_groups["out/d8"] = {
+                "base_sha256": "0" * 64,
+                "entries": 1,
+                "bytes": 1,
+            }
+        delta_builder.bus.write_builder_state("v8", state)
+        (blob,) = self._publish(delta_builder, _payload(1, 2200)).blobs
+        assert blob.delta.base_id == base.id
+        assert self._group(delta_builder) == {
+            "base_sha256": base.sha256,
+            "entries": 4,
+            "bytes": base.bytes + sum(patches) + blob.delta.plan.patch_bytes,
+        }
+
+    def test_a_reused_blob_leaves_the_totals_unchanged(self, delta_builder):
+        self._publish(delta_builder)
+        second = self._publish(delta_builder, _payload(1, 2000))
+        before = self._group(delta_builder)
+        third = self._publish(delta_builder)  # the second build's tree again
+        assert third.blobs == second.blobs
+        assert self._group(delta_builder) == before
+
+    def test_a_failed_publish_does_not_advance_the_totals(
+        self, delta_builder, monkeypatch
+    ):
+        self._publish(delta_builder)
+        before = self._group(delta_builder)
+        delta_builder.d8.write_bytes(_payload(1, 2000))
+
+        def full_disk(entry):
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(delta_builder.bus, "publish", full_disk)
+        assert not delta_builder.build_one("v8").published
+        assert self._group(delta_builder) == before
+
+
 def _payload(seed: int, edits: int = 0) -> bytes:
     """64 KiB that zstd cannot shrink, so the archive's size is honest, with
     ``edits`` bytes changed at spread-out offsets: a build that touched a
@@ -1563,6 +1715,12 @@ class TestMigratedBus:
         second = builder.bus.read_entry("v8", 102)
         assert second.blobs[0].is_delta
         assert second.objects()[0].name == first.blobs[0].sha256 + ".tar.zst"
+        group = builder.bus.read_builder_state("v8").delta_groups["out/d8"]
+        assert group == {
+            "base_sha256": first.blobs[0].sha256,
+            "entries": 2,
+            "bytes": first.blobs[0].bytes + second.blobs[0].delta.plan.patch_bytes,
+        }
         from slipstream.consumer import _unpack_delta
 
         with protocol.capture("v8", 102) as capture:

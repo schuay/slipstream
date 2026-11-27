@@ -15,6 +15,7 @@ done, while a failure at the frontier was retried every cycle forever.
 
 from __future__ import annotations
 
+import copy
 import os
 import platform
 import shutil
@@ -205,12 +206,15 @@ class _Stored:
         self.bus = bus
         self.blobs: dict[str, Blob] = {}
         self.latest: dict[str, Blob] = {}
+        # This engine's distinct blobs per path, for rebuilding group totals.
+        self.own: dict[str, dict[str, Blob]] = {}
         for name in bus.engines():
             for entry in bus.entries(name):
                 for blob in entry.blobs:
                     self.blobs[blob.id] = blob
                     if name == engine:
                         self.latest[blob.path] = blob
+                        self.own.setdefault(blob.path, {})[blob.id] = blob
 
     def known(self, blob_id: str) -> Blob | None:
         blob = self.blobs.get(blob_id)
@@ -235,6 +239,37 @@ class _Stored:
             else None
         )
 
+    def group_totals(self, path: str, base: _Base) -> dict:
+        """The group of ``base`` at ``path`` as far as the bus still shows it.
+
+        The base counts even when its own entry was pruned. Members already
+        pruned are missing, which makes the average high and this group
+        close late once; the next one is tracked exactly from its start.
+        """
+        patches = [
+            blob.delta.plan.patch_bytes
+            for blob in self.own.get(path, {}).values()
+            if blob.delta is not None and blob.delta.base_sha256 == base.sha256
+        ]
+        return _group(base.sha256, 1 + len(patches), base.bytes + sum(patches))
+
+
+def _group(base_sha256: str, entries: int, size: int) -> dict:
+    return {"base_sha256": base_sha256, "entries": entries, "bytes": size}
+
+
+def _group_matches(group, base: _Base) -> bool:
+    """Whether a recorded group is well formed and of this base."""
+    return (
+        isinstance(group, dict)
+        and group.get("base_sha256") == base.sha256
+        and all(
+            isinstance(group.get(k), int) and not isinstance(group.get(k), bool)
+            for k in ("entries", "bytes")
+        )
+        and group["entries"] > 0
+    )
+
 
 def store_run_set(
     bus: Bus,
@@ -246,6 +281,7 @@ def store_run_set(
     delta_cfg: DeltaConfig | None = None,
     log: Callable[[str], None] = lambda msg: None,
     tree_ids: dict[str, str] | None = None,
+    groups: dict[str, dict] | None = None,
 ) -> list[Blob]:
     """Store each run set entry once per distinct tree, as a delta when it pays.
 
@@ -258,6 +294,12 @@ def store_run_set(
     the next base. Nothing on the delta path can fail a publish: any error
     in it is logged and the archive stored whole. The returned blobs are
     what the manifest names, in run set order.
+
+    ``groups`` is the open delta group per path (``BuilderState.delta_groups``)
+    and is updated in place: a new whole archive opens a group, an accepted
+    delta joins one, and a reused blob changes nothing. The caller keeps the
+    result only once the entry is published. A record whose base is not the
+    one planned against is rebuilt from the bus first.
     """
     if bus.protocol:
         raise BuildError("migrated bus packaging requires a private publication stage")
@@ -278,19 +320,27 @@ def store_run_set(
             continue
         tmp = bus.tmp_blob(blob_id)
         package(src_dir, [entry], tmp, caffeinate=caffeinate)
-        planned = None
+        planned = group = None
         if delta_cfg is not None and delta_cfg.enabled:
-            planned = _try_delta(
-                bus, tmp, stored.base_for(entry), delta_cfg, log, entry
-            )
+            base = stored.base_for(entry)
+            if base is not None and groups is not None:
+                group = groups.get(entry)
+                if not _group_matches(group, base):
+                    group = groups[entry] = stored.group_totals(entry, base)
+            planned = _try_delta(bus, tmp, base, delta_cfg, log, entry, group)
         if planned is not None:
             tmp.unlink()
             blobs.append(Blob(entry, blob_id, delta=planned))
+            if group is not None:
+                group["entries"] += 1
+                group["bytes"] += planned.plan.patch_bytes
         else:
             sha = sha256_file(tmp)
             size = tmp.stat().st_size
             bus.store_blob(tmp, sha if bus.format_version >= 4 else blob_id)
             blobs.append(Blob(entry, blob_id, sha, size))
+            if groups is not None:
+                groups[entry] = _group(sha, 1, size)
     return blobs
 
 
@@ -301,8 +351,13 @@ def _try_delta(
     cfg: DeltaConfig,
     log: Callable[[str], None],
     label: str,
+    group: dict | None = None,
 ) -> Delta | None:
     """Plan ``archive`` against ``base``, or say why it stays whole.
+
+    The patches may come to at most ``max_ratio`` of the archive, and at
+    most the group's average bytes per entry so far: past that point a
+    further member raises the average, and a fresh base is cheaper.
 
     Patches are stored as they are produced; the ones of a plan that is
     abandoned, over budget or by an error, are unreferenced and the next
@@ -314,7 +369,11 @@ def _try_delta(
         return None
     if size < cfg.min_bytes:
         return None
-    budget = int(size * cfg.max_ratio)
+    budget = ratio_budget = int(size * cfg.max_ratio)
+    average = None
+    if group is not None and group.get("entries", 0) > 0:
+        average = group["bytes"] // group["entries"]
+        budget = min(budget, average)
 
     def store_patch(sha: str, data: bytes) -> None:
         name = patch_name(sha)
@@ -380,10 +439,18 @@ def _try_delta(
                 proc.wait()
     secs = time.monotonic() - t0
     if plan is None:
-        log(
-            f"{label}: delta against {base.id[:12]} exceeds {cfg.max_ratio:.0%} of "
-            f"{size / MB:.0f}MB, stored whole as the new base ({secs:.0f}s)"
-        )
+        if average is not None and average < ratio_budget:
+            log(
+                f"{label}: delta against {base.id[:12]} exceeds the group average "
+                f"{average / MB:.1f}MB over {group['entries']} entries, stored "
+                f"whole as the new base ({secs:.0f}s)"
+            )
+        else:
+            log(
+                f"{label}: delta against {base.id[:12]} exceeds "
+                f"{cfg.max_ratio:.0%} of {size / MB:.0f}MB, stored whole as the "
+                f"new base ({secs:.0f}s)"
+            )
         return None
     log(
         f"{label}: delta against {base.id[:12]}: {plan.patch_bytes / MB:.1f}MB of "
@@ -740,8 +807,12 @@ class Builder:
 
         state.in_flight = self._in_flight(job, "package")
         self._publish_state(engine_name, state)
+        # Delta group totals advance only with a published entry.
+        groups = copy.deepcopy(state.delta_groups)
         try:
-            entry = self._package_and_publish(engine, job, int(time.time() - started))
+            entry = self._package_and_publish(
+                engine, job, int(time.time() - started), groups=groups
+            )
         except (BuildError, OSError) as e:
             # Packaging is this machine's business, not the commit's.
             return self._record_failure(
@@ -762,6 +833,7 @@ class Builder:
             self.store.conn.rollback()
             cleanup_error = f"published {key}; database cleanup deferred: {e}"
             self.log(warning(f"{engine_name}: {cleanup_error}"))
+        state.delta_groups = groups
         state.stall_retry_after = None
         # Retention waits for the start of the next cycle, leaving the bus to
         # transfer and delivery of what was just published.
@@ -833,17 +905,20 @@ class Builder:
         *,
         storage=None,
         tree_ids=None,
+        groups=None,
     ) -> Entry:
         if storage is None:
             if protocol := self.bus.protocol:
-                return self._package_transaction(protocol, engine, job, build_secs)
+                return self._package_transaction(
+                    protocol, engine, job, build_secs, groups
+                )
             storage = self.bus
         key = job.key
         commit = job.commit
         inherited = None
         safari_release = {}
         if job.compiles:
-            blobs = self._store(engine, storage, tree_ids)
+            blobs = self._store(engine, storage, tree_ids, groups)
         elif engine.runtime == "safari":
             releases = self.resolver(engine.name).releases
             safari_release = releases.record
@@ -870,7 +945,7 @@ class Builder:
             # on the floor (the sweep reclaims it) and the cycle retries.
             resolver = self.resolver(engine.name)
             before, _ = resolver.installed()
-            own = self._store(engine, storage)
+            own = self._store(engine, storage, groups=groups)
             after, _ = resolver.installed()
             if after != before:
                 raise BuildError(
@@ -900,7 +975,7 @@ class Builder:
         storage.publish(entry)
         return entry
 
-    def _package_transaction(self, protocol, engine, job, build_secs):
+    def _package_transaction(self, protocol, engine, job, build_secs, groups=None):
         # A private bus snapshot lets the existing packager reuse and delta-plan
         # captured objects, while every shared operation stays a short transaction.
         # It holds every manifest but only the objects packaging can use: blobs
@@ -953,6 +1028,7 @@ class Builder:
                 build_secs,
                 storage=private,
                 tree_ids=trees if job.compiles else None,
+                groups=groups,
             )
             entry.owner_uuid = protocol.ready()["uuid"]
             entry.publication_uuid = str(uuid.uuid4())
@@ -976,7 +1052,9 @@ class Builder:
             if (src_dir / path).exists()
         }
 
-    def _store(self, engine: EngineConfig, storage=None, tree_ids=None) -> list[Blob]:
+    def _store(
+        self, engine: EngineConfig, storage=None, tree_ids=None, groups=None
+    ) -> list[Blob]:
         """This engine's own run set into the store, under its delta policy."""
         return store_run_set(
             storage or self.bus,
@@ -986,6 +1064,7 @@ class Builder:
             delta_cfg=self.cfg.build.delta,
             log=lambda msg: self.log(prefixed(f"{engine.name}: ", msg)),
             tree_ids=tree_ids,
+            groups=groups,
         )
 
     def migrate(self, should_stop=lambda: False) -> None:

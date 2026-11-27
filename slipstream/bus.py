@@ -480,6 +480,12 @@ class BuilderState:
     # deployment and each invocation is a new process.
     stall_retry_after: float | None = None
     in_flight: dict | None = None
+    # Per run set path, the open delta group: its base and the bytes and
+    # entries stored against it so far, base included. The builder closes a
+    # group when the next delta would cost more than the average. Kept here
+    # because retention frees group members, so the bus cannot recount them.
+    # run set path -> {"base_sha256": str, "entries": int, "bytes": int}
+    delta_groups: dict[str, dict] = field(default_factory=dict)
     # The builder's machine identity and slipstream version, with ``since``,
     # the time those values took effect, so a divergence check reports when
     # the two boxes parted rather than only that they currently differ.
