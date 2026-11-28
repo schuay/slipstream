@@ -12,14 +12,10 @@ from typing import Annotated, Optional
 
 import typer
 
-from .admission import StopReason
 from .config import load_config
 from .durability import report_lock_holds
 from .models import CommitKey
-from .collector import BenchCollector, FetchError
-from .hooks import HookError
 from .service_logging import EventLog, warning
-from . import host as host_mod
 
 app = typer.Typer(
     name="slipstream",
@@ -44,6 +40,7 @@ def _open_collector(cfg, **kwargs):
     machines" guard reaches bench, watch, build and bus status through here
     rather than as a traceback.
     """
+    from .collector import BenchCollector
     from .store import StoreError
 
     try:
@@ -214,6 +211,10 @@ def bench(
     Engines take turns one commit at a time when reacquiring the machine lock.
     """
     import time
+
+    from .admission import StopReason
+    from .collector import FetchError
+    from .hooks import HookError
 
     cfg = _load_config(config)
     interval_secs = _parse_interval(interval)
@@ -705,6 +706,8 @@ def build(
 ):
     """Build commits and publish the artifacts to the bus."""
     import time
+
+    from .hooks import HookError
 
     from .builder import Builder
     from .bus import Bus
@@ -1202,6 +1205,8 @@ def host_cmd(
 ):
     """Check (or configure) this machine's power state for unattended benchmarking."""
     import subprocess
+
+    from . import host as host_mod
 
     cfg = _load_config(config)
     if not host_mod.is_macos():

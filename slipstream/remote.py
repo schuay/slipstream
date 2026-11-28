@@ -30,7 +30,6 @@ from .bus import (
     state_from_json,
 )
 from .config import BusSource
-from .consumer import ShaMismatch, verify_object
 from .models import CommitKey
 
 
@@ -172,6 +171,8 @@ class SshSource:
             raise BusError(
                 "legacy SSH fetch preflight failed or remote bus is migrated"
             )
+        from .consumer import ShaMismatch, verify_object
+
         label = f"{entry.engine} {entry.key}"
         paths = {}
         for obj in entry.objects():
