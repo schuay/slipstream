@@ -347,6 +347,8 @@ def test_hung_endpoint_is_terminated_and_reaped(pair, monkeypatch):
         return proc
 
     monkeypatch.setattr("slipstream.transfer.subprocess.Popen", launch)
+    # The child ignores its closed stdin, so the grace always runs out.
+    monkeypatch.setattr(RemoteEndpoint, "CLOSE_GRACE", 0.05)
     endpoint = RemoteEndpoint(
         BusSource("peer", str(src.root), ssh_host="peer"),
         {"handshake": 0.05, "inactivity": 0.05, "total": 0.1},
@@ -367,11 +369,17 @@ import os, subprocess, sys
 from slipstream.bus_protocol import BusProtocol, staging_fds
 with BusProtocol(sys.argv[1]).stage() as stage:
     print(stage.path, flush=True)
-    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(2)'], pass_fds=staging_fds())
+    # The child holds the lease until the test closes the stdin it inherits.
+    child = subprocess.Popen(
+        [sys.executable, '-c', 'import sys; sys.stdin.read()'], pass_fds=staging_fds()
+    )
     os._exit(0)
 """
     proc = subprocess.Popen(
-        [sys.executable, "-c", script, str(src.root)], stdout=subprocess.PIPE, text=True
+        [sys.executable, "-c", script, str(src.root)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
     )
     from pathlib import Path
 
@@ -379,6 +387,7 @@ with BusProtocol(sys.argv[1]).stage() as stage:
     proc.wait(timeout=5)
     src.gc()
     assert path.exists()
+    proc.stdin.close()
     # The orphan inherits stdout as well; EOF proves that child exited.
     proc.stdout.read()
     proc.stdout.close()

@@ -247,6 +247,9 @@ class WorkSchedule:
 
 
 class Subscriptions:
+    # First reconnect wait after a dropped subscription; doubles to 60 s.
+    RECONNECT_DELAY = 1.0
+
     """One reader per bus source; no reader touches consumer or lock state."""
 
     def __init__(self, sources, schedule, log, role="bench"):
@@ -270,7 +273,7 @@ class Subscriptions:
             thread.start()
 
     def _run(self, source, engines):
-        delay = 1.0
+        delay = self.RECONNECT_DELAY
         while not self.stop.is_set():
             connected = False
 
@@ -302,7 +305,7 @@ class Subscriptions:
                         )
                     )
             if connected:
-                delay = 1.0
+                delay = self.RECONNECT_DELAY
             if self.stop.wait(delay):
                 break
             delay = min(delay * 2, 60.0)

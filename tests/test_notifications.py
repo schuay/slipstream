@@ -254,6 +254,7 @@ def test_remote_rejects_invalid_protocol(monkeypatch, message):
 
 def test_reconnect_marks_pending_again(monkeypatch):
     obj = reader()
+    obj.RECONNECT_DELAY = 0.01
     obj.schedule = n.WorkSchedule(["v8"], [], 1800)
     obj.log = lambda _: None
     attempts = []

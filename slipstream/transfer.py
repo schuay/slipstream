@@ -262,6 +262,9 @@ class LocalEndpoint:
 
 
 class RemoteEndpoint:
+    # How long a session's endpoint gets to exit after its stdin closes.
+    CLOSE_GRACE = 1.0
+
     def __init__(self, endpoint, options, retain_bytes, expected_uuid=None):
         self.expected_uuid = expected_uuid
         self.endpoint, self.options, self.retain_bytes = endpoint, options, retain_bytes
@@ -293,7 +296,7 @@ class RemoteEndpoint:
         finally:
             process.stdin.close()
             try:
-                process.wait(timeout=1)
+                process.wait(timeout=self.CLOSE_GRACE)
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGTERM)
                 try:
