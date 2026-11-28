@@ -37,6 +37,10 @@ def isolated_machine_lock(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(lock_mod, "own_process_group", lambda: None)
     # Watch hooks must never execute files from the developer's real config.
     monkeypatch.setattr(config_mod, "_DEFAULT_CONFIG_PATH", locks / "config.toml")
+    # Nor may child processes (the transfer tests run `slipstream bus
+    # endpoint`, which loads ~/.config/slipstream/config.toml): on a deployed
+    # machine that config would set the endpoint's policy or refuse the root.
+    monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
 
 
 @pytest.fixture
