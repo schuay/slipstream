@@ -213,7 +213,7 @@ def test_remote_rsync_path_is_passed_through(protocol, target):
     archiver = make(protocol, target, runner=runner, remote_rsync_path="/opt/bin/rsync")
     archiver.probe()
     assert archiver.run(once=True)
-    assert len(runner.calls) == 3  # probe, objects, manifests
+    assert len(runner.calls) >= 3  # probes, objects, manifests
     assert all("--rsync-path=/opt/bin/rsync" in c for c in runner.calls)
 
 

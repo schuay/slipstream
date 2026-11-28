@@ -1163,7 +1163,8 @@ def _parse_archive(data, engines, owners) -> ArchiveConfig | None:
     if not isinstance(data, dict):
         raise ValueError(f"{section} must be a table")
     _reject_unknown(
-        data, ("target", "engines", "every_hours", "at", "bwlimit", "remote_rsync_path"),
+        data,
+        ("target", "engines", "every_hours", "at", "bwlimit", "remote_rsync_path"),
         section,
     )
     target = data.get("target")
