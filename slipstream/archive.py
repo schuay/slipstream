@@ -178,6 +178,9 @@ class Archiver:
         ]
         if self.archive.bwlimit:
             command.append(f"--bwlimit={self.archive.bwlimit}")
+        if self.archive.remote_rsync_path:
+            # A target whose default rsync predates --fsync (Synology's).
+            command.append(f"--rsync-path={self.archive.remote_rsync_path}")
         command.extend(args)
         result = self.runner(
             command,

@@ -298,6 +298,7 @@ class ArchiveConfig:
     every_hours: float = 24
     at: str | None = None  # "HH:MM", local time
     bwlimit: str | None = None  # rsync --bwlimit
+    remote_rsync_path: str | None = None  # rsync --rsync-path on the target
 
     @property
     def at_minutes(self) -> int | None:
@@ -1162,7 +1163,8 @@ def _parse_archive(data, engines, owners) -> ArchiveConfig | None:
     if not isinstance(data, dict):
         raise ValueError(f"{section} must be a table")
     _reject_unknown(
-        data, ("target", "engines", "every_hours", "at", "bwlimit"), section
+        data, ("target", "engines", "every_hours", "at", "bwlimit", "remote_rsync_path"),
+        section,
     )
     target = data.get("target")
     if not isinstance(target, str) or not target:
@@ -1199,7 +1201,16 @@ def _parse_archive(data, engines, owners) -> ArchiveConfig | None:
     bwlimit = data.get("bwlimit")
     if bwlimit is not None and (not isinstance(bwlimit, str) or not bwlimit):
         raise ValueError(f"{section} bwlimit must be an rsync --bwlimit string")
-    return ArchiveConfig(target, list(names), every_hours, at, bwlimit)
+    remote_rsync_path = data.get("remote_rsync_path")
+    if remote_rsync_path is not None and (
+        not isinstance(remote_rsync_path, str) or not remote_rsync_path
+    ):
+        raise ValueError(
+            f"{section} remote_rsync_path must be the rsync program on the target"
+        )
+    return ArchiveConfig(
+        target, list(names), every_hours, at, bwlimit, remote_rsync_path
+    )
 
 
 def _parse_build(data: dict, engines: dict[str, EngineConfig]) -> BuildConfig:

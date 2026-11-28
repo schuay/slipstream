@@ -128,6 +128,7 @@ engines = ["v8", "jsc", "chrome", "safari"]
 every_hours = 24                     # 168 for weekly
 at = "03:00"                         # optional, local time; whole days only
 bwlimit = "50m"                      # optional, rsync --bwlimit
+remote_rsync_path = "/opt/bin/rsync" # optional, rsync --rsync-path on the target
 ```
 
 Objects land under `objects/<aa>/<name>` and the exact manifest bytes under
@@ -137,7 +138,8 @@ manifest on the target never names a missing object, and nothing is ever
 deleted there. The per-engine cursor is `state/archive/<engine>.json`; a
 changed target refuses to start. rsync 3.2.4 or later (for `--fsync`) is
 needed on both ends, which macOS's own `/usr/bin/rsync` is not: put
-Homebrew's first on the service's `PATH`. Run `slipstream archive --once`
+Homebrew's first on the service's `PATH`. A target whose default rsync is
+older (Synology's) needs `remote_rsync_path` naming a newer one there. Run `slipstream archive --once`
 for the first upload, then the daemon from `launchd/`.
 
 ## Gated retention

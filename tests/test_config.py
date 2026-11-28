@@ -1002,8 +1002,10 @@ class TestArchiveConfig:
                 "every_hours": 168,
                 "at": "03:00",
                 "bwlimit": "50m",
+                "remote_rsync_path": "/opt/bin/rsync",
             },
         )
+        assert archive.remote_rsync_path == "/opt/bin/rsync"
         assert archive.target == "archive-host:/srv/slipstream"
         assert archive.engines == ["v8"]
         assert (archive.every_hours, archive.at, archive.bwlimit) == (
@@ -1016,6 +1018,7 @@ class TestArchiveConfig:
     def test_defaults(self, tmp_path):
         archive = self._parse(tmp_path, {"target": "/a", "engines": ["v8"]})
         assert (archive.every_hours, archive.at, archive.bwlimit) == (24, None, None)
+        assert archive.remote_rsync_path is None
 
     @pytest.mark.parametrize(
         "change, match",
@@ -1032,6 +1035,8 @@ class TestArchiveConfig:
             ({"at": "24:00"}, "HH:MM"),
             ({"at": "03:00", "every_hours": 12}, "whole number of days"),
             ({"bwlimit": 50}, "bwlimit"),
+            ({"remote_rsync_path": ""}, "remote_rsync_path"),
+            ({"remote_rsync_path": 1}, "remote_rsync_path"),
         ],
     )
     def test_validation(self, tmp_path, change, match):

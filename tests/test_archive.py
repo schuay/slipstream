@@ -207,6 +207,23 @@ def test_bwlimit_is_passed_through(protocol, target):
     assert all("--bwlimit=50m" in c for c in runner.calls)
 
 
+def test_remote_rsync_path_is_passed_through(protocol, target):
+    publish(protocol, 1, {"out": b"one"})
+    runner = FakeRsync()
+    archiver = make(protocol, target, runner=runner, remote_rsync_path="/opt/bin/rsync")
+    archiver.probe()
+    assert archiver.run(once=True)
+    assert len(runner.calls) == 3  # probe, objects, manifests
+    assert all("--rsync-path=/opt/bin/rsync" in c for c in runner.calls)
+
+
+def test_no_rsync_path_by_default(protocol, target):
+    publish(protocol, 1, {"out": b"one"})
+    runner = FakeRsync()
+    make(protocol, target, runner=runner).run(once=True)
+    assert not any(a.startswith("--rsync-path") for c in runner.calls for a in c)
+
+
 def test_a_crash_after_the_objects_repeats_cleanly_and_advances_once(protocol, target):
     publish(protocol, 1, {"out": b"one"})
     publish(protocol, 2, {"out": b"two"})
